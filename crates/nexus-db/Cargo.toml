@@ -1,0 +1,13 @@
+[package]
+name = "nexus-db"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+nexus-core = { path = "../nexus-core" }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

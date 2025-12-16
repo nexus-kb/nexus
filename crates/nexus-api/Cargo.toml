@@ -1,0 +1,17 @@
+[package]
+name = "nexus-api"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+nexus-core = { path = "../nexus-core" }
+nexus-db = { path = "../nexus-db" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+config = { workspace = true }
+nexus-jobs = { path = "../nexus-jobs" }
+chrono = { workspace = true }

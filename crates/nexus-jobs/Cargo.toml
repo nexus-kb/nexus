@@ -1,0 +1,16 @@
+[package]
+name = "nexus-jobs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+nexus-core = { path = "../nexus-core" }
+nexus-db = { path = "../nexus-db" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tracing-subscriber = { workspace = true }
