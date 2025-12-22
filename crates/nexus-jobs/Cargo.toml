@@ -9,8 +9,14 @@ nexus-db = { path = "../nexus-db" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde_json = { workspace = true }
+serde = { workspace = true }
 chrono = { workspace = true }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 tracing-subscriber = { workspace = true }
+mailparse = "0.15"
+regex = "1"
+once_cell = { workspace = true }
+gix = { workspace = true }
+sha2 = { workspace = true }

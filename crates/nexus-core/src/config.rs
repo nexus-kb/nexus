@@ -27,11 +27,25 @@ fn default_host() -> String {
     "0.0.0.0".to_string()
 }
 
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct MailConfig {
+    #[serde(default = "default_mirror_root")]
+    pub mirror_root: String,
+    #[serde(default)]
+    pub webhook_secret: Option<String>,
+}
+
+fn default_mirror_root() -> String {
+    "/Users/tansanrao/work/nexus/mirrors".to_string()
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct Settings {
     pub database: DatabaseConfig,
     #[serde(default)]
     pub app: AppConfig,
+    #[serde(default)]
+    pub mail: MailConfig,
 }
 
 pub fn load() -> Result<Settings, crate::Error> {
@@ -53,6 +67,9 @@ pub fn load() -> Result<Settings, crate::Error> {
     }
     if settings.database.max_connections == 0 {
         settings.database.max_connections = default_max_connections();
+    }
+    if settings.mail.mirror_root.trim().is_empty() {
+        settings.mail.mirror_root = default_mirror_root();
     }
 
     Ok(settings)

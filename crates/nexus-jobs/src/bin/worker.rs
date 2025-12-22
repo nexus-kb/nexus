@@ -1,7 +1,6 @@
 use nexus_core::config;
 use nexus_db::Db;
-use nexus_jobs::{JobHandler, JobResult, JobRunner, JobRunnerConfig};
-use tracing::info;
+use nexus_jobs::{JobRunner, JobRunnerConfig, MailJobHandler};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -18,19 +17,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = Db::connect(&settings.database).await?;
     db.migrate().await?;
 
-    let runner = JobRunner::new(db, JobRunnerConfig::default());
-    runner.run(PrintJobHandler).await?;
+    let runner = JobRunner::new(db.clone(), JobRunnerConfig::default());
+    let handler = MailJobHandler::new(db, settings.mail.mirror_root.into());
+    runner.run(handler).await?;
     Ok(())
-}
-
-#[derive(Clone)]
-struct PrintJobHandler;
-
-#[async_trait::async_trait]
-impl JobHandler for PrintJobHandler {
-    async fn handle(&self, job: nexus_db::Job) -> JobResult {
-        info!(id = job.id, queue = %job.queue, payload = %job.payload, "processing job");
-        // Replace with real work; this is a placeholder that always succeeds.
-        JobResult::Success
-    }
 }
