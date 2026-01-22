@@ -1,6 +1,7 @@
 //! Mailing list sync and threading job handlers.
 
 mod parse;
+pub mod patch;
 mod sync;
 mod threading;
 

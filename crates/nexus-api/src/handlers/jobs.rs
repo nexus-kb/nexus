@@ -2,13 +2,14 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use chrono::{DateTime, Utc};
 use nexus_db::{Job, JobStats, JobStore};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::handlers::{default_list_limit, default_queue};
 use crate::http::{ApiError, internal_error};
 use crate::state::ApiState;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct EnqueueRequest {
     #[serde(default = "default_queue")]
     pub queue: String,
@@ -19,7 +20,7 @@ pub struct EnqueueRequest {
     pub max_attempts: Option<i32>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct EnqueueResponse {
     pub id: i64,
     pub queue: String,
@@ -62,7 +63,7 @@ pub async fn job_status(
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct JobListParams {
     pub status: Option<String>,
     #[serde(default = "default_list_limit")]

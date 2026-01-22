@@ -7,6 +7,8 @@ use regex::Regex;
 
 use nexus_db::EmailRecipient;
 
+use super::patch::{self, PatchMetadata};
+
 static B4_DIFF_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?mi)^(---.*\n\+\+\+|GIT binary patch|diff --git \w/\S+ \w/\S+)")
         .expect("valid diff detection regex")
@@ -47,6 +49,7 @@ pub struct ParsedEmail {
     pub to: Vec<EmailRecipient>,
     pub cc: Vec<EmailRecipient>,
     pub body: Option<String>,
+    pub patch_metadata: Option<PatchMetadata>,
 }
 
 /// Parse raw email bytes into a normalized, sanitized structure.
@@ -84,6 +87,9 @@ pub fn parse_email(raw: &[u8]) -> Result<ParsedEmail, ParseEmailError> {
 
     let body = sanitize_text(&extract_preferred_body(&parsed));
     let body = if body.is_empty() { None } else { Some(body) };
+
+    // Detect patches in the body
+    let patch_metadata = body.as_ref().and_then(|b| patch::detect_patches(b));
 
     let to = parsed
         .headers
@@ -125,6 +131,7 @@ pub fn parse_email(raw: &[u8]) -> Result<ParsedEmail, ParseEmailError> {
         to,
         cc,
         body,
+        patch_metadata,
     })
 }
 

@@ -26,6 +26,7 @@ pub struct EmailInput {
     pub date: DateTime<Utc>,
     pub in_reply_to: Option<String>,
     pub body: Option<String>,
+    pub patch_metadata: Option<serde_json::Value>,
     pub references: Vec<String>,
     pub to: Vec<EmailRecipient>,
     pub cc: Vec<EmailRecipient>,
@@ -90,6 +91,7 @@ impl MailIngestStore {
         let mut dates = Vec::with_capacity(batch.len());
         let mut in_reply_tos = Vec::with_capacity(batch.len());
         let mut epochs = Vec::with_capacity(batch.len());
+        let mut patch_metadatas = Vec::with_capacity(batch.len());
 
         for email in batch {
             let author_id = match author_id_map.get(&email.author_email) {
@@ -112,6 +114,7 @@ impl MailIngestStore {
             dates.push(email.date);
             in_reply_tos.push(email.in_reply_to.clone());
             epochs.push(email.epoch);
+            patch_metadatas.push(email.patch_metadata.clone());
         }
 
         let inserted_count = if message_ids.is_empty() {
@@ -128,7 +131,8 @@ impl MailIngestStore {
                         $6::text[],
                         $7::timestamptz[],
                         $8::text[],
-                        $9::int2[]
+                        $9::int2[],
+                        $10::jsonb[]
                     ) AS t (
                         mailing_list_id,
                         message_id,
@@ -138,19 +142,20 @@ impl MailIngestStore {
                         normalized_subject,
                         date,
                         in_reply_to,
-                        epoch
+                        epoch,
+                        patch_metadata
                     )
                 ),
                 inserted AS (
-                    INSERT INTO emails (mailing_list_id, message_id, blob_oid, author_id, subject, normalized_subject, date, in_reply_to, epoch)
-                    SELECT mailing_list_id, message_id, blob_oid, author_id, subject, normalized_subject, date, in_reply_to, epoch
+                    INSERT INTO emails (mailing_list_id, message_id, blob_oid, author_id, subject, normalized_subject, date, in_reply_to, epoch, patch_metadata)
+                    SELECT mailing_list_id, message_id, blob_oid, author_id, subject, normalized_subject, date, in_reply_to, epoch, patch_metadata
                     FROM data
                     ON CONFLICT (mailing_list_id, message_id) DO NOTHING
                     RETURNING id, author_id, date
                 ),
                 activity AS (
                     INSERT INTO author_mailing_list_activity (author_id, mailing_list_id, first_email_date, last_email_date, created_count, participated_count)
-                    SELECT author_id, $10, MIN(date), MAX(date), COUNT(*), COUNT(*)
+                    SELECT author_id, $11, MIN(date), MAX(date), COUNT(*), COUNT(*)
                     FROM inserted
                     GROUP BY author_id
                     ON CONFLICT (author_id, mailing_list_id) DO UPDATE
@@ -171,6 +176,7 @@ impl MailIngestStore {
             .bind(&dates)
             .bind(&in_reply_tos)
             .bind(&epochs)
+            .bind(&patch_metadatas)
             .bind(mailing_list_id)
             .fetch_one(&mut *tx)
             .await? as usize
@@ -377,6 +383,7 @@ mod tests {
             date: Utc::now(),
             in_reply_to: None,
             body: None,
+            patch_metadata: None,
             references: Vec::new(),
             to: Vec::new(),
             cc: Vec::new(),

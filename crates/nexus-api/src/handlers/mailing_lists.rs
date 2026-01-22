@@ -1,13 +1,14 @@
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use nexus_db::{MailingList, MailingListStore};
+use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::handlers::default_list_limit;
 use crate::http::{ApiError, internal_error};
 use crate::state::ApiState;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct MailingListParams {
     pub enabled: Option<bool>,
     #[serde(default = "default_list_limit")]
@@ -16,7 +17,7 @@ pub struct MailingListParams {
     pub offset: i64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct PagingParams {
     #[serde(default = "default_list_limit")]
     pub limit: i64,
@@ -24,7 +25,7 @@ pub struct PagingParams {
     pub offset: i64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct UpdateMailingListRequest {
     pub enabled: bool,
 }
@@ -72,10 +73,7 @@ pub async fn update_mailing_list(
         .map_err(internal_error)?
     {
         Some(list) => Ok(Json(list)),
-        None => Err((
-            axum::http::StatusCode::NOT_FOUND,
-            format!("mailing list '{}' not found", slug),
-        )),
+        None => Err(ApiError::not_found(&format!("mailing list '{}'", slug))),
     }
 }
 

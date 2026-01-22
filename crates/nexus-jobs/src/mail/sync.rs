@@ -91,6 +91,12 @@ pub async fn sync_epoch(
                         }
                     };
 
+                    // Serialize patch_metadata to JSON for storage
+                    let patch_metadata_json = parsed
+                        .patch_metadata
+                        .as_ref()
+                        .and_then(|pm| serde_json::to_value(pm).ok());
+
                     batch.push(EmailInput {
                         mailing_list_id,
                         message_id: parsed.message_id,
@@ -103,6 +109,7 @@ pub async fn sync_epoch(
                         date: parsed.date,
                         in_reply_to: parsed.in_reply_to,
                         body: parsed.body,
+                        patch_metadata: patch_metadata_json,
                         references: parsed.references,
                         to: parsed.to,
                         cc: parsed.cc,

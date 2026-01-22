@@ -1,11 +1,12 @@
 use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
 use crate::Result;
 
 /// Mailing list record.
-#[derive(Debug, Serialize, Deserialize, sqlx::FromRow, Clone)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema, sqlx::FromRow, Clone)]
 pub struct MailingList {
     pub id: i32,
     pub name: String,

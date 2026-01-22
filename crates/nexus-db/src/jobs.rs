@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use sqlx::{PgPool, Postgres, Transaction};
@@ -7,7 +8,7 @@ use std::time::Duration;
 use crate::Result;
 
 /// Background job record stored in Postgres.
-#[derive(Debug, Serialize, Deserialize, sqlx::FromRow, Clone)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema, sqlx::FromRow, Clone)]
 pub struct Job {
     pub id: i64,
     pub queue: String,
@@ -24,14 +25,14 @@ pub struct Job {
 }
 
 /// Aggregate count per job status.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct StatusCount {
     pub status: String,
     pub count: i64,
 }
 
 /// Summary statistics for the jobs table.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct JobStats {
     pub total: i64,
     pub by_status: Vec<StatusCount>,

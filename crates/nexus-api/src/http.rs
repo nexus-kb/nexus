@@ -1,9 +1,9 @@
-use axum::http::StatusCode;
+//! HTTP utilities for API handlers.
 
-/// Shared API error type for handlers.
-pub type ApiError = (StatusCode, String);
+pub use crate::error::ApiError;
 
-/// Convert an internal error into a 500 response payload.
+/// Convert an internal error into an ApiError.
+/// Logs the full error but returns a sanitized message to the client.
 pub fn internal_error<E: std::fmt::Display>(err: E) -> ApiError {
-    (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+    ApiError::internal(err)
 }

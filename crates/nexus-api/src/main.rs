@@ -1,5 +1,11 @@
+mod error;
 mod handlers;
 mod http;
+mod middleware;
+mod models;
+mod openapi;
+mod params;
+mod response;
 mod router;
 mod state;
 

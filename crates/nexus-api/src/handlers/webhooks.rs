@@ -1,14 +1,15 @@
 use axum::Json;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::HeaderMap;
 use nexus_db::{JobStore, MailingListStore};
+use schemars::JsonSchema;
 use serde::Serialize;
 use tracing::info;
 
 use crate::http::{ApiError, internal_error};
 use crate::state::ApiState;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct WebhookEnqueueResponse {
     pub queued: usize,
 }
@@ -24,10 +25,7 @@ pub async fn grokmirror_webhook(
             .get("x-nexus-webhook-secret")
             .and_then(|value| value.to_str().ok());
         if provided != Some(secret) {
-            return Err((
-                StatusCode::UNAUTHORIZED,
-                "invalid webhook secret".to_string(),
-            ));
+            return Err(ApiError::unauthorized("invalid webhook secret"));
         }
     }
 
