@@ -7,16 +7,17 @@ use gix::hash::ObjectId;
 use nexus_core::config::Settings;
 use nexus_db::{
     CatalogStore, EnqueueJobParams, IngestStore, Job, JobStore, JobStoreMetrics, ParsedBodyInput,
-    ParsedMessageInput, ThreadComponentWrite, ThreadMessageWrite, ThreadNodeWrite,
-    ThreadSummaryWrite, ThreadingStore,
+    ParsedMessageInput, ThreadComponentWrite, ThreadMessageWrite, ThreadNodeWrite, ThreadSummaryWrite,
+    ThreadingStore, LineageStore,
 };
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
+use crate::lineage::{process_patch_extract_window, process_patch_id_compute_batch};
 use crate::mail::{ParseEmailError, parse_email};
 use crate::payloads::{
-    IngestCommitBatchPayload, RepoScanPayload, ThreadingRebuildListPayload,
-    ThreadingUpdateWindowPayload,
+    IngestCommitBatchPayload, LineageRebuildListPayload, PatchExtractWindowPayload,
+    PatchIdComputeBatchPayload, RepoScanPayload, ThreadingRebuildListPayload, ThreadingUpdateWindowPayload,
 };
 use crate::scanner::{chunk_commit_oids, collect_new_commit_oids};
 use crate::threading::{ThreadingInputMessage, build_threads};
@@ -28,6 +29,7 @@ pub struct Phase0JobHandler {
     catalog: CatalogStore,
     ingest: IngestStore,
     threading: ThreadingStore,
+    lineage: LineageStore,
     jobs: JobStore,
 }
 
@@ -37,6 +39,7 @@ impl Phase0JobHandler {
         catalog: CatalogStore,
         ingest: IngestStore,
         threading: ThreadingStore,
+        lineage: LineageStore,
         jobs: JobStore,
     ) -> Self {
         Self {
@@ -44,6 +47,7 @@ impl Phase0JobHandler {
             catalog,
             ingest,
             threading,
+            lineage,
             jobs,
         }
     }
@@ -54,6 +58,9 @@ impl Phase0JobHandler {
             "ingest_commit_batch" => self.handle_ingest_commit_batch(job, ctx).await,
             "threading_update_window" => self.handle_threading_update_window(job, ctx).await,
             "threading_rebuild_list" => self.handle_threading_rebuild_list(job, ctx).await,
+            "lineage_rebuild_list" => self.handle_lineage_rebuild_list(job, ctx).await,
+            "patch_extract_window" => self.handle_patch_extract_window(job, ctx).await,
+            "patch_id_compute_batch" => self.handle_patch_id_compute_batch(job, ctx).await,
             other => JobExecutionOutcome::Terminal {
                 reason: format!("unknown job type: {other}"),
                 kind: "invalid_job_type".to_string(),
@@ -720,6 +727,39 @@ impl Phase0JobHandler {
             + apply_stats.messages_written
             + apply_stats.stale_threads_removed;
 
+        let mut lineage_enqueued = false;
+        if !anchors.is_empty() {
+            let patch_extract_payload = PatchExtractWindowPayload {
+                list_key: payload.list_key.clone(),
+                anchor_message_pks: anchors.clone(),
+                source_job_id: Some(job.id),
+            };
+
+            if let Err(err) = self
+                .jobs
+                .enqueue(EnqueueJobParams {
+                    job_type: "patch_extract_window".to_string(),
+                    payload_json: serde_json::to_value(patch_extract_payload)
+                        .unwrap_or_else(|_| serde_json::json!({})),
+                    priority: 11,
+                    dedupe_scope: Some(format!("list:{}", payload.list_key)),
+                    dedupe_key: Some(hash_message_pks(&anchors)),
+                    run_after: None,
+                    max_attempts: Some(8),
+                })
+                .await
+            {
+                return retryable_error(
+                    format!("failed to enqueue patch_extract_window: {err}"),
+                    "db",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+            lineage_enqueued = true;
+        }
+
         JobExecutionOutcome::Success {
             result_json: serde_json::json!({
                 "list_key": payload.list_key,
@@ -730,6 +770,7 @@ impl Phase0JobHandler {
                 "dummy_nodes_written": apply_stats.dummy_nodes_written,
                 "messages_written": apply_stats.messages_written,
                 "stale_threads_removed": apply_stats.stale_threads_removed,
+                "lineage_enqueued": lineage_enqueued,
             }),
             metrics: JobStoreMetrics {
                 duration_ms: started.elapsed().as_millis(),
@@ -872,6 +913,302 @@ impl Phase0JobHandler {
             },
         }
     }
+
+    async fn handle_lineage_rebuild_list(
+        &self,
+        job: Job,
+        _ctx: ExecutionContext,
+    ) -> JobExecutionOutcome {
+        let started = Instant::now();
+
+        let payload: LineageRebuildListPayload =
+            match serde_json::from_value(job.payload_json.clone()) {
+                Ok(v) => v,
+                Err(err) => {
+                    return JobExecutionOutcome::Terminal {
+                        reason: format!("invalid lineage_rebuild_list payload: {err}"),
+                        kind: "payload".to_string(),
+                        metrics: empty_metrics(started.elapsed().as_millis()),
+                    };
+                }
+            };
+
+        let list = match self.catalog.get_mailing_list(&payload.list_key).await {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                return JobExecutionOutcome::Terminal {
+                    reason: format!("mailing list not found for list_key={}", payload.list_key),
+                    kind: "not_found".to_string(),
+                    metrics: empty_metrics(started.elapsed().as_millis()),
+                };
+            }
+            Err(err) => {
+                return retryable_error(
+                    format!("failed to load mailing list: {err}"),
+                    "db",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+        };
+
+        let mut cursor = 0i64;
+        let mut queued_chunks = 0u64;
+        let mut queued_messages = 0u64;
+        let batch_limit = self.settings.mail.commit_batch_size.max(1) as i64;
+
+        loop {
+            let chunk = match self
+                .threading
+                .list_message_pks_for_rebuild(
+                    list.id,
+                    payload.from_seen_at,
+                    payload.to_seen_at,
+                    cursor,
+                    batch_limit,
+                )
+                .await
+            {
+                Ok(v) => v,
+                Err(err) => {
+                    return retryable_error(
+                        format!("failed to load lineage rebuild chunk: {err}"),
+                        "db",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
+                }
+            };
+
+            if chunk.is_empty() {
+                break;
+            }
+
+            cursor = *chunk.last().unwrap_or(&cursor);
+            let dedupe_key = hash_message_pks(&chunk);
+            let patch_extract_payload = PatchExtractWindowPayload {
+                list_key: payload.list_key.clone(),
+                anchor_message_pks: chunk.clone(),
+                source_job_id: Some(job.id),
+            };
+
+            if let Err(err) = self
+                .jobs
+                .enqueue(EnqueueJobParams {
+                    job_type: "patch_extract_window".to_string(),
+                    payload_json: serde_json::to_value(patch_extract_payload)
+                        .unwrap_or_else(|_| serde_json::json!({})),
+                    priority: 10,
+                    dedupe_scope: Some(format!("list:{}", payload.list_key)),
+                    dedupe_key: Some(dedupe_key),
+                    run_after: None,
+                    max_attempts: Some(8),
+                })
+                .await
+            {
+                return retryable_error(
+                    format!("failed to enqueue patch_extract_window chunk: {err}"),
+                    "db",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+
+            queued_chunks += 1;
+            queued_messages += chunk.len() as u64;
+        }
+
+        info!(
+            list_key = %payload.list_key,
+            queued_chunks,
+            queued_messages,
+            "lineage_rebuild_list enqueued patch extraction jobs"
+        );
+
+        JobExecutionOutcome::Success {
+            result_json: serde_json::json!({
+                "list_key": payload.list_key,
+                "queued_chunks": queued_chunks,
+                "queued_messages": queued_messages,
+                "from_seen_at": payload.from_seen_at,
+                "to_seen_at": payload.to_seen_at,
+            }),
+            metrics: JobStoreMetrics {
+                duration_ms: started.elapsed().as_millis(),
+                rows_written: queued_chunks,
+                bytes_read: 0,
+                commit_count: queued_messages,
+                parse_errors: 0,
+            },
+        }
+    }
+
+    async fn handle_patch_extract_window(
+        &self,
+        job: Job,
+        _ctx: ExecutionContext,
+    ) -> JobExecutionOutcome {
+        let started = Instant::now();
+
+        let payload: PatchExtractWindowPayload =
+            match serde_json::from_value(job.payload_json.clone()) {
+                Ok(v) => v,
+                Err(err) => {
+                    return JobExecutionOutcome::Terminal {
+                        reason: format!("invalid patch_extract_window payload: {err}"),
+                        kind: "payload".to_string(),
+                        metrics: empty_metrics(started.elapsed().as_millis()),
+                    };
+                }
+            };
+
+        let list = match self.catalog.get_mailing_list(&payload.list_key).await {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                return JobExecutionOutcome::Terminal {
+                    reason: format!("mailing list not found for list_key={}", payload.list_key),
+                    kind: "not_found".to_string(),
+                    metrics: empty_metrics(started.elapsed().as_millis()),
+                };
+            }
+            Err(err) => {
+                return retryable_error(
+                    format!("failed to load mailing list: {err}"),
+                    "db",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+        };
+
+        let mut anchors = payload.anchor_message_pks.clone();
+        anchors.sort_unstable();
+        anchors.dedup();
+        anchors.retain(|v| *v > 0);
+
+        let extract_outcome = match process_patch_extract_window(&self.lineage, list.id, &anchors).await
+        {
+            Ok(v) => v,
+            Err(err) => {
+                return retryable_error(
+                    format!("patch lineage extraction failed: {err}"),
+                    "parse",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+        };
+
+        let mut patch_id_compute_enqueued = false;
+        if !extract_outcome.patch_item_ids.is_empty() {
+            let dedupe_key = hash_i64_list(&extract_outcome.patch_item_ids);
+            let patch_id_payload = PatchIdComputeBatchPayload {
+                patch_item_ids: extract_outcome.patch_item_ids.clone(),
+                source_job_id: Some(job.id),
+            };
+
+            if let Err(err) = self
+                .jobs
+                .enqueue(EnqueueJobParams {
+                    job_type: "patch_id_compute_batch".to_string(),
+                    payload_json: serde_json::to_value(patch_id_payload)
+                        .unwrap_or_else(|_| serde_json::json!({})),
+                    priority: 10,
+                    dedupe_scope: Some(format!("list:{}", payload.list_key)),
+                    dedupe_key: Some(dedupe_key),
+                    run_after: None,
+                    max_attempts: Some(8),
+                })
+                .await
+            {
+                return retryable_error(
+                    format!("failed to enqueue patch_id_compute_batch: {err}"),
+                    "db",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+            patch_id_compute_enqueued = true;
+        }
+
+        JobExecutionOutcome::Success {
+            result_json: serde_json::json!({
+                "list_key": payload.list_key,
+                "source_job_id": payload.source_job_id,
+                "series_versions_written": extract_outcome.series_versions_written,
+                "patch_items_written": extract_outcome.patch_items_written,
+                "series_ids": extract_outcome.series_ids,
+                "patch_item_ids_count": extract_outcome.patch_item_ids.len(),
+                "patch_id_compute_enqueued": patch_id_compute_enqueued,
+            }),
+            metrics: JobStoreMetrics {
+                duration_ms: started.elapsed().as_millis(),
+                rows_written: extract_outcome.series_versions_written + extract_outcome.patch_items_written,
+                bytes_read: anchors.len() as u64,
+                commit_count: extract_outcome.series_ids.len() as u64,
+                parse_errors: 0,
+            },
+        }
+    }
+
+    async fn handle_patch_id_compute_batch(
+        &self,
+        job: Job,
+        _ctx: ExecutionContext,
+    ) -> JobExecutionOutcome {
+        let started = Instant::now();
+
+        let payload: PatchIdComputeBatchPayload =
+            match serde_json::from_value(job.payload_json.clone()) {
+                Ok(v) => v,
+                Err(err) => {
+                    return JobExecutionOutcome::Terminal {
+                        reason: format!("invalid patch_id_compute_batch payload: {err}"),
+                        kind: "payload".to_string(),
+                        metrics: empty_metrics(started.elapsed().as_millis()),
+                    };
+                }
+            };
+
+        let mut patch_item_ids = payload.patch_item_ids.clone();
+        patch_item_ids.sort_unstable();
+        patch_item_ids.dedup();
+        patch_item_ids.retain(|v| *v > 0);
+
+        let outcome = match process_patch_id_compute_batch(&self.lineage, &patch_item_ids).await {
+            Ok(v) => v,
+            Err(err) => {
+                return retryable_error(
+                    format!("patch-id compute failed: {err}"),
+                    "parse",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+        };
+
+        JobExecutionOutcome::Success {
+            result_json: serde_json::json!({
+                "source_job_id": payload.source_job_id,
+                "patch_item_ids_count": patch_item_ids.len(),
+                "patch_items_updated": outcome.patch_items_updated,
+            }),
+            metrics: JobStoreMetrics {
+                duration_ms: started.elapsed().as_millis(),
+                rows_written: outcome.patch_items_updated,
+                bytes_read: 0,
+                commit_count: patch_item_ids.len() as u64,
+                parse_errors: 0,
+            },
+        }
+    }
 }
 
 fn empty_metrics(duration_ms: u128) -> JobStoreMetrics {
@@ -906,13 +1243,17 @@ fn retryable_error(
 }
 
 fn hash_message_pks(message_pks: &[i64]) -> String {
-    let mut sorted = message_pks.to_vec();
+    hash_i64_list(message_pks)
+}
+
+fn hash_i64_list(values: &[i64]) -> String {
+    let mut sorted = values.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
 
     let mut hasher = Sha256::new();
-    for message_pk in &sorted {
-        hasher.update(message_pk.to_be_bytes());
+    for value in &sorted {
+        hasher.update(value.to_be_bytes());
     }
 
     let bytes = hasher.finalize();

@@ -1,5 +1,9 @@
 mod engine;
+mod lineage;
 pub mod mail;
+mod patch_detect;
+mod patch_id;
+mod patch_subject;
 mod pipeline;
 pub mod payloads;
 mod scanner;

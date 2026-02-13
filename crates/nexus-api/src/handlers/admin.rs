@@ -6,7 +6,7 @@ use axum::Json;
 use axum::extract::{Path as AxumPath, Query, State};
 use chrono::{DateTime, Utc};
 use nexus_db::{EnqueueJobParams, Job, JobState, ListJobsParams};
-use nexus_jobs::payloads::{RepoScanPayload, ThreadingRebuildListPayload};
+use nexus_jobs::payloads::{LineageRebuildListPayload, RepoScanPayload, ThreadingRebuildListPayload};
 use serde::{Deserialize, Serialize};
 
 use crate::state::ApiState;
@@ -282,6 +282,68 @@ pub async fn threading_rebuild(
         .jobs
         .enqueue(EnqueueJobParams {
             job_type: "threading_rebuild_list".to_string(),
+            payload_json: serde_json::to_value(payload)
+                .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?,
+            priority: 11,
+            dedupe_scope: Some(format!("list:{}", query.list_key)),
+            dedupe_key: Some(dedupe_key),
+            run_after: None,
+            max_attempts: Some(8),
+        })
+        .await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(EnqueueResponse { job_id: job.id }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LineageRebuildQuery {
+    pub list_key: String,
+    #[serde(default)]
+    pub from: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub to: Option<DateTime<Utc>>,
+}
+
+pub async fn lineage_rebuild(
+    State(state): State<ApiState>,
+    Query(query): Query<LineageRebuildQuery>,
+) -> Result<Json<EnqueueResponse>, axum::http::StatusCode> {
+    let exists = state
+        .catalog
+        .get_mailing_list(&query.list_key)
+        .await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?
+        .is_some();
+    if !exists {
+        return Err(axum::http::StatusCode::NOT_FOUND);
+    }
+
+    let payload = LineageRebuildListPayload {
+        list_key: query.list_key.clone(),
+        from_seen_at: query.from,
+        to_seen_at: query.to,
+    };
+
+    let dedupe_key = format!(
+        "{}:{}:{}:lineage",
+        query.list_key,
+        query
+            .from
+            .as_ref()
+            .map(DateTime::<Utc>::to_rfc3339)
+            .unwrap_or_else(|| "-".to_string()),
+        query
+            .to
+            .as_ref()
+            .map(DateTime::<Utc>::to_rfc3339)
+            .unwrap_or_else(|| "-".to_string())
+    );
+
+    let job = state
+        .jobs
+        .enqueue(EnqueueJobParams {
+            job_type: "lineage_rebuild_list".to_string(),
             payload_json: serde_json::to_value(payload)
                 .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?,
             priority: 11,

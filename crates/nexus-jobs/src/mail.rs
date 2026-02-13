@@ -6,13 +6,10 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use sha2::{Digest, Sha256};
 
+use crate::patch_detect::{extract_diff_text, has_diff_markers, normalize_line_endings};
+
 static MESSAGE_ID_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"<([^<>\s]+)>").expect("valid message-id regex"));
-
-static DIFF_MARKER_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?m)^(diff --git |---\s+\S|\+\+\+\s+\S|GIT binary patch)")
-        .expect("valid diff marker regex")
-});
 
 #[derive(Debug, thiserror::Error)]
 pub enum ParseEmailError {
@@ -143,8 +140,12 @@ pub fn parse_email(raw_rfc822: &[u8]) -> Result<ParseOutcome, ParseEmailError> {
             .unwrap_or(false);
 
         let normalized_body = normalize_line_endings(&body);
-        if looks_like_patch_mime || looks_like_patch_name || DIFF_MARKER_REGEX.is_match(&normalized_body) {
-            diff_parts.push(normalized_body);
+        if looks_like_patch_mime || looks_like_patch_name {
+            diff_parts.push(
+                extract_diff_text(&normalized_body).unwrap_or_else(|| normalized_body.clone()),
+            );
+        } else if let Some(extracted) = extract_diff_text(&normalized_body) {
+            diff_parts.push(extracted);
         }
 
         if body_text.is_none() && mime.starts_with("text/") {
@@ -165,7 +166,7 @@ pub fn parse_email(raw_rfc822: &[u8]) -> Result<ParseOutcome, ParseEmailError> {
         .unwrap_or(false)
         || body_text
             .as_ref()
-            .map(|v| DIFF_MARKER_REGEX.is_match(v))
+            .map(|v| has_diff_markers(v))
             .unwrap_or(false);
 
     let body_for_hash = body_text
@@ -308,10 +309,6 @@ fn normalize_subject(subject: &str) -> String {
     }
 
     normalized.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn normalize_line_endings(text: &str) -> String {
-    text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 fn normalize_text_for_hash(text: &str) -> String {
@@ -499,5 +496,40 @@ mod tests {
         assert!(parsed.has_attachments);
         assert!(parsed.has_diff);
         assert!(parsed.diff_text.unwrap_or_default().contains("diff --git"));
+    }
+
+    #[test]
+    fn parser_extracts_format_patch_diff_section() {
+        let raw = concat!(
+            "From: Alice <alice@example.com>\r\n",
+            "Message-ID: <fmt@example.com>\r\n",
+            "Date: Tue, 1 Jan 2024 00:00:00 +0000\r\n",
+            "Subject: [PATCH] sample\r\n",
+            "Content-Type: text/plain; charset=utf-8\r\n",
+            "\r\n",
+            "From abcdef Mon Sep 17 00:00:00 2001\r\n",
+            "Subject: [PATCH] sample\r\n",
+            "\r\n",
+            "demo message\r\n",
+            "\r\n",
+            "---\r\n",
+            " foo.c | 2 +-\r\n",
+            " 1 file changed, 1 insertion(+), 1 deletion(-)\r\n",
+            "\r\n",
+            "diff --git a/foo.c b/foo.c\r\n",
+            "index 1111111..2222222 100644\r\n",
+            "--- a/foo.c\r\n",
+            "+++ b/foo.c\r\n",
+            "@@ -1 +1 @@\r\n",
+            "-old\r\n",
+            "+new\r\n"
+        )
+        .as_bytes()
+        .to_vec();
+
+        let parsed = parse_email(&raw).expect("parse should succeed");
+        assert!(parsed.has_diff);
+        let diff = parsed.diff_text.unwrap_or_default();
+        assert!(diff.starts_with("diff --git a/foo.c b/foo.c"));
     }
 }

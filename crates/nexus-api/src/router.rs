@@ -21,6 +21,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/ingest/sync", post(admin::ingest_sync))
         .route("/ingest/reset-watermark", post(admin::reset_watermark))
         .route("/threading/rebuild", post(admin::threading_rebuild))
+        .route("/lineage/rebuild", post(admin::lineage_rebuild))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_admin,

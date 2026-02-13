@@ -4,6 +4,7 @@ mod catalog;
 mod db;
 mod ingest;
 mod jobs;
+mod lineage;
 mod models;
 mod threading;
 
@@ -12,6 +13,11 @@ pub use crate::db::Db;
 pub use crate::ingest::{IngestStore, ParsedBodyInput, ParsedMessageInput, WriteOutcome};
 pub use crate::jobs::{
     EnqueueJobParams, JobAttempt, JobStore, JobStoreMetrics, ListJobsParams, RetryDecision,
+};
+pub use crate::lineage::{
+    AssembledItemRecord, LineageSourceMessage, LineageStore, PatchItemDiffRecord, PatchItemRecord,
+    PatchLogicalRecord, PatchSeriesRecord, PatchSeriesVersionRecord, SeriesVersionPatchRef,
+    UpsertPatchItemInput, UpsertPatchSeriesInput, UpsertPatchSeriesVersionInput,
 };
 pub use crate::models::{Job, JobState};
 pub use crate::threading::{

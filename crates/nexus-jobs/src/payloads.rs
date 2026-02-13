@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoScanPayload {
@@ -30,4 +30,24 @@ pub struct ThreadingRebuildListPayload {
     pub list_key: String,
     pub from_seen_at: Option<DateTime<Utc>>,
     pub to_seen_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LineageRebuildListPayload {
+    pub list_key: String,
+    pub from_seen_at: Option<DateTime<Utc>>,
+    pub to_seen_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatchExtractWindowPayload {
+    pub list_key: String,
+    pub anchor_message_pks: Vec<i64>,
+    pub source_job_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatchIdComputeBatchPayload {
+    pub patch_item_ids: Vec<i64>,
+    pub source_job_id: Option<i64>,
 }
