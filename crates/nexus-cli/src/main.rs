@@ -1,12 +1,20 @@
-mod cli;
-mod commands;
-mod config;
-mod manifest;
-
-use clap::Parser;
+use clap::{Parser, Subcommand};
+use nexus_core::config;
+use nexus_db::{CatalogStore, Db};
 use tracing_subscriber::EnvFilter;
 
-use crate::cli::{Cli, Command};
+#[derive(Debug, Parser)]
+#[command(name = "nexus-cli", about = "Nexus KB phase0 admin CLI")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Debug, Subcommand)]
+enum Commands {
+    /// Seed pilot mailing lists (lkml + bpf)
+    SeedPilot,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -19,10 +27,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let cli = Cli::parse();
+    let settings = config::load()?;
+    let db = Db::connect(&settings.database).await?;
+    db.migrate().await?;
 
     match cli.command {
-        Command::ImportMailingLists => commands::import_mailing_lists::run().await?,
-        Command::ResetDb => commands::reset_db::run().await?,
+        Commands::SeedPilot => {
+            let catalog = CatalogStore::new(db.pool().clone());
+            catalog.ensure_mailing_list("lkml").await?;
+            catalog.ensure_mailing_list("bpf").await?;
+            println!("Seeded mailing lists: lkml, bpf");
+        }
     }
 
     Ok(())

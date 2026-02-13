@@ -10,14 +10,12 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 nexus-core = { path = "../nexus-core" }
 nexus-db = { path = "../nexus-db" }
+nexus-jobs = { path = "../nexus-jobs" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-config = { workspace = true }
-nexus-jobs = { path = "../nexus-jobs" }
 chrono = { workspace = true }
 sqlx = { workspace = true }
-okapi = { workspace = true }
-schemars = { workspace = true }
+reqwest = { workspace = true }
+thiserror = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
-uuid = { workspace = true }

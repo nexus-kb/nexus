@@ -1,6 +1,6 @@
 use nexus_core::config;
 use nexus_db::Db;
-use nexus_jobs::{JobRunner, JobRunnerConfig, MailJobHandler};
+use nexus_jobs::Phase0Worker;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -17,8 +17,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = Db::connect(&settings.database).await?;
     db.migrate().await?;
 
-    let runner = JobRunner::new(db.clone(), JobRunnerConfig::default());
-    let handler = MailJobHandler::new(db, settings.mail.mirror_root.into());
-    runner.run(handler).await?;
+    let worker = Phase0Worker::new(settings, db);
+    worker.run().await?;
+
     Ok(())
 }

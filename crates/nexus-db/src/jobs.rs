@@ -1,44 +1,56 @@
-use chrono::{DateTime, Utc};
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-use sqlx::Row;
-use sqlx::{PgPool, Postgres, Transaction};
-use std::time::Duration;
+use chrono::{DateTime, Duration, Utc};
+use serde::Serialize;
+use sqlx::{PgPool, QueryBuilder};
 
-use crate::Result;
+use crate::{Job, JobState, Result};
 
-/// Background job record stored in Postgres.
-#[derive(Debug, Serialize, Deserialize, JsonSchema, sqlx::FromRow, Clone)]
-pub struct Job {
+#[derive(Debug, Clone)]
+pub struct EnqueueJobParams {
+    pub job_type: String,
+    pub payload_json: serde_json::Value,
+    pub priority: i32,
+    pub dedupe_scope: Option<String>,
+    pub dedupe_key: Option<String>,
+    pub run_after: Option<DateTime<Utc>>,
+    pub max_attempts: Option<i32>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ListJobsParams {
+    pub state: Option<JobState>,
+    pub job_type: Option<String>,
+    pub limit: i64,
+    pub cursor: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct JobAttempt {
     pub id: i64,
-    pub queue: String,
-    pub payload: serde_json::Value,
+    pub job_id: i64,
+    pub attempt: i32,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
     pub status: String,
-    pub run_at: DateTime<Utc>,
-    pub attempts: i32,
-    pub max_attempts: i32,
-    pub locked_at: Option<DateTime<Utc>>,
-    pub locked_by: Option<String>,
-    pub last_error: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub error: Option<String>,
+    pub metrics_json: Option<serde_json::Value>,
 }
 
-/// Aggregate count per job status.
-#[derive(Debug, Serialize, JsonSchema)]
-pub struct StatusCount {
-    pub status: String,
-    pub count: i64,
+#[derive(Debug, Clone, Serialize)]
+pub struct JobStoreMetrics {
+    pub duration_ms: u128,
+    pub rows_written: u64,
+    pub bytes_read: u64,
+    pub commit_count: u64,
+    pub parse_errors: u64,
 }
 
-/// Summary statistics for the jobs table.
-#[derive(Debug, Serialize, JsonSchema)]
-pub struct JobStats {
-    pub total: i64,
-    pub by_status: Vec<StatusCount>,
+#[derive(Debug, Clone)]
+pub struct RetryDecision {
+    pub reason: String,
+    pub kind: String,
+    pub run_after: DateTime<Utc>,
 }
 
-/// Job persistence and queue helpers.
 #[derive(Clone)]
 pub struct JobStore {
     pool: PgPool,
@@ -49,160 +61,347 @@ impl JobStore {
         Self { pool }
     }
 
-    pub async fn enqueue(
-        &self,
-        queue: &str,
-        payload: serde_json::Value,
-        run_at: Option<DateTime<Utc>>,
-        max_attempts: Option<i32>,
-    ) -> Result<Job> {
-        let job = sqlx::query_as::<_, Job>(
-            r#"INSERT INTO jobs (queue, payload, run_at, max_attempts)
-            VALUES ($1, $2, COALESCE($3, NOW()), COALESCE($4, 5))
-            RETURNING id, queue, payload, status, run_at, attempts, max_attempts, locked_at, locked_by, last_error, created_at, updated_at
-            "#,
-        )
-        .bind(queue)
-        .bind(payload)
-        .bind(run_at)
-        .bind(max_attempts)
-        .fetch_one(&self.pool)
-        .await?;
+    pub async fn enqueue(&self, params: EnqueueJobParams) -> Result<Job> {
+        let dedupe_scope = params.dedupe_scope.unwrap_or_else(|| "global".to_string());
+        let max_attempts = params.max_attempts.unwrap_or(8);
+        let run_after = params.run_after.unwrap_or_else(Utc::now);
+        let state = if run_after > Utc::now() {
+            JobState::Scheduled
+        } else {
+            JobState::Queued
+        };
 
-        // Notify listeners that work is available; payload is just the queue name to keep NOTIFY cheap.
+        let job = if let Some(dedupe_key) = params.dedupe_key {
+            sqlx::query_as::<_, Job>(
+                r#"INSERT INTO jobs
+                (job_type, state, priority, run_after, dedupe_scope, dedupe_key, max_attempts, payload_json)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                ON CONFLICT (job_type, dedupe_scope, dedupe_key)
+                DO UPDATE SET updated_at = now()
+                RETURNING *"#,
+            )
+            .bind(&params.job_type)
+            .bind(state)
+            .bind(params.priority)
+            .bind(run_after)
+            .bind(&dedupe_scope)
+            .bind(dedupe_key)
+            .bind(max_attempts)
+            .bind(&params.payload_json)
+            .fetch_one(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, Job>(
+                r#"INSERT INTO jobs
+                (job_type, state, priority, run_after, dedupe_scope, max_attempts, payload_json)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                RETURNING *"#,
+            )
+            .bind(&params.job_type)
+            .bind(state)
+            .bind(params.priority)
+            .bind(run_after)
+            .bind(&dedupe_scope)
+            .bind(max_attempts)
+            .bind(&params.payload_json)
+            .fetch_one(&self.pool)
+            .await?
+        };
+
         let _ = sqlx::query("SELECT pg_notify('nexus_jobs', $1)")
-            .bind(queue)
+            .bind(&job.job_type)
             .execute(&self.pool)
-            .await?;
+            .await;
 
         Ok(job)
     }
 
-    pub async fn fetch_and_claim(
-        &self,
-        queue: &str,
-        limit: i64,
-        worker_id: &str,
-    ) -> Result<Vec<Job>> {
-        let mut tx: Transaction<'_, Postgres> = self.pool.begin().await?;
+    pub async fn list(&self, params: ListJobsParams) -> Result<Vec<Job>> {
+        let mut qb = QueryBuilder::new("SELECT * FROM jobs WHERE true");
 
-        // Reserve a batch of due jobs using SKIP LOCKED so multiple workers can safely compete.
-        let jobs = sqlx::query_as::<_, Job>(
-            r#"
-            WITH grabbed AS (
-                SELECT id
-                FROM jobs
-                WHERE status = 'queued'
-                  AND queue = $1
-                  AND run_at <= NOW()
-                ORDER BY run_at
-                FOR UPDATE SKIP LOCKED
-                LIMIT $2
-            ), updated AS (
-                UPDATE jobs j
-                SET status = 'running', locked_at = NOW(), locked_by = $3
-                WHERE j.id IN (SELECT id FROM grabbed)
-                RETURNING j.*
-            )
-            SELECT * FROM updated
-            "#,
-        )
-        .bind(queue)
-        .bind(limit)
-        .bind(worker_id)
-        .fetch_all(&mut *tx)
-        .await?;
+        if let Some(state) = params.state {
+            qb.push(" AND state = ").push_bind(state);
+        }
+        if let Some(job_type) = params.job_type {
+            qb.push(" AND job_type = ").push_bind(job_type);
+        }
+        if let Some(cursor) = params.cursor {
+            qb.push(" AND id < ").push_bind(cursor);
+        }
 
-        tx.commit().await?;
-        Ok(jobs)
+        qb.push(" ORDER BY id DESC LIMIT ")
+            .push_bind(params.limit.clamp(1, 500));
+
+        qb.build_query_as::<Job>().fetch_all(&self.pool).await
     }
 
-    pub async fn mark_succeeded(&self, job_id: i64) -> Result<()> {
-        sqlx::query("UPDATE jobs SET status = 'succeeded', locked_at = NULL, locked_by = NULL WHERE id = $1")
-        .bind(job_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    pub async fn mark_failed(&self, job_id: i64, error: &str, backoff: Duration) -> Result<()> {
-        // Increment attempts, requeue with backoff if we have retries left, otherwise mark failed.
-        sqlx::query(
-            r#"
-            UPDATE jobs
-            SET attempts = attempts + 1,
-                status = CASE WHEN attempts + 1 >= max_attempts THEN 'failed' ELSE 'queued' END,
-                run_at = CASE WHEN attempts + 1 >= max_attempts THEN run_at ELSE NOW() + ($2::bigint * INTERVAL '1 millisecond') END,
-                locked_at = NULL,
-                locked_by = NULL,
-                last_error = $1
-            WHERE id = $3
-            "#,
-        )
-        .bind(error)
-        .bind(backoff.as_millis() as i64)
-        .bind(job_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    pub async fn find_by_id(&self, job_id: i64) -> Result<Option<Job>> {
-        sqlx::query_as::<_, Job>(r#"SELECT * FROM jobs WHERE id = $1"#)
+    pub async fn get(&self, job_id: i64) -> Result<Option<Job>> {
+        sqlx::query_as::<_, Job>("SELECT * FROM jobs WHERE id = $1")
             .bind(job_id)
             .fetch_optional(&self.pool)
             .await
     }
 
-    pub async fn list(&self, status: Option<&str>, limit: i64, offset: i64) -> Result<Vec<Job>> {
-        if let Some(status) = status {
-            sqlx::query_as::<_, Job>(
-                r#"SELECT * FROM jobs WHERE status = $1 ORDER BY id DESC LIMIT $2 OFFSET $3"#,
-            )
-            .bind(status)
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await
-        } else {
-            sqlx::query_as::<_, Job>(r#"SELECT * FROM jobs ORDER BY id DESC LIMIT $1 OFFSET $2"#)
-                .bind(limit)
-                .bind(offset)
-                .fetch_all(&self.pool)
-                .await
-        }
+    pub async fn request_cancel(&self, job_id: i64) -> Result<Option<Job>> {
+        sqlx::query_as::<_, Job>(
+            r#"UPDATE jobs
+            SET state = CASE WHEN state IN ('queued', 'scheduled', 'failed_retryable') THEN 'cancelled'::job_state ELSE state END,
+                cancel_requested = CASE WHEN state = 'running' THEN true ELSE cancel_requested END,
+                updated_at = now()
+            WHERE id = $1
+            RETURNING *"#,
+        )
+        .bind(job_id)
+        .fetch_optional(&self.pool)
+        .await
     }
 
-    pub async fn stats(&self) -> Result<JobStats> {
-        let total = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM jobs")
-            .fetch_one(&self.pool)
-            .await?;
-
-        let by_status =
-            sqlx::query(r#"SELECT status, COUNT(*) as count FROM jobs GROUP BY status"#)
-                .fetch_all(&self.pool)
-                .await?
-                .into_iter()
-                .map(|row| StatusCount {
-                    status: row.get::<String, _>("status"),
-                    count: row.get::<i64, _>("count"),
-                })
-                .collect();
-
-        Ok(JobStats { total, by_status })
+    pub async fn retry(&self, job_id: i64, run_after: DateTime<Utc>) -> Result<Option<Job>> {
+        sqlx::query_as::<_, Job>(
+            r#"UPDATE jobs
+            SET state = CASE WHEN $2 > now() THEN 'scheduled'::job_state ELSE 'queued'::job_state END,
+                run_after = $2,
+                claimed_by = NULL,
+                lease_until = NULL,
+                cancel_requested = false,
+                updated_at = now(),
+                last_error = NULL,
+                last_error_kind = NULL
+            WHERE id = $1
+            RETURNING *"#,
+        )
+        .bind(job_id)
+        .bind(run_after)
+        .fetch_optional(&self.pool)
+        .await
     }
-}
 
-/// Send a NOTIFY to wake queue listeners.
-pub async fn notify_queue(pool: &PgPool, queue: &str) -> Result<()> {
-    sqlx::query("SELECT pg_notify('nexus_jobs', $1)")
-        .bind(queue)
-        .execute(pool)
+    pub async fn promote_ready_jobs(&self) -> Result<u64> {
+        let result = sqlx::query(
+            r#"UPDATE jobs
+            SET state = 'queued', updated_at = now()
+            WHERE state IN ('scheduled', 'failed_retryable')
+              AND run_after <= now()"#,
+        )
+        .execute(&self.pool)
         .await?;
-    Ok(())
-}
 
-/// Human-friendly worker ID based on the current process id.
-pub fn worker_id() -> String {
-    format!("worker-{}", std::process::id())
+        Ok(result.rows_affected())
+    }
+
+    pub async fn requeue_stuck_jobs(&self) -> Result<(u64, u64)> {
+        let requeued = sqlx::query(
+            r#"UPDATE jobs
+            SET state = 'queued',
+                claimed_by = NULL,
+                lease_until = NULL,
+                updated_at = now(),
+                last_error = 'lease expired',
+                last_error_kind = 'transient'
+            WHERE state = 'running'
+              AND lease_until < now()
+              AND attempt < max_attempts"#,
+        )
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+
+        let terminal = sqlx::query(
+            r#"UPDATE jobs
+            SET state = 'failed_terminal',
+                claimed_by = NULL,
+                lease_until = NULL,
+                updated_at = now(),
+                last_error = 'lease expired and max attempts reached',
+                last_error_kind = 'transient'
+            WHERE state = 'running'
+              AND lease_until < now()
+              AND attempt >= max_attempts"#,
+        )
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+
+        Ok((requeued, terminal))
+    }
+
+    pub async fn claim_jobs(
+        &self,
+        limit: i64,
+        worker_id: &str,
+        lease_ms: i64,
+    ) -> Result<Vec<Job>> {
+        sqlx::query_as::<_, Job>(
+            r#"WITH picked AS (
+                SELECT id
+                FROM jobs
+                WHERE state = 'queued'
+                  AND run_after <= now()
+                ORDER BY priority DESC, run_after ASC, id ASC
+                FOR UPDATE SKIP LOCKED
+                LIMIT $1
+            )
+            UPDATE jobs j
+            SET state = 'running',
+                claimed_by = $2,
+                lease_until = now() + ($3::bigint * interval '1 millisecond'),
+                attempt = attempt + 1,
+                updated_at = now()
+            FROM picked
+            WHERE j.id = picked.id
+            RETURNING j.*"#,
+        )
+        .bind(limit)
+        .bind(worker_id)
+        .bind(lease_ms)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn heartbeat(&self, job_id: i64, worker_id: &str, lease_ms: i64) -> Result<bool> {
+        let result = sqlx::query(
+            r#"UPDATE jobs
+            SET lease_until = now() + ($3::bigint * interval '1 millisecond'),
+                updated_at = now()
+            WHERE id = $1
+              AND state = 'running'
+              AND claimed_by = $2"#,
+        )
+        .bind(job_id)
+        .bind(worker_id)
+        .bind(lease_ms)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn is_cancel_requested(&self, job_id: i64) -> Result<bool> {
+        sqlx::query_scalar::<_, bool>("SELECT cancel_requested FROM jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(&self.pool)
+            .await
+    }
+
+    pub async fn start_attempt(&self, job_id: i64, attempt: i32) -> Result<JobAttempt> {
+        sqlx::query_as::<_, JobAttempt>(
+            r#"INSERT INTO job_attempts (job_id, attempt, status)
+            VALUES ($1, $2, 'running')
+            RETURNING id, job_id, attempt, started_at, finished_at, status, error, metrics_json"#,
+        )
+        .bind(job_id)
+        .bind(attempt)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    pub async fn finish_attempt(
+        &self,
+        attempt_id: i64,
+        status: &str,
+        error: Option<&str>,
+        metrics_json: Option<serde_json::Value>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"UPDATE job_attempts
+            SET finished_at = now(),
+                status = $2,
+                error = $3,
+                metrics_json = $4
+            WHERE id = $1"#,
+        )
+        .bind(attempt_id)
+        .bind(status)
+        .bind(error)
+        .bind(metrics_json)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn mark_succeeded(
+        &self,
+        job_id: i64,
+        result_json: Option<serde_json::Value>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"UPDATE jobs
+            SET state = 'succeeded',
+                result_json = $2,
+                claimed_by = NULL,
+                lease_until = NULL,
+                cancel_requested = false,
+                updated_at = now()
+            WHERE id = $1"#,
+        )
+        .bind(job_id)
+        .bind(result_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn mark_retryable(&self, job_id: i64, retry: RetryDecision) -> Result<()> {
+        sqlx::query(
+            r#"UPDATE jobs
+            SET state = 'failed_retryable',
+                run_after = $2,
+                claimed_by = NULL,
+                lease_until = NULL,
+                updated_at = now(),
+                last_error = $3,
+                last_error_kind = $4
+            WHERE id = $1"#,
+        )
+        .bind(job_id)
+        .bind(retry.run_after)
+        .bind(retry.reason)
+        .bind(retry.kind)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn mark_terminal(&self, job_id: i64, reason: &str, kind: &str) -> Result<()> {
+        sqlx::query(
+            r#"UPDATE jobs
+            SET state = 'failed_terminal',
+                claimed_by = NULL,
+                lease_until = NULL,
+                updated_at = now(),
+                last_error = $2,
+                last_error_kind = $3
+            WHERE id = $1"#,
+        )
+        .bind(job_id)
+        .bind(reason)
+        .bind(kind)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn mark_cancelled(&self, job_id: i64, reason: &str) -> Result<()> {
+        sqlx::query(
+            r#"UPDATE jobs
+            SET state = 'cancelled',
+                claimed_by = NULL,
+                lease_until = NULL,
+                updated_at = now(),
+                last_error = $2,
+                last_error_kind = 'cancelled'
+            WHERE id = $1"#,
+        )
+        .bind(job_id)
+        .bind(reason)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub fn compute_backoff(base_ms: u64, max_ms: u64, attempt: i32) -> Duration {
+        let exponent = (attempt.max(1) as u32).saturating_sub(1);
+        let raw = base_ms.saturating_mul(2u64.saturating_pow(exponent));
+        Duration::milliseconds(raw.min(max_ms) as i64)
+    }
 }

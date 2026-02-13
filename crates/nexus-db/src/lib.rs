@@ -1,16 +1,17 @@
-//! Database access layer for Nexus.
+//! Nexus KB Phase 0 database layer.
 
+mod catalog;
 mod db;
-mod epochs;
+mod ingest;
 mod jobs;
-mod mail_ingest;
-mod mailing_lists;
+mod models;
 
+pub use crate::catalog::{CatalogStore, MailingList, MailingListRepo};
 pub use crate::db::Db;
-pub use crate::epochs::{MailingListEpoch, MailingListEpochStore};
-pub use crate::jobs::{Job, JobStats, JobStore, StatusCount, notify_queue, worker_id};
-pub use crate::mail_ingest::{EmailInput, EmailRecipient, MailIngestStore};
-pub use crate::mailing_lists::{MailingList, MailingListStore};
+pub use crate::ingest::{IngestStore, ParsedBodyInput, ParsedMessageInput, WriteOutcome};
+pub use crate::jobs::{
+    EnqueueJobParams, JobAttempt, JobStore, JobStoreMetrics, ListJobsParams, RetryDecision,
+};
+pub use crate::models::{Job, JobState};
 
-/// Shared result type for database operations.
 pub type Result<T> = std::result::Result<T, sqlx::Error>;

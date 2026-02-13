@@ -14,7 +14,7 @@ license = "MIT OR Apache-2.0"
 authors = ["Nexus Team"]
 
 [workspace.dependencies]
-axum = "0.8"
+axum = { version = "0.8", features = ["macros"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1.48", features = ["full"] }
@@ -27,10 +27,10 @@ async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 gix = "0.63"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "json"] }
-flate2 = "1.0"
 sha2 = "0.10"
-okapi = "0.7"
-schemars = { version = "0.8", features = ["chrono"] }
+regex = "1"
+mailparse = "0.15"
+anyhow = "1"
 
 sqlx = { version = "0.8", default-features = false, features = [
   "runtime-tokio-rustls",
@@ -42,5 +42,4 @@ sqlx = { version = "0.8", default-features = false, features = [
 ] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "set-header"] }
-uuid = { version = "1", features = ["v4"] }
+tower-http = { version = "0.6", features = ["trace", "cors", "set-header"] }
