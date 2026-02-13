@@ -13,11 +13,14 @@ use nexus_db::{
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
-use crate::lineage::{process_patch_extract_window, process_patch_id_compute_batch};
+use crate::lineage::{
+    process_diff_parse_patch_items, process_patch_extract_window, process_patch_id_compute_batch,
+};
 use crate::mail::{ParseEmailError, parse_email};
 use crate::payloads::{
-    IngestCommitBatchPayload, LineageRebuildListPayload, PatchExtractWindowPayload,
-    PatchIdComputeBatchPayload, RepoScanPayload, ThreadingRebuildListPayload, ThreadingUpdateWindowPayload,
+    DiffParsePatchItemsPayload, IngestCommitBatchPayload, LineageRebuildListPayload,
+    PatchExtractWindowPayload, PatchIdComputeBatchPayload, RepoScanPayload,
+    ThreadingRebuildListPayload, ThreadingUpdateWindowPayload,
 };
 use crate::scanner::{chunk_commit_oids, collect_new_commit_oids};
 use crate::threading::{ThreadingInputMessage, build_threads};
@@ -61,6 +64,7 @@ impl Phase0JobHandler {
             "lineage_rebuild_list" => self.handle_lineage_rebuild_list(job, ctx).await,
             "patch_extract_window" => self.handle_patch_extract_window(job, ctx).await,
             "patch_id_compute_batch" => self.handle_patch_id_compute_batch(job, ctx).await,
+            "diff_parse_patch_items" => self.handle_diff_parse_patch_items(job, ctx).await,
             other => JobExecutionOutcome::Terminal {
                 reason: format!("unknown job type: {other}"),
                 kind: "invalid_job_type".to_string(),
@@ -1105,6 +1109,7 @@ impl Phase0JobHandler {
         };
 
         let mut patch_id_compute_enqueued = false;
+        let mut diff_parse_enqueued = false;
         if !extract_outcome.patch_item_ids.is_empty() {
             let dedupe_key = hash_i64_list(&extract_outcome.patch_item_ids);
             let patch_id_payload = PatchIdComputeBatchPayload {
@@ -1120,7 +1125,7 @@ impl Phase0JobHandler {
                         .unwrap_or_else(|_| serde_json::json!({})),
                     priority: 10,
                     dedupe_scope: Some(format!("list:{}", payload.list_key)),
-                    dedupe_key: Some(dedupe_key),
+                    dedupe_key: Some(dedupe_key.clone()),
                     run_after: None,
                     max_attempts: Some(8),
                 })
@@ -1135,6 +1140,35 @@ impl Phase0JobHandler {
                 );
             }
             patch_id_compute_enqueued = true;
+
+            let diff_parse_payload = DiffParsePatchItemsPayload {
+                patch_item_ids: extract_outcome.patch_item_ids.clone(),
+                source_job_id: Some(job.id),
+            };
+
+            if let Err(err) = self
+                .jobs
+                .enqueue(EnqueueJobParams {
+                    job_type: "diff_parse_patch_items".to_string(),
+                    payload_json: serde_json::to_value(diff_parse_payload)
+                        .unwrap_or_else(|_| serde_json::json!({})),
+                    priority: 10,
+                    dedupe_scope: Some(format!("list:{}", payload.list_key)),
+                    dedupe_key: Some(dedupe_key),
+                    run_after: None,
+                    max_attempts: Some(8),
+                })
+                .await
+            {
+                return retryable_error(
+                    format!("failed to enqueue diff_parse_patch_items: {err}"),
+                    "db",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+            diff_parse_enqueued = true;
         }
 
         JobExecutionOutcome::Success {
@@ -1146,6 +1180,7 @@ impl Phase0JobHandler {
                 "series_ids": extract_outcome.series_ids,
                 "patch_item_ids_count": extract_outcome.patch_item_ids.len(),
                 "patch_id_compute_enqueued": patch_id_compute_enqueued,
+                "diff_parse_enqueued": diff_parse_enqueued,
             }),
             metrics: JobStoreMetrics {
                 duration_ms: started.elapsed().as_millis(),
@@ -1203,6 +1238,60 @@ impl Phase0JobHandler {
             metrics: JobStoreMetrics {
                 duration_ms: started.elapsed().as_millis(),
                 rows_written: outcome.patch_items_updated,
+                bytes_read: 0,
+                commit_count: patch_item_ids.len() as u64,
+                parse_errors: 0,
+            },
+        }
+    }
+
+    async fn handle_diff_parse_patch_items(
+        &self,
+        job: Job,
+        _ctx: ExecutionContext,
+    ) -> JobExecutionOutcome {
+        let started = Instant::now();
+
+        let payload: DiffParsePatchItemsPayload =
+            match serde_json::from_value(job.payload_json.clone()) {
+                Ok(v) => v,
+                Err(err) => {
+                    return JobExecutionOutcome::Terminal {
+                        reason: format!("invalid diff_parse_patch_items payload: {err}"),
+                        kind: "payload".to_string(),
+                        metrics: empty_metrics(started.elapsed().as_millis()),
+                    };
+                }
+            };
+
+        let mut patch_item_ids = payload.patch_item_ids.clone();
+        patch_item_ids.sort_unstable();
+        patch_item_ids.dedup();
+        patch_item_ids.retain(|v| *v > 0);
+
+        let outcome = match process_diff_parse_patch_items(&self.lineage, &patch_item_ids).await {
+            Ok(v) => v,
+            Err(err) => {
+                return retryable_error(
+                    format!("diff metadata parse failed: {err}"),
+                    "parse",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+        };
+
+        JobExecutionOutcome::Success {
+            result_json: serde_json::json!({
+                "source_job_id": payload.source_job_id,
+                "patch_item_ids_count": patch_item_ids.len(),
+                "patch_items_updated": outcome.patch_items_updated,
+                "patch_item_files_written": outcome.patch_item_files_written,
+            }),
+            metrics: JobStoreMetrics {
+                duration_ms: started.elapsed().as_millis(),
+                rows_written: outcome.patch_item_files_written,
                 bytes_read: 0,
                 commit_count: patch_item_ids.len() as u64,
                 parse_errors: 0,

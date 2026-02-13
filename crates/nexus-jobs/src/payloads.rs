@@ -51,3 +51,9 @@ pub struct PatchIdComputeBatchPayload {
     pub patch_item_ids: Vec<i64>,
     pub source_job_id: Option<i64>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffParsePatchItemsPayload {
+    pub patch_item_ids: Vec<i64>,
+    pub source_job_id: Option<i64>,
+}

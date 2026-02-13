@@ -1,4 +1,5 @@
 mod engine;
+mod diff_metadata;
 mod lineage;
 pub mod mail;
 mod patch_detect;

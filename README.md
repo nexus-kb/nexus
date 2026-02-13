@@ -45,6 +45,13 @@ cargo run -p nexus-cli -- seed-pilot
 - `GET /api/v1/healthz`
 - `GET /api/v1/readyz`
 - `GET /api/v1/version`
+- `GET /api/v1/lists/{list_key}/threads/{thread_id}`
+- `GET /api/v1/messages/{message_id}/body?include_diff=true|false&strip_quotes=true|false`
+- `GET /api/v1/patch-items/{patch_item_id}`
+- `GET /api/v1/patch-items/{patch_item_id}/files`
+- `GET /api/v1/patch-items/{patch_item_id}/files/{path}/diff`
+- `GET /api/v1/patch-items/{patch_item_id}/diff`
+- `GET /api/v1/series/{series_id}/versions/{series_version_id}/export/mbox?assembled=true|false&include_cover=true|false`
 
 ## Admin endpoints (token required)
 

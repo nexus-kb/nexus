@@ -6,12 +6,13 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use sha2::{Digest, Sha256};
 
+use crate::diff_metadata::parse_diff_metadata;
 use crate::patch_detect::extract_diff_text;
 use crate::patch_id::PatchIdMemo;
 use crate::patch_subject::parse_patch_subject;
 use nexus_db::{
-    AssembledItemRecord, LineageSourceMessage, LineageStore, UpsertPatchItemInput,
-    UpsertPatchSeriesInput, UpsertPatchSeriesVersionInput,
+    AssembledItemRecord, LineageSourceMessage, LineageStore, UpsertPatchItemFileInput,
+    UpsertPatchItemInput, UpsertPatchSeriesInput, UpsertPatchSeriesVersionInput,
 };
 
 static CHANGE_ID_RE: Lazy<Regex> =
@@ -30,6 +31,12 @@ pub struct PatchExtractOutcome {
 #[derive(Debug, Clone, Default)]
 pub struct PatchIdComputeOutcome {
     pub patch_items_updated: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DiffParseOutcome {
+    pub patch_items_updated: u64,
+    pub patch_item_files_written: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -269,6 +276,83 @@ pub async fn process_patch_id_compute_batch(
 
     Ok(PatchIdComputeOutcome {
         patch_items_updated: updated,
+    })
+}
+
+pub async fn process_diff_parse_patch_items(
+    store: &LineageStore,
+    patch_item_ids: &[i64],
+) -> anyhow::Result<DiffParseOutcome> {
+    let mut ids = patch_item_ids.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    ids.retain(|v| *v > 0);
+
+    if ids.is_empty() {
+        return Ok(DiffParseOutcome::default());
+    }
+
+    let diffs = store
+        .load_patch_item_diffs(&ids)
+        .await
+        .context("load patch item diffs for metadata parse")?;
+
+    let mut updated = 0u64;
+    let mut files_written = 0u64;
+
+    for row in diffs {
+        let parsed_files = row
+            .diff_text
+            .as_deref()
+            .map(parse_diff_metadata)
+            .unwrap_or_default();
+
+        let mut file_rows = Vec::with_capacity(parsed_files.len());
+        let mut additions = 0i32;
+        let mut deletions = 0i32;
+        let mut hunk_count = 0i32;
+
+        for file in parsed_files {
+            additions += file.additions;
+            deletions += file.deletions;
+            hunk_count += file.hunk_count;
+
+            file_rows.push(UpsertPatchItemFileInput {
+                old_path: file.old_path,
+                new_path: file.new_path,
+                change_type: file.change_type,
+                is_binary: file.is_binary,
+                additions: file.additions,
+                deletions: file.deletions,
+                hunk_count: file.hunk_count,
+                diff_start: file.diff_start,
+                diff_end: file.diff_end,
+            });
+        }
+
+        store
+            .replace_patch_item_files(row.patch_item_id, &file_rows)
+            .await
+            .with_context(|| format!("replace patch_item_files for {}", row.patch_item_id))?;
+
+        store
+            .update_patch_item_diff_stats(
+                row.patch_item_id,
+                file_rows.len() as i32,
+                additions,
+                deletions,
+                hunk_count,
+            )
+            .await
+            .with_context(|| format!("update patch stats for {}", row.patch_item_id))?;
+
+        updated += 1;
+        files_written += file_rows.len() as u64;
+    }
+
+    Ok(DiffParseOutcome {
+        patch_items_updated: updated,
+        patch_item_files_written: files_written,
     })
 }
 
@@ -796,7 +880,9 @@ mod tests {
     use crate::mail::parse_email;
     use crate::patch_subject::parse_patch_subject;
 
-    use super::{process_patch_extract_window, process_patch_id_compute_batch};
+    use super::{
+        process_diff_parse_patch_items, process_patch_extract_window, process_patch_id_compute_batch,
+    };
 
     #[test]
     fn subject_examples_are_supported() {
@@ -943,6 +1029,10 @@ mod tests {
         let patch_id_outcome =
             process_patch_id_compute_batch(&lineage, &first.patch_item_ids).await?;
         assert!(patch_id_outcome.patch_items_updated >= 1);
+        let diff_parse_outcome =
+            process_diff_parse_patch_items(&lineage, &first.patch_item_ids).await?;
+        assert!(diff_parse_outcome.patch_items_updated >= 1);
+        assert!(diff_parse_outcome.patch_item_files_written >= 1);
 
         let series_id = first.series_ids[0];
         let series_count: i64 = sqlx::query_scalar(
@@ -1020,8 +1110,63 @@ mod tests {
         .await?;
         assert_eq!(patch_with_ids, 4);
 
+        let patch_item_files_count: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*)
+            FROM patch_item_files pif
+            JOIN patch_items pi ON pi.id = pif.patch_item_id
+            JOIN patch_series_versions psv ON psv.id = pi.patch_series_version_id
+            WHERE psv.patch_series_id = $1"#,
+        )
+        .bind(series_id)
+        .fetch_one(db.pool())
+        .await?;
+        assert!(patch_item_files_count >= 4);
+
+        let file_slices = sqlx::query(
+            r#"SELECT pif.diff_start, pif.diff_end, mb.diff_text
+            FROM patch_item_files pif
+            JOIN patch_items pi ON pi.id = pif.patch_item_id
+            JOIN messages m ON m.id = pi.message_pk
+            JOIN message_bodies mb ON mb.id = m.body_id
+            JOIN patch_series_versions psv ON psv.id = pi.patch_series_version_id
+            WHERE psv.patch_series_id = $1"#,
+        )
+        .bind(series_id)
+        .fetch_all(db.pool())
+        .await?;
+        for row in &file_slices {
+            let start = row.get::<i32, _>(0) as usize;
+            let end = row.get::<i32, _>(1) as usize;
+            let diff_text = row.get::<Option<String>, _>(2).unwrap_or_default();
+            assert!(start < end);
+            assert!(end <= diff_text.len());
+            let slice = &diff_text[start..end];
+            assert!(slice.starts_with("diff --git "));
+        }
+
+        let stats_sum: (i64, i64, i64, i64) = sqlx::query_as::<_, (i64, i64, i64, i64)>(
+            r#"SELECT
+                COALESCE(SUM(file_count)::bigint, 0) AS file_count_sum,
+                COALESCE(SUM(additions)::bigint, 0) AS additions_sum,
+                COALESCE(SUM(deletions)::bigint, 0) AS deletions_sum,
+                COALESCE(SUM(hunk_count)::bigint, 0) AS hunk_count_sum
+            FROM patch_items pi
+            JOIN patch_series_versions psv
+              ON psv.id = pi.patch_series_version_id
+            WHERE psv.patch_series_id = $1
+              AND pi.item_type = 'patch'"#,
+        )
+        .bind(series_id)
+        .fetch_one(db.pool())
+        .await?;
+        assert!(stats_sum.0 >= 4);
+        assert!(stats_sum.1 >= 4);
+        assert!(stats_sum.2 >= 4);
+        assert!(stats_sum.3 >= 4);
+
         let before_counts = snapshot_counts(db.pool(), series_id).await?;
         let _second = process_patch_extract_window(&lineage, list.id, &anchors).await?;
+        let _second_diff_parse = process_diff_parse_patch_items(&lineage, &first.patch_item_ids).await?;
         let after_counts = snapshot_counts(db.pool(), series_id).await?;
         assert_eq!(before_counts, after_counts);
 
@@ -1031,7 +1176,7 @@ mod tests {
     async fn snapshot_counts(
         pool: &sqlx::PgPool,
         series_id: i64,
-    ) -> Result<(i64, i64, i64, i64), sqlx::Error> {
+    ) -> Result<(i64, i64, i64, i64, i64), sqlx::Error> {
         let versions = sqlx::query_scalar(
             "SELECT COUNT(*) FROM patch_series_versions WHERE patch_series_id = $1",
         )
@@ -1068,8 +1213,20 @@ mod tests {
         .bind(series_id)
         .fetch_one(pool)
         .await?;
+        let files = sqlx::query_scalar(
+            r#"SELECT COUNT(*)
+            FROM patch_item_files pif
+            JOIN patch_items pi
+              ON pi.id = pif.patch_item_id
+            JOIN patch_series_versions psv
+              ON psv.id = pi.patch_series_version_id
+            WHERE psv.patch_series_id = $1"#,
+        )
+        .bind(series_id)
+        .fetch_one(pool)
+        .await?;
 
-        Ok((versions, items, assembled, logical_versions))
+        Ok((versions, items, assembled, logical_versions, files))
     }
 
     fn fixture_messages(series_tag: &str) -> Vec<String> {

@@ -3,14 +3,27 @@ use axum::middleware;
 use axum::routing::{get, post};
 
 use crate::auth::require_admin;
-use crate::handlers::{admin, health};
+use crate::handlers::{admin, health, public};
 use crate::state::ApiState;
 
 pub fn build_router(state: ApiState) -> Router {
     let public_routes = Router::new()
         .route("/healthz", get(health::healthz))
         .route("/readyz", get(health::readyz))
-        .route("/version", get(health::version));
+        .route("/version", get(health::version))
+        .route("/lists/{list_key}/threads/{thread_id}", get(public::list_thread_detail))
+        .route("/messages/{message_id}/body", get(public::message_body))
+        .route("/patch-items/{patch_item_id}", get(public::patch_item))
+        .route("/patch-items/{patch_item_id}/files", get(public::patch_item_files))
+        .route(
+            "/patch-items/{patch_item_id}/files/{path}/diff",
+            get(public::patch_item_file_diff),
+        )
+        .route("/patch-items/{patch_item_id}/diff", get(public::patch_item_diff))
+        .route(
+            "/series/{series_id}/versions/{series_version_id}/export/mbox",
+            get(public::series_version_export_mbox),
+        );
 
     let admin_routes = Router::new()
         .route("/jobs/enqueue", post(admin::enqueue_job))
