@@ -372,13 +372,12 @@ impl ThreadingStore {
             .filter(|id| !rewritten_thread_ids.contains(id))
             .collect();
         if !stale_thread_ids.is_empty() {
-            let deleted = sqlx::query(
-                "DELETE FROM threads WHERE mailing_list_id = $1 AND id = ANY($2)",
-            )
-            .bind(mailing_list_id)
-            .bind(&stale_thread_ids)
-            .execute(&mut *tx)
-            .await?;
+            let deleted =
+                sqlx::query("DELETE FROM threads WHERE mailing_list_id = $1 AND id = ANY($2)")
+                    .bind(mailing_list_id)
+                    .bind(&stale_thread_ids)
+                    .execute(&mut *tx)
+                    .await?;
             stats.stale_threads_removed = deleted.rows_affected();
         }
 

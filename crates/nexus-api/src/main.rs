@@ -28,7 +28,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = ApiState::new(settings.clone(), db);
     let app = build_router(state);
 
-    let listener = tokio::net::TcpListener::bind((settings.app.host.as_str(), settings.app.port)).await?;
+    let listener =
+        tokio::net::TcpListener::bind((settings.app.host.as_str(), settings.app.port)).await?;
     let addr = listener.local_addr()?;
     info!(%addr, "nexus phase0 api listening");
 

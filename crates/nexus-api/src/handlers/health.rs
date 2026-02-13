@@ -42,7 +42,10 @@ pub async fn readyz(State(state): State<ApiState>) -> Json<ReadyResponse> {
     };
 
     let meili = match reqwest::Client::new()
-        .get(format!("{}/health", state.settings.meili.url.trim_end_matches('/')))
+        .get(format!(
+            "{}/health",
+            state.settings.meili.url.trim_end_matches('/')
+        ))
         .header("X-Meili-API-Key", &state.settings.meili.master_key)
         .send()
         .await

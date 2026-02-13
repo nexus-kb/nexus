@@ -1,12 +1,12 @@
-mod engine;
 mod diff_metadata;
+mod engine;
 mod lineage;
 pub mod mail;
 mod patch_detect;
 mod patch_id;
 mod patch_subject;
-mod pipeline;
 pub mod payloads;
+mod pipeline;
 mod scanner;
 mod threading;
 

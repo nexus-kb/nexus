@@ -225,12 +225,7 @@ impl JobStore {
         Ok((requeued, terminal))
     }
 
-    pub async fn claim_jobs(
-        &self,
-        limit: i64,
-        worker_id: &str,
-        lease_ms: i64,
-    ) -> Result<Vec<Job>> {
+    pub async fn claim_jobs(&self, limit: i64, worker_id: &str, lease_ms: i64) -> Result<Vec<Job>> {
         sqlx::query_as::<_, Job>(
             r#"WITH picked AS (
                 SELECT id

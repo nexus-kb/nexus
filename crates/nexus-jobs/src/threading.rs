@@ -136,7 +136,10 @@ pub fn build_threads(messages: Vec<ThreadingInputMessage>) -> BuildOutcome {
         let Some(node_key) = message_pk_to_node_key.get(message_pk).cloned() else {
             continue;
         };
-        let Some(message) = ordered_messages.iter().find(|msg| msg.message_pk == *message_pk) else {
+        let Some(message) = ordered_messages
+            .iter()
+            .find(|msg| msg.message_pk == *message_pk)
+        else {
             continue;
         };
 
@@ -144,22 +147,21 @@ pub fn build_threads(messages: Vec<ThreadingInputMessage>) -> BuildOutcome {
         let mut chain_node_keys = Vec::new();
 
         for reference_id in reference_chain {
-            let resolved_key = if let Some(existing) = canonical_key_to_node_key.get(&reference_id) {
+            let resolved_key = if let Some(existing) = canonical_key_to_node_key.get(&reference_id)
+            {
                 existing.clone()
             } else {
-                nodes
-                    .entry(reference_id.clone())
-                    .or_insert_with(|| Node {
-                        node_key: reference_id.clone(),
-                        message_pk: None,
-                        message_id_primary: None,
-                        subject_raw: String::new(),
-                        subject_norm: String::new(),
-                        date_utc: epoch_utc(),
-                        parent_node_key: None,
-                        children: BTreeSet::new(),
-                        is_dummy: true,
-                    });
+                nodes.entry(reference_id.clone()).or_insert_with(|| Node {
+                    node_key: reference_id.clone(),
+                    message_pk: None,
+                    message_id_primary: None,
+                    subject_raw: String::new(),
+                    subject_norm: String::new(),
+                    date_utc: epoch_utc(),
+                    parent_node_key: None,
+                    children: BTreeSet::new(),
+                    is_dummy: true,
+                });
                 reference_id
             };
             chain_node_keys.push(resolved_key);
@@ -368,10 +370,7 @@ fn apply_subject_fallback(nodes: &mut HashMap<String, Node>) {
 
         parent_candidates.sort_by_key(|key| {
             let node = nodes.get(key).expect("candidate exists");
-            (
-                is_reply_subject(&node.subject_raw),
-                node.sort_tuple(),
-            )
+            (is_reply_subject(&node.subject_raw), node.sort_tuple())
         });
 
         if let Some(parent_key) = parent_candidates.first() {
@@ -566,21 +565,16 @@ mod tests {
             .iter()
             .find(|node| node.message_pk == Some(10))
             .expect("child node");
-        assert_eq!(child.parent_node_key.as_deref(), Some("missing@example.com"));
+        assert_eq!(
+            child.parent_node_key.as_deref(),
+            Some("missing@example.com")
+        );
     }
 
     #[test]
     fn duplicate_message_ids_first_wins() {
         let outcome = build_threads(vec![
-            msg(
-                1,
-                "dup@example.com",
-                "topic",
-                "topic",
-                &[],
-                &[],
-                1,
-            ),
+            msg(1, "dup@example.com", "topic", "topic", &[], &[], 1),
             msg(
                 2,
                 "dup@example.com",
@@ -598,9 +592,11 @@ mod tests {
             .flat_map(|component| component.nodes.iter())
             .collect();
         assert!(nodes.iter().any(|n| n.node_key == "dup@example.com"));
-        assert!(nodes
-            .iter()
-            .any(|n| n.node_key == "duplicate:dup@example.com:msgpk:2"));
+        assert!(
+            nodes
+                .iter()
+                .any(|n| n.node_key == "duplicate:dup@example.com:msgpk:2")
+        );
     }
 
     #[test]
@@ -636,8 +632,24 @@ mod tests {
     fn sort_keys_are_deterministic() {
         let input_a = vec![
             msg(1, "a@example.com", "topic", "topic", &[], &[], 1),
-            msg(2, "b@example.com", "re: topic", "topic", &["a@example.com"], &[], 2),
-            msg(3, "c@example.com", "re: topic", "topic", &["a@example.com"], &[], 3),
+            msg(
+                2,
+                "b@example.com",
+                "re: topic",
+                "topic",
+                &["a@example.com"],
+                &[],
+                2,
+            ),
+            msg(
+                3,
+                "c@example.com",
+                "re: topic",
+                "topic",
+                &["a@example.com"],
+                &[],
+                3,
+            ),
         ];
         let mut input_b = input_a.clone();
         input_b.reverse();
@@ -648,12 +660,20 @@ mod tests {
         let keys_a: BTreeMap<i64, Vec<u8>> = outcome_a
             .components
             .iter()
-            .flat_map(|c| c.messages.iter().map(|m| (m.message_pk, m.sort_key.clone())))
+            .flat_map(|c| {
+                c.messages
+                    .iter()
+                    .map(|m| (m.message_pk, m.sort_key.clone()))
+            })
             .collect();
         let keys_b: BTreeMap<i64, Vec<u8>> = outcome_b
             .components
             .iter()
-            .flat_map(|c| c.messages.iter().map(|m| (m.message_pk, m.sort_key.clone())))
+            .flat_map(|c| {
+                c.messages
+                    .iter()
+                    .map(|m| (m.message_pk, m.sort_key.clone()))
+            })
             .collect();
 
         assert_eq!(keys_a, keys_b);

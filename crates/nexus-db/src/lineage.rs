@@ -196,6 +196,35 @@ pub struct ThreadSummaryRecord {
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct ThreadListItemRecord {
+    pub thread_id: i64,
+    pub subject_norm: String,
+    pub root_message_pk: Option<i64>,
+    pub created_at: DateTime<Utc>,
+    pub last_activity_at: DateTime<Utc>,
+    pub message_count: i32,
+    pub has_diff: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ListThreadsParams {
+    pub sort: String,
+    pub from_ts: Option<DateTime<Utc>>,
+    pub to_ts: Option<DateTime<Utc>>,
+    pub author_email: Option<String>,
+    pub has_diff: Option<bool>,
+    pub cursor: Option<(DateTime<Utc>, i64)>,
+    pub limit: i64,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct ThreadParticipantRecord {
+    pub thread_id: i64,
+    pub from_name: Option<String>,
+    pub from_email: String,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct ThreadMessageRecord {
     pub message_pk: i64,
     pub parent_message_pk: Option<i64>,
@@ -216,6 +245,23 @@ pub struct MessageBodyRecord {
     pub subject_raw: String,
     pub body_text: Option<String>,
     pub diff_text: Option<String>,
+    pub has_diff: bool,
+    pub has_attachments: bool,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct MessageDetailRecord {
+    pub message_pk: i64,
+    pub message_id_primary: String,
+    pub subject_raw: String,
+    pub subject_norm: String,
+    pub from_name: Option<String>,
+    pub from_email: String,
+    pub date_utc: Option<DateTime<Utc>>,
+    pub to_raw: Option<String>,
+    pub cc_raw: Option<String>,
+    pub references_ids: Vec<String>,
+    pub in_reply_to_ids: Vec<String>,
     pub has_diff: bool,
     pub has_attachments: bool,
 }
@@ -244,6 +290,83 @@ pub struct SeriesVersionPatchRef {
     pub patch_series_id: i64,
     pub version_num: i32,
     pub patch_id_stable: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct SeriesListItemRecord {
+    pub series_id: i64,
+    pub canonical_subject_norm: String,
+    pub author_email: String,
+    pub author_name: Option<String>,
+    pub last_seen_at: DateTime<Utc>,
+    pub latest_version_num: i32,
+    pub is_rfc_latest: bool,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct SeriesVersionSummaryRecord {
+    pub id: i64,
+    pub patch_series_id: i64,
+    pub version_num: i32,
+    pub is_rfc: bool,
+    pub is_resend: bool,
+    pub is_partial_reroll: bool,
+    pub thread_id: Option<i64>,
+    pub cover_message_pk: Option<i64>,
+    pub first_patch_message_pk: Option<i64>,
+    pub sent_at: DateTime<Utc>,
+    pub subject_raw: String,
+    pub subject_norm: String,
+    pub patch_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct ThreadRefRecord {
+    pub thread_id: i64,
+    pub list_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct SeriesVersionPatchItemRecord {
+    pub patch_item_id: i64,
+    pub ordinal: i32,
+    pub total: Option<i32>,
+    pub message_pk: i64,
+    pub message_id_primary: String,
+    pub subject_raw: String,
+    pub subject_norm: String,
+    pub commit_subject: Option<String>,
+    pub commit_subject_norm: Option<String>,
+    pub item_type: String,
+    pub has_diff: bool,
+    pub patch_id_stable: Option<String>,
+    pub file_count: i32,
+    pub additions: i32,
+    pub deletions: i32,
+    pub hunk_count: i32,
+    pub inherited_from_version_num: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct SeriesLogicalCompareRow {
+    pub slot: i32,
+    pub title_norm: String,
+    pub v1_patch_item_id: Option<i64>,
+    pub v1_item_type: Option<String>,
+    pub v1_patch_id_stable: Option<String>,
+    pub v1_subject_raw: Option<String>,
+    pub v2_patch_item_id: Option<i64>,
+    pub v2_item_type: Option<String>,
+    pub v2_patch_id_stable: Option<String>,
+    pub v2_subject_raw: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct PatchItemFileAggregateRecord {
+    pub path: String,
+    pub additions: i64,
+    pub deletions: i64,
+    pub hunk_count: i64,
 }
 
 #[derive(Clone)]
@@ -777,7 +900,10 @@ impl LineageStore {
         .await
     }
 
-    pub async fn list_patch_item_files(&self, patch_item_id: i64) -> Result<Vec<PatchItemFileRecord>> {
+    pub async fn list_patch_item_files(
+        &self,
+        patch_item_id: i64,
+    ) -> Result<Vec<PatchItemFileRecord>> {
         sqlx::query_as::<_, PatchItemFileRecord>(
             r#"SELECT
                 patch_item_id,
@@ -828,7 +954,7 @@ impl LineageStore {
     }
 
     pub async fn get_patch_item_full_diff(&self, patch_item_id: i64) -> Result<Option<String>> {
-        sqlx::query_scalar::<_, String>(
+        let row = sqlx::query_scalar::<_, Option<String>>(
             r#"SELECT mb.diff_text
             FROM patch_items pi
             JOIN messages m
@@ -840,7 +966,9 @@ impl LineageStore {
         )
         .bind(patch_item_id)
         .fetch_optional(&self.pool)
-        .await
+        .await?;
+
+        Ok(row.flatten())
     }
 
     pub async fn get_message_body(&self, message_pk: i64) -> Result<Option<MessageBodyRecord>> {
@@ -860,6 +988,208 @@ impl LineageStore {
         )
         .bind(message_pk)
         .fetch_optional(&self.pool)
+        .await
+    }
+
+    pub async fn get_message_detail(&self, message_pk: i64) -> Result<Option<MessageDetailRecord>> {
+        sqlx::query_as::<_, MessageDetailRecord>(
+            r#"SELECT
+                m.id AS message_pk,
+                m.message_id_primary,
+                m.subject_raw,
+                m.subject_norm,
+                m.from_name,
+                m.from_email,
+                m.date_utc,
+                m.to_raw,
+                m.cc_raw,
+                m.references_ids,
+                m.in_reply_to_ids,
+                mb.has_diff,
+                mb.has_attachments
+            FROM messages m
+            JOIN message_bodies mb
+              ON mb.id = m.body_id
+            WHERE m.id = $1
+            LIMIT 1"#,
+        )
+        .bind(message_pk)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    pub async fn get_message_raw_rfc822(&self, message_pk: i64) -> Result<Option<Vec<u8>>> {
+        sqlx::query_scalar::<_, Vec<u8>>(
+            r#"SELECT mb.raw_rfc822
+            FROM messages m
+            JOIN message_bodies mb
+              ON mb.id = m.body_id
+            WHERE m.id = $1
+            LIMIT 1"#,
+        )
+        .bind(message_pk)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    pub async fn resolve_message_pk_by_message_id(&self, message_id: &str) -> Result<Option<i64>> {
+        sqlx::query_scalar::<_, i64>(
+            r#"SELECT message_pk
+            FROM message_id_map
+            WHERE message_id = $1
+            ORDER BY is_primary DESC, message_pk ASC
+            LIMIT 1"#,
+        )
+        .bind(message_id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    pub async fn list_threads(
+        &self,
+        mailing_list_id: i64,
+        params: &ListThreadsParams,
+    ) -> Result<Vec<ThreadListItemRecord>> {
+        let mut qb: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
+            r#"SELECT
+                t.id AS thread_id,
+                t.subject_norm,
+                t.root_message_pk,
+                t.created_at,
+                t.last_activity_at,
+                t.message_count,
+                EXISTS (
+                    SELECT 1
+                    FROM thread_messages tm
+                    JOIN messages m ON m.id = tm.message_pk
+                    JOIN message_bodies mb ON mb.id = m.body_id
+                    WHERE tm.mailing_list_id = t.mailing_list_id
+                      AND tm.thread_id = t.id
+                      AND mb.has_diff = true
+                ) AS has_diff
+            FROM threads t
+            WHERE t.mailing_list_id = "#,
+        );
+        qb.push_bind(mailing_list_id);
+
+        let cursor_column = if params.sort == "date_desc" {
+            "t.created_at"
+        } else {
+            "t.last_activity_at"
+        };
+
+        if let Some(from_ts) = params.from_ts {
+            qb.push(" AND ");
+            qb.push(cursor_column);
+            qb.push(" >= ");
+            qb.push_bind(from_ts);
+        }
+        if let Some(to_ts) = params.to_ts {
+            qb.push(" AND ");
+            qb.push(cursor_column);
+            qb.push(" < ");
+            qb.push_bind(to_ts);
+        }
+        if let Some(author_email) = params.author_email.as_deref() {
+            qb.push(
+                r#" AND EXISTS (
+                    SELECT 1
+                    FROM thread_messages tm
+                    JOIN messages m ON m.id = tm.message_pk
+                    WHERE tm.mailing_list_id = t.mailing_list_id
+                      AND tm.thread_id = t.id
+                      AND lower(m.from_email) = lower("#,
+            );
+            qb.push_bind(author_email);
+            qb.push("))");
+        }
+        if let Some(has_diff) = params.has_diff {
+            if has_diff {
+                qb.push(
+                    r#" AND EXISTS (
+                        SELECT 1
+                        FROM thread_messages tm
+                        JOIN messages m ON m.id = tm.message_pk
+                        JOIN message_bodies mb ON mb.id = m.body_id
+                        WHERE tm.mailing_list_id = t.mailing_list_id
+                          AND tm.thread_id = t.id
+                          AND mb.has_diff = true
+                    )"#,
+                );
+            } else {
+                qb.push(
+                    r#" AND NOT EXISTS (
+                        SELECT 1
+                        FROM thread_messages tm
+                        JOIN messages m ON m.id = tm.message_pk
+                        JOIN message_bodies mb ON mb.id = m.body_id
+                        WHERE tm.mailing_list_id = t.mailing_list_id
+                          AND tm.thread_id = t.id
+                          AND mb.has_diff = true
+                    )"#,
+                );
+            }
+        }
+        if let Some((cursor_ts, cursor_id)) = params.cursor {
+            qb.push(" AND (");
+            qb.push(cursor_column);
+            qb.push(" < ");
+            qb.push_bind(cursor_ts);
+            qb.push(" OR (");
+            qb.push(cursor_column);
+            qb.push(" = ");
+            qb.push_bind(cursor_ts);
+            qb.push(" AND t.id < ");
+            qb.push_bind(cursor_id);
+            qb.push("))");
+        }
+
+        qb.push(" ORDER BY ");
+        qb.push(cursor_column);
+        qb.push(" DESC, t.id DESC LIMIT ");
+        qb.push_bind(params.limit.clamp(1, 200));
+
+        qb.build_query_as::<ThreadListItemRecord>()
+            .fetch_all(&self.pool)
+            .await
+    }
+
+    pub async fn list_thread_participants(
+        &self,
+        mailing_list_id: i64,
+        thread_ids: &[i64],
+    ) -> Result<Vec<ThreadParticipantRecord>> {
+        if thread_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        sqlx::query_as::<_, ThreadParticipantRecord>(
+            r#"WITH ranked AS (
+                SELECT
+                    tm.thread_id,
+                    m.from_name,
+                    m.from_email,
+                    row_number() OVER (
+                        PARTITION BY tm.thread_id, lower(m.from_email)
+                        ORDER BY m.date_utc DESC NULLS LAST, m.id DESC
+                    ) AS rn
+                FROM thread_messages tm
+                JOIN messages m
+                  ON m.id = tm.message_pk
+                WHERE tm.mailing_list_id = $1
+                  AND tm.thread_id = ANY($2)
+            )
+            SELECT
+                thread_id,
+                from_name,
+                from_email
+            FROM ranked
+            WHERE rn = 1
+            ORDER BY thread_id ASC, from_email ASC"#,
+        )
+        .bind(mailing_list_id)
+        .bind(thread_ids)
+        .fetch_all(&self.pool)
         .await
     }
 
@@ -955,6 +1285,268 @@ impl LineageStore {
         .bind(patch_series_id)
         .bind(series_version_id)
         .fetch_optional(&self.pool)
+        .await
+    }
+
+    pub async fn list_series(
+        &self,
+        list_key: Option<&str>,
+        cursor: Option<(DateTime<Utc>, i64)>,
+        limit: i64,
+    ) -> Result<Vec<SeriesListItemRecord>> {
+        let mut qb: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
+            r#"SELECT
+                ps.id AS series_id,
+                ps.canonical_subject_norm,
+                ps.author_email,
+                ps.author_name,
+                ps.last_seen_at,
+                COALESCE(latest.version_num, 1) AS latest_version_num,
+                COALESCE(latest.is_rfc, false) AS is_rfc_latest
+            FROM patch_series ps
+            LEFT JOIN LATERAL (
+                SELECT psv.version_num, psv.is_rfc
+                FROM patch_series_versions psv
+                WHERE psv.patch_series_id = ps.id
+                ORDER BY psv.version_num DESC, psv.sent_at DESC, psv.id DESC
+                LIMIT 1
+            ) latest ON true"#,
+        );
+
+        if list_key.is_some() {
+            qb.push(
+                r#" JOIN patch_series_lists psl
+                     ON psl.patch_series_id = ps.id
+                    JOIN mailing_lists ml
+                     ON ml.id = psl.mailing_list_id"#,
+            );
+        }
+
+        qb.push(" WHERE 1=1");
+        if let Some(list_key) = list_key {
+            qb.push(" AND ml.list_key = ");
+            qb.push_bind(list_key);
+        }
+
+        if let Some((cursor_ts, cursor_id)) = cursor {
+            qb.push(" AND (ps.last_seen_at < ");
+            qb.push_bind(cursor_ts);
+            qb.push(" OR (ps.last_seen_at = ");
+            qb.push_bind(cursor_ts);
+            qb.push(" AND ps.id < ");
+            qb.push_bind(cursor_id);
+            qb.push("))");
+        }
+
+        qb.push(" ORDER BY ps.last_seen_at DESC, ps.id DESC LIMIT ");
+        qb.push_bind(limit.clamp(1, 200));
+
+        qb.build_query_as::<SeriesListItemRecord>()
+            .fetch_all(&self.pool)
+            .await
+    }
+
+    pub async fn list_series_list_keys(&self, patch_series_id: i64) -> Result<Vec<String>> {
+        sqlx::query_scalar::<_, String>(
+            r#"SELECT ml.list_key
+            FROM patch_series_lists psl
+            JOIN mailing_lists ml
+              ON ml.id = psl.mailing_list_id
+            WHERE psl.patch_series_id = $1
+            ORDER BY ml.list_key ASC"#,
+        )
+        .bind(patch_series_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn list_series_versions_with_counts(
+        &self,
+        patch_series_id: i64,
+    ) -> Result<Vec<SeriesVersionSummaryRecord>> {
+        sqlx::query_as::<_, SeriesVersionSummaryRecord>(
+            r#"SELECT
+                psv.id,
+                psv.patch_series_id,
+                psv.version_num,
+                psv.is_rfc,
+                psv.is_resend,
+                psv.is_partial_reroll,
+                psv.thread_id,
+                psv.cover_message_pk,
+                psv.first_patch_message_pk,
+                psv.sent_at,
+                psv.subject_raw,
+                psv.subject_norm,
+                COUNT(*) FILTER (WHERE pi.item_type = 'patch') AS patch_count
+            FROM patch_series_versions psv
+            LEFT JOIN patch_items pi
+              ON pi.patch_series_version_id = psv.id
+            WHERE psv.patch_series_id = $1
+            GROUP BY
+                psv.id,
+                psv.patch_series_id,
+                psv.version_num,
+                psv.is_rfc,
+                psv.is_resend,
+                psv.is_partial_reroll,
+                psv.thread_id,
+                psv.cover_message_pk,
+                psv.first_patch_message_pk,
+                psv.sent_at,
+                psv.subject_raw,
+                psv.subject_norm
+            ORDER BY psv.version_num ASC, psv.sent_at ASC, psv.id ASC"#,
+        )
+        .bind(patch_series_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn get_thread_ref(&self, thread_id: i64) -> Result<Option<ThreadRefRecord>> {
+        sqlx::query_as::<_, ThreadRefRecord>(
+            r#"SELECT
+                t.id AS thread_id,
+                ml.list_key
+            FROM threads t
+            JOIN mailing_lists ml
+              ON ml.id = t.mailing_list_id
+            WHERE t.id = $1
+            LIMIT 1"#,
+        )
+        .bind(thread_id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    pub async fn list_series_version_patch_items(
+        &self,
+        patch_series_version_id: i64,
+        assembled: bool,
+    ) -> Result<Vec<SeriesVersionPatchItemRecord>> {
+        if assembled {
+            return sqlx::query_as::<_, SeriesVersionPatchItemRecord>(
+                r#"SELECT
+                    pi.id AS patch_item_id,
+                    psvai.ordinal,
+                    pi.total,
+                    pi.message_pk,
+                    m.message_id_primary,
+                    pi.subject_raw,
+                    pi.subject_norm,
+                    pi.commit_subject,
+                    pi.commit_subject_norm,
+                    pi.item_type,
+                    pi.has_diff,
+                    pi.patch_id_stable,
+                    pi.file_count,
+                    pi.additions,
+                    pi.deletions,
+                    pi.hunk_count,
+                    psvai.inherited_from_version_num
+                FROM patch_series_version_assembled_items psvai
+                JOIN patch_items pi
+                  ON pi.id = psvai.patch_item_id
+                JOIN messages m
+                  ON m.id = pi.message_pk
+                WHERE psvai.patch_series_version_id = $1
+                ORDER BY psvai.ordinal ASC, pi.id ASC"#,
+            )
+            .bind(patch_series_version_id)
+            .fetch_all(&self.pool)
+            .await;
+        }
+
+        sqlx::query_as::<_, SeriesVersionPatchItemRecord>(
+            r#"SELECT
+                pi.id AS patch_item_id,
+                pi.ordinal,
+                pi.total,
+                pi.message_pk,
+                m.message_id_primary,
+                pi.subject_raw,
+                pi.subject_norm,
+                pi.commit_subject,
+                pi.commit_subject_norm,
+                pi.item_type,
+                pi.has_diff,
+                pi.patch_id_stable,
+                pi.file_count,
+                pi.additions,
+                pi.deletions,
+                pi.hunk_count,
+                NULL::int4 AS inherited_from_version_num
+            FROM patch_items pi
+            JOIN messages m
+              ON m.id = pi.message_pk
+            WHERE pi.patch_series_version_id = $1
+            ORDER BY pi.ordinal ASC, pi.id ASC"#,
+        )
+        .bind(patch_series_version_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn list_series_logical_compare(
+        &self,
+        patch_series_id: i64,
+        v1_version_num: i32,
+        v2_version_num: i32,
+    ) -> Result<Vec<SeriesLogicalCompareRow>> {
+        sqlx::query_as::<_, SeriesLogicalCompareRow>(
+            r#"SELECT
+                pl.slot,
+                pl.title_norm,
+                plv1.patch_item_id AS v1_patch_item_id,
+                pi1.item_type AS v1_item_type,
+                pi1.patch_id_stable AS v1_patch_id_stable,
+                pi1.subject_raw AS v1_subject_raw,
+                plv2.patch_item_id AS v2_patch_item_id,
+                pi2.item_type AS v2_item_type,
+                pi2.patch_id_stable AS v2_patch_id_stable,
+                pi2.subject_raw AS v2_subject_raw
+            FROM patch_logical pl
+            LEFT JOIN patch_logical_versions plv1
+              ON plv1.patch_logical_id = pl.id
+             AND plv1.version_num = $2
+            LEFT JOIN patch_logical_versions plv2
+              ON plv2.patch_logical_id = pl.id
+             AND plv2.version_num = $3
+            LEFT JOIN patch_items pi1
+              ON pi1.id = plv1.patch_item_id
+            LEFT JOIN patch_items pi2
+              ON pi2.id = plv2.patch_item_id
+            WHERE pl.patch_series_id = $1
+            ORDER BY pl.slot ASC"#,
+        )
+        .bind(patch_series_id)
+        .bind(v1_version_num)
+        .bind(v2_version_num)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn aggregate_patch_item_files(
+        &self,
+        patch_item_ids: &[i64],
+    ) -> Result<Vec<PatchItemFileAggregateRecord>> {
+        if patch_item_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        sqlx::query_as::<_, PatchItemFileAggregateRecord>(
+            r#"SELECT
+                pif.new_path AS path,
+                SUM(pif.additions)::bigint AS additions,
+                SUM(pif.deletions)::bigint AS deletions,
+                SUM(pif.hunk_count)::bigint AS hunk_count
+            FROM patch_item_files pif
+            WHERE pif.patch_item_id = ANY($1)
+            GROUP BY pif.new_path
+            ORDER BY pif.new_path ASC"#,
+        )
+        .bind(patch_item_ids)
+        .fetch_all(&self.pool)
         .await
     }
 
@@ -1121,13 +1713,11 @@ impl LineageStore {
         patch_series_version_id: i64,
         is_partial_reroll: bool,
     ) -> Result<()> {
-        sqlx::query(
-            "UPDATE patch_series_versions SET is_partial_reroll = $2 WHERE id = $1",
-        )
-        .bind(patch_series_version_id)
-        .bind(is_partial_reroll)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE patch_series_versions SET is_partial_reroll = $2 WHERE id = $1")
+            .bind(patch_series_version_id)
+            .bind(is_partial_reroll)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -1325,20 +1915,15 @@ impl LineageStore {
         patch_item_id: i64,
         patch_id_stable: Option<&str>,
     ) -> Result<()> {
-        sqlx::query(
-            "UPDATE patch_items SET patch_id_stable = $2 WHERE id = $1",
-        )
-        .bind(patch_item_id)
-        .bind(patch_id_stable)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE patch_items SET patch_id_stable = $2 WHERE id = $1")
+            .bind(patch_item_id)
+            .bind(patch_id_stable)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
-    pub async fn list_patch_items_for_message_ids(
-        &self,
-        message_pks: &[i64],
-    ) -> Result<Vec<i64>> {
+    pub async fn list_patch_items_for_message_ids(&self, message_pks: &[i64]) -> Result<Vec<i64>> {
         if message_pks.is_empty() {
             return Ok(Vec::new());
         }
@@ -1356,7 +1941,10 @@ impl LineageStore {
         Ok(rows)
     }
 
-    pub fn unique_message_ids(references_ids: &[String], in_reply_to_ids: &[String]) -> Vec<String> {
+    pub fn unique_message_ids(
+        references_ids: &[String],
+        in_reply_to_ids: &[String],
+    ) -> Vec<String> {
         let mut set = BTreeSet::new();
         for value in references_ids {
             let trimmed = value.trim();

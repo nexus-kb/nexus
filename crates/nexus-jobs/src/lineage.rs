@@ -262,10 +262,7 @@ pub async fn process_patch_id_compute_batch(
     let mut memo = PatchIdMemo::default();
     let mut updated = 0u64;
     for row in diffs {
-        let patch_id = row
-            .diff_text
-            .as_deref()
-            .and_then(|diff| memo.compute(diff));
+        let patch_id = row.diff_text.as_deref().and_then(|diff| memo.compute(diff));
 
         store
             .set_patch_item_patch_id(row.patch_item_id, patch_id.as_deref())
@@ -405,9 +402,8 @@ fn build_candidates(
                 .cloned()
                 .unwrap_or_else(|| parsed.subject_norm_base.clone());
 
-            let is_synthetic_group = cover_subject_by_version
-                .get(&(parsed.version_num, parsed.is_rfc))
-                .is_none()
+            let is_synthetic_group = !cover_subject_by_version
+                .contains_key(&(parsed.version_num, parsed.is_rfc))
                 && parsed.total.unwrap_or(0) > 1;
 
             let group_key_subject = if is_synthetic_group {
@@ -424,27 +420,26 @@ fn build_candidates(
 
             let key = (group_key_subject, parsed.version_num, parsed.is_rfc);
 
-            let entry = by_subject_and_version.entry(key).or_insert_with(|| CandidateVersion {
-                thread_id,
-                canonical_subject_norm: canonical_subject_norm.clone(),
-                author_email: message.from_email.clone(),
-                author_name: message.from_name.clone(),
-                version_num: parsed.version_num,
-                is_rfc: parsed.is_rfc,
-                is_resend: parsed.is_resend,
-                sent_at: message.date_utc.unwrap_or_else(epoch_utc),
-                subject_raw: message.subject_raw.clone(),
-                subject_norm: message.subject_norm.clone(),
-                cover_message_pk: None,
-                first_patch_message_pk: None,
-                base_commit: message
-                    .body_text
-                    .as_deref()
-                    .and_then(extract_base_commit),
-                change_id: message.body_text.as_deref().and_then(extract_change_id),
-                reference_message_ids: lineage_reference_ids(&message),
-                items: Vec::new(),
-            });
+            let entry = by_subject_and_version
+                .entry(key)
+                .or_insert_with(|| CandidateVersion {
+                    thread_id,
+                    canonical_subject_norm: canonical_subject_norm.clone(),
+                    author_email: message.from_email.clone(),
+                    author_name: message.from_name.clone(),
+                    version_num: parsed.version_num,
+                    is_rfc: parsed.is_rfc,
+                    is_resend: parsed.is_resend,
+                    sent_at: message.date_utc.unwrap_or_else(epoch_utc),
+                    subject_raw: message.subject_raw.clone(),
+                    subject_norm: message.subject_norm.clone(),
+                    cover_message_pk: None,
+                    first_patch_message_pk: None,
+                    base_commit: message.body_text.as_deref().and_then(extract_base_commit),
+                    change_id: message.body_text.as_deref().and_then(extract_change_id),
+                    reference_message_ids: lineage_reference_ids(&message),
+                    items: Vec::new(),
+                });
 
             if entry.canonical_subject_norm.starts_with("__thread:") {
                 entry.canonical_subject_norm = canonical_subject_norm.clone();
@@ -515,7 +510,9 @@ fn build_candidates(
 
         for mut candidate in by_subject_and_version.into_values() {
             normalize_item_ordinals(&mut candidate.items);
-            candidate.items.sort_by_key(|item| (item.ordinal.unwrap_or(0), item.message_pk));
+            candidate
+                .items
+                .sort_by_key(|item| (item.ordinal.unwrap_or(0), item.message_pk));
             if candidate.first_patch_message_pk.is_none() {
                 candidate.first_patch_message_pk = candidate
                     .items
@@ -740,12 +737,18 @@ async fn apply_assembled_view(
             .find_inherited_patch_item(series_id, version_num, ordinal)
             .await?
         {
-            assembled.push((ordinal, inherited_patch_item_id, Some(inherited_from_version_num)));
+            assembled.push((
+                ordinal,
+                inherited_patch_item_id,
+                Some(inherited_from_version_num),
+            ));
             inherited_found = true;
         }
     }
 
-    store.replace_assembled_items(version_id, &assembled).await?;
+    store
+        .replace_assembled_items(version_id, &assembled)
+        .await?;
     store
         .set_partial_reroll_flag(version_id, inherited_found)
         .await?;
@@ -881,7 +884,8 @@ mod tests {
     use crate::patch_subject::parse_patch_subject;
 
     use super::{
-        process_diff_parse_patch_items, process_patch_extract_window, process_patch_id_compute_batch,
+        process_diff_parse_patch_items, process_patch_extract_window,
+        process_patch_id_compute_batch,
     };
 
     #[test]
@@ -1035,12 +1039,11 @@ mod tests {
         assert!(diff_parse_outcome.patch_item_files_written >= 1);
 
         let series_id = first.series_ids[0];
-        let series_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM patch_series WHERE id = $1",
-        )
-        .bind(series_id)
-        .fetch_one(db.pool())
-        .await?;
+        let series_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM patch_series WHERE id = $1")
+                .bind(series_id)
+                .fetch_one(db.pool())
+                .await?;
         assert_eq!(series_count, 1);
 
         let version_count: i64 = sqlx::query_scalar(
@@ -1076,7 +1079,10 @@ mod tests {
         .fetch_all(db.pool())
         .await?;
 
-        let ordinals: Vec<i32> = assembled_rows.iter().map(|row| row.get::<i32, _>(0)).collect();
+        let ordinals: Vec<i32> = assembled_rows
+            .iter()
+            .map(|row| row.get::<i32, _>(0))
+            .collect();
         assert_eq!(ordinals, vec![0, 1, 2, 3]);
         let inherited_count = assembled_rows
             .iter()
@@ -1166,7 +1172,8 @@ mod tests {
 
         let before_counts = snapshot_counts(db.pool(), series_id).await?;
         let _second = process_patch_extract_window(&lineage, list.id, &anchors).await?;
-        let _second_diff_parse = process_diff_parse_patch_items(&lineage, &first.patch_item_ids).await?;
+        let _second_diff_parse =
+            process_diff_parse_patch_items(&lineage, &first.patch_item_ids).await?;
         let after_counts = snapshot_counts(db.pool(), series_id).await?;
         assert_eq!(before_counts, after_counts);
 
@@ -1283,12 +1290,7 @@ mod tests {
         ]
     }
 
-    fn cover_mail(
-        message_id: &str,
-        date: &str,
-        subject: &str,
-        references: Option<&str>,
-    ) -> String {
+    fn cover_mail(message_id: &str, date: &str, subject: &str, references: Option<&str>) -> String {
         let mut headers = vec![
             "From: Alice <alice@example.com>".to_string(),
             format!("Message-ID: <{message_id}>"),

@@ -6,9 +6,9 @@ use std::time::Instant;
 use gix::hash::ObjectId;
 use nexus_core::config::Settings;
 use nexus_db::{
-    CatalogStore, EnqueueJobParams, IngestStore, Job, JobStore, JobStoreMetrics, ParsedBodyInput,
-    ParsedMessageInput, ThreadComponentWrite, ThreadMessageWrite, ThreadNodeWrite, ThreadSummaryWrite,
-    ThreadingStore, LineageStore,
+    CatalogStore, EnqueueJobParams, IngestStore, Job, JobStore, JobStoreMetrics, LineageStore,
+    ParsedBodyInput, ParsedMessageInput, ThreadComponentWrite, ThreadMessageWrite, ThreadNodeWrite,
+    ThreadSummaryWrite, ThreadingStore,
 };
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
@@ -214,21 +214,30 @@ impl Phase0JobHandler {
         }
     }
 
-    async fn handle_ingest_commit_batch(&self, job: Job, ctx: ExecutionContext) -> JobExecutionOutcome {
+    async fn handle_ingest_commit_batch(
+        &self,
+        job: Job,
+        ctx: ExecutionContext,
+    ) -> JobExecutionOutcome {
         let started = Instant::now();
 
-        let payload: IngestCommitBatchPayload = match serde_json::from_value(job.payload_json.clone()) {
-            Ok(v) => v,
-            Err(err) => {
-                return JobExecutionOutcome::Terminal {
-                    reason: format!("invalid ingest payload: {err}"),
-                    kind: "payload".to_string(),
-                    metrics: empty_metrics(started.elapsed().as_millis()),
-                };
-            }
-        };
+        let payload: IngestCommitBatchPayload =
+            match serde_json::from_value(job.payload_json.clone()) {
+                Ok(v) => v,
+                Err(err) => {
+                    return JobExecutionOutcome::Terminal {
+                        reason: format!("invalid ingest payload: {err}"),
+                        kind: "payload".to_string(),
+                        metrics: empty_metrics(started.elapsed().as_millis()),
+                    };
+                }
+            };
 
-        let repo = match self.catalog.get_repo(&payload.list_key, &payload.repo_key).await {
+        let repo = match self
+            .catalog
+            .get_repo(&payload.list_key, &payload.repo_key)
+            .await
+        {
             Ok(Some(v)) => v,
             Ok(None) => {
                 return JobExecutionOutcome::Terminal {
@@ -446,16 +455,19 @@ impl Phase0JobHandler {
             threading_enqueued = true;
         }
 
-        if let Some(last_commit) = last_success_commit.as_deref() {
-            if let Err(err) = self.catalog.update_watermark(repo.id, Some(last_commit)).await {
-                return retryable_error(
-                    format!("failed to update watermark: {err}"),
-                    "db",
-                    &job,
-                    started.elapsed().as_millis(),
-                    &self.settings,
-                );
-            }
+        if let Some(last_commit) = last_success_commit.as_deref()
+            && let Err(err) = self
+                .catalog
+                .update_watermark(repo.id, Some(last_commit))
+                .await
+        {
+            return retryable_error(
+                format!("failed to update watermark: {err}"),
+                "db",
+                &job,
+                started.elapsed().as_millis(),
+                &self.settings,
+            );
         }
 
         JobExecutionOutcome::Success {
@@ -1094,19 +1106,19 @@ impl Phase0JobHandler {
         anchors.dedup();
         anchors.retain(|v| *v > 0);
 
-        let extract_outcome = match process_patch_extract_window(&self.lineage, list.id, &anchors).await
-        {
-            Ok(v) => v,
-            Err(err) => {
-                return retryable_error(
-                    format!("patch lineage extraction failed: {err}"),
-                    "parse",
-                    &job,
-                    started.elapsed().as_millis(),
-                    &self.settings,
-                );
-            }
-        };
+        let extract_outcome =
+            match process_patch_extract_window(&self.lineage, list.id, &anchors).await {
+                Ok(v) => v,
+                Err(err) => {
+                    return retryable_error(
+                        format!("patch lineage extraction failed: {err}"),
+                        "parse",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
+                }
+            };
 
         let mut patch_id_compute_enqueued = false;
         let mut diff_parse_enqueued = false;
@@ -1184,7 +1196,8 @@ impl Phase0JobHandler {
             }),
             metrics: JobStoreMetrics {
                 duration_ms: started.elapsed().as_millis(),
-                rows_written: extract_outcome.series_versions_written + extract_outcome.patch_items_written,
+                rows_written: extract_outcome.series_versions_written
+                    + extract_outcome.patch_items_written,
                 bytes_read: anchors.len() as u64,
                 commit_count: extract_outcome.series_ids.len() as u64,
                 parse_errors: 0,

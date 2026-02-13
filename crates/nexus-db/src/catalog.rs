@@ -116,7 +116,11 @@ impl CatalogStore {
         .await
     }
 
-    pub async fn get_repo(&self, list_key: &str, repo_key: &str) -> Result<Option<MailingListRepo>> {
+    pub async fn get_repo(
+        &self,
+        list_key: &str,
+        repo_key: &str,
+    ) -> Result<Option<MailingListRepo>> {
         sqlx::query_as::<_, MailingListRepo>(
             r#"SELECT r.id, r.mailing_list_id, r.repo_key, r.repo_relpath, r.active, r.created_at
             FROM mailing_list_repos r

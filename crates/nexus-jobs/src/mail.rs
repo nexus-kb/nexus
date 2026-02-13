@@ -174,18 +174,27 @@ pub fn parse_email(raw_rfc822: &[u8]) -> Result<ParseOutcome, ParseEmailError> {
         .map(normalize_text_for_hash)
         .unwrap_or_default();
 
-    let content_hash_sha256 = compute_content_hash(
+    let content_hash_sha256 = compute_content_hash(ContentHashInput {
+        subject: &subject_raw,
+        from: &from_header,
+        date: parsed
+            .headers
+            .get_first_value("Date")
+            .as_deref()
+            .unwrap_or(""),
+        references_ids: &references_ids,
+        in_reply_to_ids: &in_reply_to_ids,
+        to_raw: to_raw.as_deref().unwrap_or(""),
+        cc_raw: cc_raw.as_deref().unwrap_or(""),
+        body: &body_for_hash,
+    });
+
+    let search_text = build_search_text(
         &subject_raw,
         &from_header,
-        parsed.headers.get_first_value("Date").as_deref().unwrap_or(""),
-        &references_ids,
-        &in_reply_to_ids,
-        to_raw.as_deref().unwrap_or(""),
-        cc_raw.as_deref().unwrap_or(""),
-        &body_for_hash,
+        body_text.as_deref(),
+        diff_text.as_deref(),
     );
-
-    let search_text = build_search_text(&subject_raw, &from_header, body_text.as_deref(), diff_text.as_deref());
 
     Ok(ParseOutcome {
         content_hash_sha256,
@@ -299,7 +308,9 @@ fn normalize_subject(subject: &str) -> String {
             }
         }
 
-        if normalized.starts_with('[') && let Some(idx) = normalized.find(']') {
+        if normalized.starts_with('[')
+            && let Some(idx) = normalized.find(']')
+        {
             normalized = normalized[idx + 1..].trim_start().to_string();
         }
 
@@ -319,32 +330,34 @@ fn normalize_text_for_hash(text: &str) -> String {
         .join("\n")
 }
 
-fn compute_content_hash(
-    subject: &str,
-    from: &str,
-    date: &str,
-    references_ids: &[String],
-    in_reply_to_ids: &[String],
-    to_raw: &str,
-    cc_raw: &str,
-    body: &str,
-) -> Vec<u8> {
+struct ContentHashInput<'a> {
+    subject: &'a str,
+    from: &'a str,
+    date: &'a str,
+    references_ids: &'a [String],
+    in_reply_to_ids: &'a [String],
+    to_raw: &'a str,
+    cc_raw: &'a str,
+    body: &'a str,
+}
+
+fn compute_content_hash(input: ContentHashInput<'_>) -> Vec<u8> {
     let mut hasher = Sha256::new();
 
     for (key, value) in [
-        ("Subject", normalize_text_for_hash(subject)),
-        ("From", normalize_text_for_hash(from)),
-        ("Date", normalize_text_for_hash(date)),
+        ("Subject", normalize_text_for_hash(input.subject)),
+        ("From", normalize_text_for_hash(input.from)),
+        ("Date", normalize_text_for_hash(input.date)),
         (
             "References",
-            normalize_text_for_hash(&references_ids.join(" ")),
+            normalize_text_for_hash(&input.references_ids.join(" ")),
         ),
         (
             "In-Reply-To",
-            normalize_text_for_hash(&in_reply_to_ids.join(" ")),
+            normalize_text_for_hash(&input.in_reply_to_ids.join(" ")),
         ),
-        ("To", normalize_text_for_hash(to_raw)),
-        ("Cc", normalize_text_for_hash(cc_raw)),
+        ("To", normalize_text_for_hash(input.to_raw)),
+        ("Cc", normalize_text_for_hash(input.cc_raw)),
     ] {
         hasher.update(key.as_bytes());
         hasher.update(b":");
@@ -353,7 +366,7 @@ fn compute_content_hash(
     }
 
     hasher.update(b"\n");
-    hasher.update(normalize_text_for_hash(body).as_bytes());
+    hasher.update(normalize_text_for_hash(input.body).as_bytes());
     hasher.finalize().to_vec()
 }
 
@@ -395,7 +408,11 @@ pub fn normalize_message_id_token(raw: &str) -> Option<String> {
 
     loop {
         let before = value.clone();
-        value = value.trim().trim_matches('"').trim_matches('\'').to_string();
+        value = value
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_string();
         value = value.trim_matches('<').trim_matches('>').trim().to_string();
         if before == value {
             break;
@@ -424,31 +441,31 @@ fn dedupe_preserve_order(ids: Vec<String>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_content_hash, normalize_message_id_token, parse_email};
+    use super::{ContentHashInput, compute_content_hash, normalize_message_id_token, parse_email};
 
     #[test]
     fn hash_normalizes_line_endings_and_trailing_whitespace() {
-        let h1 = compute_content_hash(
-            "[PATCH] Test",
-            "Alice <alice@example.com>",
-            "Mon, 01 Jan 2024 00:00:00 +0000",
-            &[],
-            &[],
-            "list@example.com",
-            "",
-            "line one\r\nline two   \r\n",
-        );
+        let h1 = compute_content_hash(ContentHashInput {
+            subject: "[PATCH] Test",
+            from: "Alice <alice@example.com>",
+            date: "Mon, 01 Jan 2024 00:00:00 +0000",
+            references_ids: &[],
+            in_reply_to_ids: &[],
+            to_raw: "list@example.com",
+            cc_raw: "",
+            body: "line one\r\nline two   \r\n",
+        });
 
-        let h2 = compute_content_hash(
-            "[PATCH] Test",
-            "Alice <alice@example.com>",
-            "Mon, 01 Jan 2024 00:00:00 +0000",
-            &[],
-            &[],
-            "list@example.com",
-            "",
-            "line one\nline two\n",
-        );
+        let h2 = compute_content_hash(ContentHashInput {
+            subject: "[PATCH] Test",
+            from: "Alice <alice@example.com>",
+            date: "Mon, 01 Jan 2024 00:00:00 +0000",
+            references_ids: &[],
+            in_reply_to_ids: &[],
+            to_raw: "list@example.com",
+            cc_raw: "",
+            body: "line one\nline two\n",
+        });
 
         assert_eq!(h1, h2);
     }

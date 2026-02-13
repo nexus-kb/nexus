@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use nexus_core::config::DatabaseConfig;
-use sqlx::postgres::{PgListener, PgPoolOptions};
 use sqlx::PgPool;
+use sqlx::postgres::{PgListener, PgPoolOptions};
 
 use crate::Result;
 

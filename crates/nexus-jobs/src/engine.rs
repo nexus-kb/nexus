@@ -4,15 +4,15 @@ use std::time::Duration;
 use chrono::Utc;
 use nexus_core::config::Settings;
 use nexus_db::{
-    CatalogStore, Db, IngestStore, Job, JobState, JobStore, JobStoreMetrics, RetryDecision,
-    ThreadingStore, LineageStore,
+    CatalogStore, Db, IngestStore, Job, JobState, JobStore, JobStoreMetrics, LineageStore,
+    RetryDecision, ThreadingStore,
 };
 use tokio::sync::Notify;
-use tokio::time::{interval, MissedTickBehavior};
+use tokio::time::{MissedTickBehavior, interval};
 use tracing::{error, info, warn};
 
-use crate::pipeline::Phase0JobHandler;
 use crate::JobExecutionOutcome;
+use crate::pipeline::Phase0JobHandler;
 
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
@@ -71,8 +71,14 @@ impl Phase0Worker {
         let ingest = IngestStore::new(db.pool().clone());
         let threading = ThreadingStore::new(db.pool().clone());
         let lineage = LineageStore::new(db.pool().clone());
-        let handler =
-            Phase0JobHandler::new(settings.clone(), catalog, ingest, threading, lineage, jobs.clone());
+        let handler = Phase0JobHandler::new(
+            settings.clone(),
+            catalog,
+            ingest,
+            threading,
+            lineage,
+            jobs.clone(),
+        );
         let cfg = WorkerConfig::from(&settings.worker);
 
         Self {
@@ -153,7 +159,11 @@ impl Phase0Worker {
         };
 
         if job.cancel_requested {
-            if let Err(err) = self.jobs.mark_cancelled(job.id, "cancel requested before execution").await {
+            if let Err(err) = self
+                .jobs
+                .mark_cancelled(job.id, "cancel requested before execution")
+                .await
+            {
                 error!(job_id = job.id, error = %err, "failed to mark cancelled");
             }
             let _ = self
@@ -251,7 +261,8 @@ async fn finalize_job(
             result_json,
             metrics,
         } => {
-            jobs.mark_succeeded(job.id, Some(result_json.clone())).await?;
+            jobs.mark_succeeded(job.id, Some(result_json.clone()))
+                .await?;
             jobs.finish_attempt(
                 attempt_id,
                 "succeeded",
@@ -300,8 +311,8 @@ async fn finalize_job(
                 )
                 .await?;
             } else {
-                let run_after = Utc::now()
-                    + chrono::Duration::milliseconds((*backoff_ms as i64).max(1));
+                let run_after =
+                    Utc::now() + chrono::Duration::milliseconds((*backoff_ms as i64).max(1));
 
                 jobs.mark_retryable(
                     job.id,

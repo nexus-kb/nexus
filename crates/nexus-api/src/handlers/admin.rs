@@ -6,7 +6,9 @@ use axum::Json;
 use axum::extract::{Path as AxumPath, Query, State};
 use chrono::{DateTime, Utc};
 use nexus_db::{EnqueueJobParams, Job, JobState, ListJobsParams};
-use nexus_jobs::payloads::{LineageRebuildListPayload, RepoScanPayload, ThreadingRebuildListPayload};
+use nexus_jobs::payloads::{
+    LineageRebuildListPayload, RepoScanPayload, ThreadingRebuildListPayload,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::state::ApiState;
@@ -165,8 +167,8 @@ pub async fn ingest_sync(
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let list_root = Path::new(&state.settings.mail.mirror_root).join(&query.list_key);
-    let repos = discover_repo_relpaths(&list_root)
-        .map_err(|_| axum::http::StatusCode::BAD_REQUEST)?;
+    let repos =
+        discover_repo_relpaths(&list_root).map_err(|_| axum::http::StatusCode::BAD_REQUEST)?;
 
     if repos.is_empty() {
         return Err(axum::http::StatusCode::BAD_REQUEST);
@@ -205,10 +207,7 @@ pub async fn ingest_sync(
         queued += 1;
     }
 
-    Ok(Json(IngestSyncResponse {
-        queued,
-        repos,
-    }))
+    Ok(Json(IngestSyncResponse { queued, repos }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -375,7 +374,13 @@ fn discover_repo_relpaths(list_root: &Path) -> Result<Vec<String>, std::io::Erro
         for entry in fs::read_dir(&git_dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.is_dir() && path.file_name().and_then(|v| v.to_str()).unwrap_or("").ends_with(".git") {
+            if path.is_dir()
+                && path
+                    .file_name()
+                    .and_then(|v| v.to_str())
+                    .unwrap_or("")
+                    .ends_with(".git")
+            {
                 let relpath = PathBuf::from("git")
                     .join(path.file_name().unwrap_or_default())
                     .display()

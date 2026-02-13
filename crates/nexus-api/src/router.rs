@@ -11,15 +11,40 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/healthz", get(health::healthz))
         .route("/readyz", get(health::readyz))
         .route("/version", get(health::version))
-        .route("/lists/{list_key}/threads/{thread_id}", get(public::list_thread_detail))
+        .route("/openapi.json", get(public::openapi_json))
+        .route("/lists/{list_key}/threads", get(public::list_threads))
+        .route(
+            "/lists/{list_key}/threads/{thread_id}",
+            get(public::list_thread_detail),
+        )
+        .route(
+            "/lists/{list_key}/threads/{thread_id}/messages",
+            get(public::thread_messages),
+        )
+        .route("/messages/{message_id}", get(public::message_detail))
         .route("/messages/{message_id}/body", get(public::message_body))
+        .route("/messages/{message_id}/raw", get(public::message_raw))
+        .route("/r/{msgid}", get(public::message_id_redirect))
+        .route("/series", get(public::series_list))
+        .route("/series/{series_id}", get(public::series_detail))
+        .route(
+            "/series/{series_id}/versions/{series_version_id}",
+            get(public::series_version),
+        )
+        .route("/series/{series_id}/compare", get(public::series_compare))
         .route("/patch-items/{patch_item_id}", get(public::patch_item))
-        .route("/patch-items/{patch_item_id}/files", get(public::patch_item_files))
+        .route(
+            "/patch-items/{patch_item_id}/files",
+            get(public::patch_item_files),
+        )
         .route(
             "/patch-items/{patch_item_id}/files/{path}/diff",
             get(public::patch_item_file_diff),
         )
-        .route("/patch-items/{patch_item_id}/diff", get(public::patch_item_diff))
+        .route(
+            "/patch-items/{patch_item_id}/diff",
+            get(public::patch_item_diff),
+        )
         .route(
             "/series/{series_id}/versions/{series_version_id}/export/mbox",
             get(public::series_version_export_mbox),
@@ -35,10 +60,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/ingest/reset-watermark", post(admin::reset_watermark))
         .route("/threading/rebuild", post(admin::threading_rebuild))
         .route("/lineage/rebuild", post(admin::lineage_rebuild))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            require_admin,
-        ));
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_admin));
 
     Router::new()
         .nest("/api/v1", public_routes)

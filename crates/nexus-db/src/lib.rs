@@ -15,11 +15,14 @@ pub use crate::jobs::{
     EnqueueJobParams, JobAttempt, JobStore, JobStoreMetrics, ListJobsParams, RetryDecision,
 };
 pub use crate::lineage::{
-    AssembledItemRecord, LineageSourceMessage, LineageStore, MessageBodyRecord, PatchItemDetailRecord,
-    PatchItemDiffRecord, PatchItemFileDiffSliceSource, PatchItemFileRecord, PatchItemRecord,
-    PatchLogicalRecord, PatchSeriesRecord, PatchSeriesVersionRecord, SeriesExportMessageRecord,
-    SeriesVersionPatchRef, ThreadMessageRecord, ThreadSummaryRecord, UpsertPatchItemFileInput,
-    UpsertPatchItemInput, UpsertPatchSeriesInput, UpsertPatchSeriesVersionInput,
+    AssembledItemRecord, LineageSourceMessage, LineageStore, ListThreadsParams, MessageBodyRecord,
+    MessageDetailRecord, PatchItemDetailRecord, PatchItemDiffRecord, PatchItemFileAggregateRecord,
+    PatchItemFileDiffSliceSource, PatchItemFileRecord, PatchItemRecord, PatchLogicalRecord,
+    PatchSeriesRecord, PatchSeriesVersionRecord, SeriesExportMessageRecord, SeriesListItemRecord,
+    SeriesLogicalCompareRow, SeriesVersionPatchItemRecord, SeriesVersionPatchRef,
+    SeriesVersionSummaryRecord, ThreadListItemRecord, ThreadMessageRecord, ThreadParticipantRecord,
+    ThreadRefRecord, ThreadSummaryRecord, UpsertPatchItemFileInput, UpsertPatchItemInput,
+    UpsertPatchSeriesInput, UpsertPatchSeriesVersionInput,
 };
 pub use crate::models::{Job, JobState};
 pub use crate::threading::{

@@ -1,9 +1,8 @@
 use once_cell::sync::Lazy;
 use regex::Regex;
 
-static REPLY_PREFIX_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)^(re|fwd|fw|aw):\s*").expect("valid reply prefix regex")
-});
+static REPLY_PREFIX_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)^(re|fwd|fw|aw):\s*").expect("valid reply prefix regex"));
 
 static VERSION_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?i)^v([0-9]+)$").expect("valid version regex"));
