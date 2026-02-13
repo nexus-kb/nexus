@@ -3,6 +3,7 @@ pub mod mail;
 mod pipeline;
 pub mod payloads;
 mod scanner;
+mod threading;
 
 pub use engine::{ExecutionContext, Phase0Worker, WorkerConfig};
 

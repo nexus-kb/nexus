@@ -20,6 +20,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/jobs/{job_id}/retry", post(admin::retry_job))
         .route("/ingest/sync", post(admin::ingest_sync))
         .route("/ingest/reset-watermark", post(admin::reset_watermark))
+        .route("/threading/rebuild", post(admin::threading_rebuild))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_admin,

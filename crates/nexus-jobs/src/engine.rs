@@ -5,6 +5,7 @@ use chrono::Utc;
 use nexus_core::config::Settings;
 use nexus_db::{
     CatalogStore, Db, IngestStore, Job, JobState, JobStore, JobStoreMetrics, RetryDecision,
+    ThreadingStore,
 };
 use tokio::sync::Notify;
 use tokio::time::{interval, MissedTickBehavior};
@@ -68,7 +69,9 @@ impl Phase0Worker {
         let jobs = JobStore::new(db.pool().clone());
         let catalog = CatalogStore::new(db.pool().clone());
         let ingest = IngestStore::new(db.pool().clone());
-        let handler = Phase0JobHandler::new(settings.clone(), catalog, ingest, jobs.clone());
+        let threading = ThreadingStore::new(db.pool().clone());
+        let handler =
+            Phase0JobHandler::new(settings.clone(), catalog, ingest, threading, jobs.clone());
         let cfg = WorkerConfig::from(&settings.worker);
 
         Self {

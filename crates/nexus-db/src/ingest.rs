@@ -35,6 +35,7 @@ pub struct ParsedMessageInput {
 pub struct WriteOutcome {
     pub message_inserted: bool,
     pub instance_inserted: bool,
+    pub message_pk: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -69,10 +70,23 @@ impl IngestStore {
         .is_some();
 
         if already_ingested {
+            let existing_message_pk = sqlx::query_scalar::<_, i64>(
+                r#"SELECT message_pk
+                FROM list_message_instances
+                WHERE mailing_list_id = $1 AND git_commit_oid = $2
+                ORDER BY message_pk ASC
+                LIMIT 1"#,
+            )
+            .bind(repo.mailing_list_id)
+            .bind(git_commit_oid)
+            .fetch_optional(&mut *tx)
+            .await?;
+
             tx.commit().await?;
             return Ok(WriteOutcome {
                 message_inserted: false,
                 instance_inserted: false,
+                message_pk: existing_message_pk,
             });
         }
 
@@ -163,6 +177,7 @@ impl IngestStore {
         Ok(WriteOutcome {
             message_inserted,
             instance_inserted: instance_result.rows_affected() > 0,
+            message_pk: Some(message_pk),
         })
     }
 }

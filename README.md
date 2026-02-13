@@ -55,3 +55,4 @@ cargo run -p nexus-cli -- seed-pilot
 - `POST /admin/v1/jobs/{job_id}/retry`
 - `POST /admin/v1/ingest/sync?list_key=<key>`
 - `POST /admin/v1/ingest/reset-watermark?list_key=<key>&repo_key=<key>`
+- `POST /admin/v1/threading/rebuild?list_key=<key>&from=<iso8601>&to=<iso8601>`

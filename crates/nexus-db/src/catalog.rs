@@ -49,6 +49,18 @@ impl CatalogStore {
             .bind(list.id)
             .execute(&self.pool)
             .await?;
+        sqlx::query("SELECT ensure_threads_partition($1)")
+            .bind(list.id)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("SELECT ensure_thread_nodes_partition($1)")
+            .bind(list.id)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("SELECT ensure_thread_messages_partition($1)")
+            .bind(list.id)
+            .execute(&self.pool)
+            .await?;
 
         Ok(list)
     }
