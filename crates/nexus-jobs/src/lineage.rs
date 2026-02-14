@@ -62,6 +62,7 @@ struct CandidateVersion {
 #[derive(Debug, Clone)]
 struct CandidateItem {
     message_pk: i64,
+    thread_order: usize,
     ordinal: Option<i32>,
     total: Option<i32>,
     subject_raw: String,
@@ -370,14 +371,18 @@ fn build_candidates(
 
         for message in &thread_messages {
             let parsed = parse_patch_subject(&message.subject_raw);
-            if parsed.ordinal == Some(0) && !parsed.subject_norm_base.is_empty() {
+            if parsed.has_patch_tag
+                && !parsed.had_reply_prefix
+                && parsed.ordinal == Some(0)
+                && !parsed.subject_norm_base.is_empty()
+            {
                 cover_subject_by_version
                     .entry((parsed.version_num, parsed.is_rfc))
                     .or_insert(parsed.subject_norm_base);
             }
         }
 
-        for message in thread_messages {
+        for (thread_order, message) in thread_messages.into_iter().enumerate() {
             let parsed = parse_patch_subject(&message.subject_raw);
             let extracted_diff = message
                 .diff_text
@@ -389,11 +394,20 @@ fn build_candidates(
                 .map(|value| !value.trim().is_empty())
                 .unwrap_or(false);
 
-            if !parsed.has_patch_tag && !has_diff {
+            if !parsed.has_patch_tag {
                 continue;
             }
 
             if parsed.subject_norm_base.is_empty() {
+                continue;
+            }
+
+            let is_cover = !parsed.had_reply_prefix && parsed.ordinal == Some(0);
+            let is_patch = !parsed.had_reply_prefix
+                && parsed.ordinal.is_some_and(|ordinal| ordinal > 0)
+                && has_diff;
+
+            if !is_cover && !is_patch {
                 continue;
             }
 
@@ -464,21 +478,14 @@ fn build_candidates(
                 entry.reference_message_ids = lineage_reference_ids(&message);
             }
 
-            let mut ordinal = parsed.ordinal;
-            let item_type = if parsed.ordinal == Some(0) || (parsed.has_patch_tag && !has_diff) {
+            let item_type = if is_cover { "cover" } else { "patch" }.to_string();
+            let ordinal = parsed.ordinal;
+
+            if is_cover {
                 entry.cover_message_pk.get_or_insert(message.message_pk);
-                "cover".to_string()
-            } else if parsed.has_patch_tag || has_diff {
-                if ordinal == Some(0) {
-                    ordinal = None;
-                }
-                if entry.first_patch_message_pk.is_none() {
-                    entry.first_patch_message_pk = Some(message.message_pk);
-                }
-                "patch".to_string()
-            } else {
-                "other".to_string()
-            };
+            } else if entry.first_patch_message_pk.is_none() {
+                entry.first_patch_message_pk = Some(message.message_pk);
+            }
 
             let patch_id_stable = extracted_diff
                 .as_deref()
@@ -486,6 +493,7 @@ fn build_candidates(
 
             entry.items.push(CandidateItem {
                 message_pk: message.message_pk,
+                thread_order,
                 ordinal,
                 total: parsed.total,
                 subject_raw: message.subject_raw,
@@ -509,22 +517,64 @@ fn build_candidates(
         }
 
         for mut candidate in by_subject_and_version.into_values() {
+            candidate.items = dedupe_items_by_ordinal(candidate.items);
             normalize_item_ordinals(&mut candidate.items);
-            candidate
+            candidate.items.sort_by_key(|item| {
+                (
+                    item.ordinal.unwrap_or(0),
+                    item.thread_order,
+                    item.message_pk,
+                )
+            });
+            candidate.cover_message_pk = candidate
                 .items
-                .sort_by_key(|item| (item.ordinal.unwrap_or(0), item.message_pk));
-            if candidate.first_patch_message_pk.is_none() {
-                candidate.first_patch_message_pk = candidate
-                    .items
-                    .iter()
-                    .find(|item| item.item_type == "patch")
-                    .map(|item| item.message_pk);
-            }
+                .iter()
+                .find(|item| item.item_type == "cover" && item.ordinal == Some(0))
+                .map(|item| item.message_pk);
+            candidate.first_patch_message_pk = candidate
+                .items
+                .iter()
+                .find(|item| item.item_type == "patch")
+                .map(|item| item.message_pk);
             out.push(candidate);
         }
     }
 
     out
+}
+
+fn dedupe_items_by_ordinal(items: Vec<CandidateItem>) -> Vec<CandidateItem> {
+    let mut by_ordinal: BTreeMap<i32, CandidateItem> = BTreeMap::new();
+    for item in items {
+        let Some(ordinal) = item.ordinal else {
+            continue;
+        };
+
+        let replace = by_ordinal
+            .get(&ordinal)
+            .map(|existing| is_better_candidate_item(&item, existing))
+            .unwrap_or(true);
+        if replace {
+            by_ordinal.insert(ordinal, item);
+        }
+    }
+    by_ordinal.into_values().collect()
+}
+
+fn is_better_candidate_item(candidate: &CandidateItem, existing: &CandidateItem) -> bool {
+    let candidate_rank = (
+        if candidate.item_type == "patch" { 0 } else { 1 },
+        if candidate.has_diff { 0 } else { 1 },
+        candidate.thread_order,
+        candidate.message_pk,
+    );
+    let existing_rank = (
+        if existing.item_type == "patch" { 0 } else { 1 },
+        if existing.has_diff { 0 } else { 1 },
+        existing.thread_order,
+        existing.message_pk,
+    );
+    candidate_rank < existing_rank
 }
 
 fn normalize_item_ordinals(items: &mut [CandidateItem]) {
@@ -876,15 +926,17 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use nexus_core::config::DatabaseConfig;
     use nexus_db::{
-        CatalogStore, Db, IngestStore, LineageStore, ParsedBodyInput, ParsedMessageInput,
+        CatalogStore, Db, IngestStore, LineageSourceMessage, LineageStore, ParsedBodyInput,
+        ParsedMessageInput,
     };
     use sqlx::Row;
 
     use crate::mail::parse_email;
+    use crate::patch_id::PatchIdMemo;
     use crate::patch_subject::parse_patch_subject;
 
     use super::{
-        process_diff_parse_patch_items, process_patch_extract_window,
+        build_candidates, process_diff_parse_patch_items, process_patch_extract_window,
         process_patch_id_compute_batch,
     };
 
@@ -903,6 +955,116 @@ mod tests {
         assert!(c.is_resend);
         assert_eq!(c.version_num, 3);
         assert_eq!(c.ordinal, Some(2));
+
+        let reply = parse_patch_subject("Re: [PATCH 1/1] net: clean");
+        assert!(reply.had_reply_prefix);
+    }
+
+    #[test]
+    fn build_candidates_ignores_reply_subject_contamination() {
+        let messages = vec![
+            source_message(
+                500,
+                1,
+                1,
+                "[PATCH 0/2] bpf: series",
+                "alice@example.com",
+                "Mon, 01 Jan 2024 00:00:00 +0000",
+                "Cover body",
+                None,
+            ),
+            source_message(
+                500,
+                2,
+                2,
+                "[PATCH 1/2] bpf: patch one",
+                "alice@example.com",
+                "Mon, 01 Jan 2024 00:01:00 +0000",
+                "Patch body",
+                Some("diff --git a/a.c b/a.c\n--- a/a.c\n+++ b/a.c\n@@ -1 +1 @@\n-old\n+new\n"),
+            ),
+            source_message(
+                500,
+                3,
+                3,
+                "Re: [PATCH 1/2] bpf: patch one",
+                "reviewer@example.com",
+                "Mon, 01 Jan 2024 00:02:00 +0000",
+                "Looks good",
+                None,
+            ),
+            source_message(
+                500,
+                4,
+                4,
+                "Re: [PATCH 1/2] bpf: patch one",
+                "reviewer2@example.com",
+                "Mon, 01 Jan 2024 00:03:00 +0000",
+                "Inline diff in reply",
+                Some(
+                    "diff --git a/a.c b/a.c\n--- a/a.c\n+++ b/a.c\n@@ -1 +1 @@\n-old\n+new-reply\n",
+                ),
+            ),
+            source_message(
+                500,
+                5,
+                5,
+                "[PATCH 2/2] bpf: patch two",
+                "alice@example.com",
+                "Mon, 01 Jan 2024 00:04:00 +0000",
+                "Patch body",
+                Some("diff --git a/b.c b/b.c\n--- a/b.c\n+++ b/b.c\n@@ -1 +1 @@\n-old\n+new\n"),
+            ),
+            source_message(
+                500,
+                6,
+                6,
+                "Re: [PATCH 2/2] bpf: patch two",
+                "reviewer@example.com",
+                "Mon, 01 Jan 2024 00:05:00 +0000",
+                "Ack",
+                None,
+            ),
+        ];
+
+        let mut memo = PatchIdMemo::default();
+        let candidates = build_candidates(messages, &mut memo);
+        assert_eq!(candidates.len(), 1);
+
+        let candidate = &candidates[0];
+        let cover_items = candidate
+            .items
+            .iter()
+            .filter(|item| item.item_type == "cover")
+            .collect::<Vec<_>>();
+        assert_eq!(cover_items.len(), 1);
+        assert_eq!(cover_items[0].ordinal, Some(0));
+        assert_eq!(cover_items[0].message_pk, 1);
+
+        let patch_items = candidate
+            .items
+            .iter()
+            .filter(|item| item.item_type == "patch")
+            .collect::<Vec<_>>();
+        assert_eq!(patch_items.len(), 2);
+        assert_eq!(patch_items[0].ordinal, Some(1));
+        assert_eq!(patch_items[0].message_pk, 2);
+        assert_eq!(patch_items[1].ordinal, Some(2));
+        assert_eq!(patch_items[1].message_pk, 5);
+
+        assert!(
+            candidate
+                .items
+                .iter()
+                .all(|item| !(item.item_type == "cover" && item.ordinal.unwrap_or(0) > 0))
+        );
+        assert!(
+            candidate
+                .items
+                .iter()
+                .all(|item| ![3, 4, 6].contains(&item.message_pk)),
+            "reply messages must not be present in patch_items",
+        );
     }
 
     #[tokio::test]
@@ -1116,6 +1278,20 @@ mod tests {
         .await?;
         assert_eq!(patch_with_ids, 4);
 
+        let bad_cover_ordinals: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*)
+            FROM patch_items pi
+            JOIN patch_series_versions psv
+              ON psv.id = pi.patch_series_version_id
+            WHERE psv.patch_series_id = $1
+              AND pi.item_type = 'cover'
+              AND pi.ordinal > 0"#,
+        )
+        .bind(series_id)
+        .fetch_one(db.pool())
+        .await?;
+        assert_eq!(bad_cover_ordinals, 0);
+
         let patch_item_files_count: i64 = sqlx::query_scalar(
             r#"SELECT COUNT(*)
             FROM patch_item_files pif
@@ -1254,6 +1430,22 @@ mod tests {
                 "new1",
                 None,
             ),
+            reply_mail(
+                "m2-reply@example.com",
+                "Mon, 01 Jan 2024 00:01:30 +0000",
+                "Re: [PATCH 1/3] subsys: part one",
+                Some("<m2@example.com>"),
+                None,
+            ),
+            reply_mail(
+                "m2-reply-diff@example.com",
+                "Mon, 01 Jan 2024 00:01:45 +0000",
+                "Re: [PATCH 1/3] subsys: part one",
+                Some("<m2@example.com>"),
+                Some(
+                    "diff --git a/foo.c b/foo.c\r\n--- a/foo.c\r\n+++ b/foo.c\r\n@@ -1 +1 @@\r\n-old1\r\n+reply-change\r\n",
+                ),
+            ),
             patch_mail(
                 "m3@example.com",
                 "Mon, 01 Jan 2024 00:02:00 +0000",
@@ -1288,6 +1480,36 @@ mod tests {
                 Some("<m5@example.com>"),
             ),
         ]
+    }
+
+    fn source_message(
+        thread_id: i64,
+        sort_ordinal: u32,
+        message_pk: i64,
+        subject_raw: &str,
+        from_email: &str,
+        date_raw: &str,
+        body_text: &str,
+        diff_text: Option<&str>,
+    ) -> LineageSourceMessage {
+        let date_utc = chrono::DateTime::parse_from_rfc2822(date_raw)
+            .expect("valid rfc2822 date")
+            .with_timezone(&Utc);
+        LineageSourceMessage {
+            thread_id,
+            message_pk,
+            sort_key: sort_ordinal.to_be_bytes().to_vec(),
+            message_id_primary: format!("m{message_pk}@example.com"),
+            subject_raw: subject_raw.to_string(),
+            subject_norm: subject_raw.to_ascii_lowercase(),
+            from_name: None,
+            from_email: from_email.to_string(),
+            date_utc: Some(date_utc),
+            references_ids: Vec::new(),
+            in_reply_to_ids: Vec::new(),
+            body_text: Some(body_text.to_string()),
+            diff_text: diff_text.map(str::to_string),
+        }
     }
 
     fn cover_mail(message_id: &str, date: &str, subject: &str, references: Option<&str>) -> String {
@@ -1350,6 +1572,33 @@ mod tests {
             old = old,
             new = new,
         );
+
+        format!("{}\r\n\r\n{}", headers.join("\r\n"), body)
+    }
+
+    fn reply_mail(
+        message_id: &str,
+        date: &str,
+        subject: &str,
+        references: Option<&str>,
+        inline_diff: Option<&str>,
+    ) -> String {
+        let mut headers = vec![
+            "From: Reviewer <reviewer@example.com>".to_string(),
+            format!("Message-ID: <{message_id}>"),
+            format!("Date: {date}"),
+            format!("Subject: {subject}"),
+            "Content-Type: text/plain; charset=utf-8".to_string(),
+        ];
+        if let Some(reference) = references {
+            headers.push(format!("References: {reference}"));
+            headers.push(format!("In-Reply-To: {reference}"));
+        }
+
+        let body = match inline_diff {
+            Some(diff) => format!("Review comments\r\n\r\n{diff}"),
+            None => "Review comments only\r\n".to_string(),
+        };
 
         format!("{}\r\n\r\n{}", headers.join("\r\n"), body)
     }

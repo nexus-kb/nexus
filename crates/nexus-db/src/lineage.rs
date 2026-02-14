@@ -203,6 +203,8 @@ pub struct ThreadListItemRecord {
     pub created_at: DateTime<Utc>,
     pub last_activity_at: DateTime<Utc>,
     pub message_count: i32,
+    pub starter_name: Option<String>,
+    pub starter_email: Option<String>,
     pub has_diff: bool,
 }
 
@@ -752,21 +754,91 @@ impl LineageStore {
                     $9, $10, $11,
                     $12, $13, $14, $15, $16, $17)
             ON CONFLICT (patch_series_version_id, ordinal)
-            DO UPDATE SET total = EXCLUDED.total,
-                          message_pk = EXCLUDED.message_pk,
-                          subject_raw = EXCLUDED.subject_raw,
-                          subject_norm = EXCLUDED.subject_norm,
-                          commit_subject = EXCLUDED.commit_subject,
-                          commit_subject_norm = EXCLUDED.commit_subject_norm,
-                          commit_author_name = EXCLUDED.commit_author_name,
-                          commit_author_email = EXCLUDED.commit_author_email,
-                          item_type = EXCLUDED.item_type,
-                          has_diff = EXCLUDED.has_diff,
-                          patch_id_stable = EXCLUDED.patch_id_stable,
-                          file_count = EXCLUDED.file_count,
-                          additions = EXCLUDED.additions,
-                          deletions = EXCLUDED.deletions,
-                          hunk_count = EXCLUDED.hunk_count
+            DO UPDATE SET total = COALESCE(EXCLUDED.total, patch_items.total),
+                          message_pk = CASE
+                              WHEN patch_items.item_type = 'patch'
+                               AND (EXCLUDED.item_type <> 'patch' OR EXCLUDED.has_diff = false)
+                              THEN patch_items.message_pk
+                              ELSE EXCLUDED.message_pk
+                          END,
+                          subject_raw = CASE
+                              WHEN patch_items.item_type = 'patch'
+                               AND (EXCLUDED.item_type <> 'patch' OR EXCLUDED.has_diff = false)
+                              THEN patch_items.subject_raw
+                              ELSE EXCLUDED.subject_raw
+                          END,
+                          subject_norm = CASE
+                              WHEN patch_items.item_type = 'patch'
+                               AND (EXCLUDED.item_type <> 'patch' OR EXCLUDED.has_diff = false)
+                              THEN patch_items.subject_norm
+                              ELSE EXCLUDED.subject_norm
+                          END,
+                          commit_subject = CASE
+                              WHEN patch_items.item_type = 'patch'
+                               AND (EXCLUDED.item_type <> 'patch' OR EXCLUDED.has_diff = false)
+                              THEN patch_items.commit_subject
+                              ELSE EXCLUDED.commit_subject
+                          END,
+                          commit_subject_norm = CASE
+                              WHEN patch_items.item_type = 'patch'
+                               AND (EXCLUDED.item_type <> 'patch' OR EXCLUDED.has_diff = false)
+                              THEN patch_items.commit_subject_norm
+                              ELSE EXCLUDED.commit_subject_norm
+                          END,
+                          commit_author_name = CASE
+                              WHEN patch_items.item_type = 'patch'
+                               AND (EXCLUDED.item_type <> 'patch' OR EXCLUDED.has_diff = false)
+                              THEN patch_items.commit_author_name
+                              ELSE EXCLUDED.commit_author_name
+                          END,
+                          commit_author_email = CASE
+                              WHEN patch_items.item_type = 'patch'
+                               AND (EXCLUDED.item_type <> 'patch' OR EXCLUDED.has_diff = false)
+                              THEN patch_items.commit_author_email
+                              ELSE EXCLUDED.commit_author_email
+                          END,
+                          item_type = CASE
+                              WHEN patch_items.item_type = 'patch'
+                               AND (EXCLUDED.item_type <> 'patch' OR EXCLUDED.has_diff = false)
+                              THEN patch_items.item_type
+                              ELSE EXCLUDED.item_type
+                          END,
+                          has_diff = CASE
+                              WHEN patch_items.item_type = 'patch'
+                               AND (EXCLUDED.item_type <> 'patch' OR EXCLUDED.has_diff = false)
+                              THEN patch_items.has_diff
+                              ELSE EXCLUDED.has_diff
+                          END,
+                          patch_id_stable = CASE
+                              WHEN patch_items.item_type = 'patch'
+                               AND (EXCLUDED.item_type <> 'patch' OR EXCLUDED.has_diff = false)
+                              THEN patch_items.patch_id_stable
+                              ELSE COALESCE(EXCLUDED.patch_id_stable, patch_items.patch_id_stable)
+                          END,
+                          file_count = CASE
+                              WHEN patch_items.item_type = 'patch'
+                               AND (EXCLUDED.item_type <> 'patch' OR EXCLUDED.has_diff = false)
+                              THEN patch_items.file_count
+                              ELSE EXCLUDED.file_count
+                          END,
+                          additions = CASE
+                              WHEN patch_items.item_type = 'patch'
+                               AND (EXCLUDED.item_type <> 'patch' OR EXCLUDED.has_diff = false)
+                              THEN patch_items.additions
+                              ELSE EXCLUDED.additions
+                          END,
+                          deletions = CASE
+                              WHEN patch_items.item_type = 'patch'
+                               AND (EXCLUDED.item_type <> 'patch' OR EXCLUDED.has_diff = false)
+                              THEN patch_items.deletions
+                              ELSE EXCLUDED.deletions
+                          END,
+                          hunk_count = CASE
+                              WHEN patch_items.item_type = 'patch'
+                               AND (EXCLUDED.item_type <> 'patch' OR EXCLUDED.has_diff = false)
+                              THEN patch_items.hunk_count
+                              ELSE EXCLUDED.hunk_count
+                          END
             RETURNING id,
                       patch_series_version_id,
                       ordinal,
@@ -1058,6 +1130,8 @@ impl LineageStore {
                 t.created_at,
                 t.last_activity_at,
                 t.message_count,
+                starter_msg.from_name AS starter_name,
+                starter_msg.from_email AS starter_email,
                 EXISTS (
                     SELECT 1
                     FROM thread_messages tm
@@ -1068,6 +1142,7 @@ impl LineageStore {
                       AND mb.has_diff = true
                 ) AS has_diff
             FROM threads t
+            LEFT JOIN messages starter_msg ON starter_msg.id = t.root_message_pk
             WHERE t.mailing_list_id = "#,
         );
         qb.push_bind(mailing_list_id);

@@ -14,6 +14,7 @@ static ORDINAL_RE: Lazy<Regex> = Lazy::new(|| {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedPatchSubject {
     pub subject_norm_base: String,
+    pub had_reply_prefix: bool,
     pub has_patch_tag: bool,
     pub is_rfc: bool,
     pub version_num: i32,
@@ -24,7 +25,7 @@ pub struct ParsedPatchSubject {
 }
 
 pub fn parse_patch_subject(subject_raw: &str) -> ParsedPatchSubject {
-    let stripped = strip_reply_prefixes(subject_raw.trim());
+    let (stripped, had_reply_prefix) = strip_reply_prefixes(subject_raw.trim());
     let (tags, remainder) = consume_leading_bracket_groups(stripped);
 
     let mut has_patch_tag = false;
@@ -94,6 +95,7 @@ pub fn parse_patch_subject(subject_raw: &str) -> ParsedPatchSubject {
 
     ParsedPatchSubject {
         subject_norm_base: normalize_subject_base(remainder),
+        had_reply_prefix,
         has_patch_tag,
         is_rfc,
         version_num,
@@ -104,14 +106,16 @@ pub fn parse_patch_subject(subject_raw: &str) -> ParsedPatchSubject {
     }
 }
 
-fn strip_reply_prefixes(mut value: &str) -> &str {
+fn strip_reply_prefixes(mut value: &str) -> (&str, bool) {
+    let mut had_reply_prefix = false;
     loop {
         let trimmed = value.trim_start();
         if let Some(mat) = REPLY_PREFIX_RE.find(trimmed) {
+            had_reply_prefix = true;
             value = &trimmed[mat.end()..];
             continue;
         }
-        return trimmed;
+        return (trimmed, had_reply_prefix);
     }
 }
 
@@ -158,6 +162,7 @@ mod tests {
     #[test]
     fn parses_patch_v2_ordinal() {
         let parsed = parse_patch_subject("[PATCH v2 01/27] mm: improve reclaim");
+        assert!(!parsed.had_reply_prefix);
         assert!(parsed.has_patch_tag);
         assert_eq!(parsed.version_num, 2);
         assert_eq!(parsed.ordinal, Some(1));
@@ -169,6 +174,7 @@ mod tests {
     #[test]
     fn parses_rfc_cover() {
         let parsed = parse_patch_subject("[RFC PATCH 0/5] bpf: add feature");
+        assert!(!parsed.had_reply_prefix);
         assert!(parsed.has_patch_tag);
         assert!(parsed.is_rfc);
         assert_eq!(parsed.version_num, 1);
@@ -179,11 +185,18 @@ mod tests {
     #[test]
     fn parses_resend_and_reply_prefixes() {
         let parsed = parse_patch_subject("Re: [PATCH RESEND v3 2/7] net: cleanup foo");
+        assert!(parsed.had_reply_prefix);
         assert!(parsed.has_patch_tag);
         assert!(parsed.is_resend);
         assert_eq!(parsed.version_num, 3);
         assert_eq!(parsed.ordinal, Some(2));
         assert_eq!(parsed.total, Some(7));
         assert_eq!(parsed.subject_norm_base, "net: cleanup foo");
+    }
+
+    #[test]
+    fn keeps_non_reply_subjects_marked_as_non_reply() {
+        let parsed = parse_patch_subject("[PATCH 1/1] bpf: sample");
+        assert!(!parsed.had_reply_prefix);
     }
 }
