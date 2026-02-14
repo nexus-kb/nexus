@@ -4,13 +4,14 @@ use std::path::Path;
 use std::time::Instant;
 
 use gix::hash::ObjectId;
-use nexus_core::config::Settings;
+use nexus_core::config::{BackfillMode, IngestWriteMode, Settings};
 use nexus_db::{
-    CatalogStore, EnqueueJobParams, IngestStore, Job, JobStore, JobStoreMetrics, LineageStore,
-    ParsedBodyInput, ParsedMessageInput, ThreadComponentWrite, ThreadMessageWrite, ThreadNodeWrite,
-    ThreadSummaryWrite, ThreadingStore,
+    CatalogStore, EnqueueJobParams, IngestCommitRow, IngestStore, Job, JobStore, JobStoreMetrics,
+    LineageStore, ParsedBodyInput, ParsedMessageInput, ThreadComponentWrite, ThreadMessageWrite,
+    ThreadNodeWrite, ThreadSummaryWrite, ThreadingApplyStats, ThreadingStore,
 };
 use sha2::{Digest, Sha256};
+use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 use crate::lineage::{
@@ -19,10 +20,10 @@ use crate::lineage::{
 use crate::mail::{ParseEmailError, parse_email};
 use crate::payloads::{
     DiffParsePatchItemsPayload, IngestCommitBatchPayload, LineageRebuildListPayload,
-    PatchExtractWindowPayload, PatchIdComputeBatchPayload, RepoScanPayload,
+    PatchExtractWindowPayload, PatchIdComputeBatchPayload, RepoIngestRunPayload, RepoScanPayload,
     ThreadingRebuildListPayload, ThreadingUpdateWindowPayload,
 };
-use crate::scanner::{chunk_commit_oids, collect_new_commit_oids};
+use crate::scanner::stream_new_commit_oid_chunks;
 use crate::threading::{ThreadingInputMessage, build_threads};
 use crate::{ExecutionContext, JobExecutionOutcome};
 
@@ -58,6 +59,7 @@ impl Phase0JobHandler {
     pub async fn handle(&self, job: Job, ctx: ExecutionContext) -> JobExecutionOutcome {
         match job.job_type.as_str() {
             "repo_scan" => self.handle_repo_scan(job, ctx).await,
+            "repo_ingest_run" => self.handle_repo_ingest_run(job, ctx).await,
             "ingest_commit_batch" => self.handle_ingest_commit_batch(job, ctx).await,
             "threading_update_window" => self.handle_threading_update_window(job, ctx).await,
             "threading_rebuild_list" => self.handle_threading_rebuild_list(job, ctx).await,
@@ -130,11 +132,131 @@ impl Phase0JobHandler {
             }
         };
 
-        let since_commit_oid = payload.since_commit_oid.as_ref().or(watermark.as_ref());
+        let since_commit_oid = payload.since_commit_oid.or(watermark);
+        let repo_ingest_payload = RepoIngestRunPayload {
+            list_key: payload.list_key.clone(),
+            repo_key: payload.repo_key.clone(),
+            mirror_path: payload.mirror_path.clone(),
+            since_commit_oid: since_commit_oid.clone(),
+        };
 
-        let commits = match collect_new_commit_oids(
+        let dedupe_key = format!(
+            "{}:{}",
+            payload.repo_key,
+            since_commit_oid.as_deref().unwrap_or("-")
+        );
+
+        if let Err(err) = self
+            .jobs
+            .enqueue(EnqueueJobParams {
+                job_type: "repo_ingest_run".to_string(),
+                payload_json: serde_json::to_value(repo_ingest_payload)
+                    .unwrap_or_else(|_| serde_json::json!({})),
+                priority: 10,
+                dedupe_scope: Some(format!("repo:{}:scan:{}", repo.id, job.id)),
+                dedupe_key: Some(dedupe_key),
+                run_after: None,
+                max_attempts: Some(8),
+            })
+            .await
+        {
+            return retryable_error(
+                format!("failed to enqueue repo_ingest_run: {err}"),
+                "db",
+                &job,
+                started.elapsed().as_millis(),
+                &self.settings,
+            );
+        }
+
+        let duration_ms = started.elapsed().as_millis();
+        info!(
+            list_key = %payload.list_key,
+            repo_key = %payload.repo_key,
+            "repo_scan queued repo ingest run"
+        );
+
+        JobExecutionOutcome::Success {
+            result_json: serde_json::json!({
+                "queued_runs": 1,
+                "repo_key": payload.repo_key,
+                "since_commit_oid": since_commit_oid,
+            }),
+            metrics: JobStoreMetrics {
+                duration_ms,
+                rows_written: 1,
+                bytes_read: 0,
+                commit_count: 0,
+                parse_errors: 0,
+            },
+        }
+    }
+
+    async fn handle_repo_ingest_run(&self, job: Job, ctx: ExecutionContext) -> JobExecutionOutcome {
+        let started = Instant::now();
+
+        let payload: RepoIngestRunPayload = match serde_json::from_value(job.payload_json.clone()) {
+            Ok(v) => v,
+            Err(err) => {
+                return JobExecutionOutcome::Terminal {
+                    reason: format!("invalid repo_ingest_run payload: {err}"),
+                    kind: "payload".to_string(),
+                    metrics: empty_metrics(started.elapsed().as_millis()),
+                };
+            }
+        };
+
+        let repo = match self
+            .catalog
+            .get_repo(&payload.list_key, &payload.repo_key)
+            .await
+        {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                return JobExecutionOutcome::Terminal {
+                    reason: format!(
+                        "repo not found for list_key={} repo_key={}",
+                        payload.list_key, payload.repo_key
+                    ),
+                    kind: "not_found".to_string(),
+                    metrics: empty_metrics(started.elapsed().as_millis()),
+                };
+            }
+            Err(err) => {
+                return retryable_error(
+                    format!("failed to load repo metadata: {err}"),
+                    "db",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+        };
+
+        let current_watermark = match self.catalog.get_watermark(repo.id).await {
+            Ok(v) => v,
+            Err(err) => {
+                return retryable_error(
+                    format!("failed to read watermark: {err}"),
+                    "db",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+        };
+
+        let since_commit_oid = current_watermark.clone();
+        let batch_size = if matches!(self.settings.worker.backfill_mode, BackfillMode::IngestOnly) {
+            self.settings.worker.backfill_batch_size.max(1)
+        } else {
+            self.settings.mail.commit_batch_size.max(1)
+        };
+
+        let mut stream = match stream_new_commit_oid_chunks(
             Path::new(&payload.mirror_path),
-            since_commit_oid.map(|v| v.as_str()),
+            since_commit_oid.as_deref(),
+            batch_size,
         ) {
             Ok(v) => v,
             Err(err) => {
@@ -148,68 +270,209 @@ impl Phase0JobHandler {
             }
         };
 
-        let chunks = chunk_commit_oids(&commits, self.settings.mail.commit_batch_size.max(1));
+        let mut gix_repo = match gix::open(Path::new(&payload.mirror_path)) {
+            Ok(v) => v,
+            Err(err) => {
+                return retryable_error(
+                    format!("failed to open repo path {}: {err}", payload.mirror_path),
+                    "io",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+        };
+        gix_repo.object_cache_size_if_unset(64 * 1024 * 1024);
 
-        let mut expected_prev = since_commit_oid.cloned();
-        for (index, chunk) in chunks.iter().enumerate() {
-            let chunk_first = chunk.first().cloned().unwrap_or_default();
-            let chunk_last = chunk.last().cloned().unwrap_or_default();
-            let dedupe_key = format!("{}:{}:{}", payload.repo_key, chunk_first, chunk_last);
+        let mut chunk_count = 0u64;
+        let mut processed_commits = 0u64;
+        let mut rows_written = 0u64;
+        let mut bytes_read = 0u64;
+        let mut parse_errors = 0u64;
+        let mut threading_enqueued = 0u64;
+        let mut last_scanned_commit: Option<String> = None;
 
-            let ingest_payload = IngestCommitBatchPayload {
-                list_key: payload.list_key.clone(),
-                repo_key: payload.repo_key.clone(),
-                chunk_index: index as u32,
-                expected_prev_commit_oid: expected_prev.clone(),
-                commit_oids: chunk.clone(),
+        loop {
+            if let Err(err) = ctx.heartbeat().await {
+                warn!(job_id = job.id, error = %err, "heartbeat update failed");
+            }
+            match ctx.is_cancel_requested().await {
+                Ok(true) => {
+                    return JobExecutionOutcome::Cancelled {
+                        reason: "cancel requested".to_string(),
+                        metrics: JobStoreMetrics {
+                            duration_ms: started.elapsed().as_millis(),
+                            rows_written,
+                            bytes_read,
+                            commit_count: processed_commits,
+                            parse_errors,
+                        },
+                    };
+                }
+                Ok(false) => {}
+                Err(err) => warn!(job_id = job.id, error = %err, "cancel check failed"),
+            }
+
+            let chunk = match stream.next_chunk() {
+                Ok(Some(v)) => v,
+                Ok(None) => break,
+                Err(err) => {
+                    return retryable_error(
+                        format!("repo scan failed: {err}"),
+                        "io",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
+                }
             };
 
-            if let Err(err) = self
-                .jobs
-                .enqueue(EnqueueJobParams {
-                    job_type: "ingest_commit_batch".to_string(),
-                    payload_json: serde_json::to_value(ingest_payload)
-                        .unwrap_or_else(|_| serde_json::json!({})),
-                    priority: 10,
-                    dedupe_scope: Some(format!("repo:{}:scan:{}", repo.id, job.id)),
-                    dedupe_key: Some(dedupe_key),
-                    run_after: None,
-                    max_attempts: Some(8),
-                })
+            chunk_count += 1;
+            processed_commits += chunk.len() as u64;
+            last_scanned_commit = chunk.last().cloned();
+
+            let mut raw_commits = Vec::with_capacity(chunk.len());
+            for (idx, commit_oid) in chunk.iter().enumerate() {
+                let raw_mail = match read_mail_blob(&gix_repo, commit_oid) {
+                    Ok(Some(v)) => v,
+                    Ok(None) => {
+                        parse_errors += 1;
+                        continue;
+                    }
+                    Err(err) => {
+                        return retryable_error(
+                            format!("failed to read commit blob {commit_oid}: {err}"),
+                            "io",
+                            &job,
+                            started.elapsed().as_millis(),
+                            &self.settings,
+                        );
+                    }
+                };
+
+                bytes_read += raw_mail.len() as u64;
+                raw_commits.push(RawCommitMail {
+                    index: idx,
+                    commit_oid: commit_oid.clone(),
+                    raw_rfc822: raw_mail,
+                });
+            }
+
+            let parsed_outcome = parse_commit_rows(
+                raw_commits,
+                self.settings.worker.ingest_parse_concurrency.max(1),
+            )
+            .await;
+            parse_errors += parsed_outcome.parse_errors;
+
+            let batch_outcome = match self
+                .write_ingest_rows(
+                    &repo,
+                    &parsed_outcome.rows,
+                    self.settings.worker.db_relaxed_durability,
+                )
                 .await
             {
+                Ok(v) => v,
+                Err(err) => {
+                    return retryable_error(
+                        format!(
+                            "ingest batch write failed for repo {}: {err}",
+                            payload.repo_key
+                        ),
+                        "db",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
+                }
+            };
+
+            rows_written += batch_outcome.inserted_instances;
+            let mut anchor_message_pks: Vec<i64> = batch_outcome.message_pks;
+            anchor_message_pks.sort_unstable();
+            anchor_message_pks.dedup();
+
+            let full_pipeline = matches!(
+                self.settings.worker.backfill_mode,
+                BackfillMode::FullPipeline
+            );
+            if full_pipeline && !anchor_message_pks.is_empty() {
+                let dedupe_key = hash_message_pks(&anchor_message_pks);
+                let threading_payload = ThreadingUpdateWindowPayload {
+                    list_key: payload.list_key.clone(),
+                    anchor_message_pks: anchor_message_pks.clone(),
+                    source_job_id: Some(job.id),
+                };
+
+                if let Err(err) = self
+                    .jobs
+                    .enqueue(EnqueueJobParams {
+                        job_type: "threading_update_window".to_string(),
+                        payload_json: serde_json::to_value(threading_payload)
+                            .unwrap_or_else(|_| serde_json::json!({})),
+                        priority: 5,
+                        dedupe_scope: Some(format!("list:{}", payload.list_key)),
+                        dedupe_key: Some(dedupe_key),
+                        run_after: None,
+                        max_attempts: Some(8),
+                    })
+                    .await
+                {
+                    return retryable_error(
+                        format!("failed to enqueue threading update: {err}"),
+                        "db",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
+                }
+                threading_enqueued += 1;
+            }
+
+            if let Some(last_commit) = chunk.last()
+                && let Err(err) = self
+                    .catalog
+                    .update_watermark(repo.id, Some(last_commit))
+                    .await
+            {
                 return retryable_error(
-                    format!("failed to enqueue ingest chunk: {err}"),
+                    format!("failed to update watermark: {err}"),
                     "db",
                     &job,
                     started.elapsed().as_millis(),
                     &self.settings,
                 );
             }
-
-            expected_prev = Some(chunk_last);
         }
-
-        let duration_ms = started.elapsed().as_millis();
-        info!(
-            list_key = %payload.list_key,
-            repo_key = %payload.repo_key,
-            commit_count = commits.len(),
-            chunk_count = chunks.len(),
-            "repo_scan queued ingest jobs"
-        );
 
         JobExecutionOutcome::Success {
             result_json: serde_json::json!({
-                "commit_count": commits.len(),
-                "chunk_count": chunks.len(),
+                "list_key": payload.list_key,
+                "repo_key": payload.repo_key,
+                "batch_size": batch_size,
+                "chunk_count": chunk_count,
+                "commit_count": processed_commits,
+                "rows_written": rows_written,
+                "parse_errors": parse_errors,
+                "threading_jobs_enqueued": threading_enqueued,
+                "last_scanned_commit": last_scanned_commit,
+                "start_watermark": since_commit_oid,
+                "backfill_mode": match self.settings.worker.backfill_mode {
+                    BackfillMode::FullPipeline => "full_pipeline",
+                    BackfillMode::IngestOnly => "ingest_only",
+                },
+                "ingest_write_mode": match self.settings.worker.ingest_write_mode {
+                    IngestWriteMode::Copy => "copy",
+                    IngestWriteMode::BatchedSql => "batched_sql",
+                }
             }),
             metrics: JobStoreMetrics {
-                duration_ms,
-                rows_written: chunks.len() as u64,
-                bytes_read: 0,
-                commit_count: commits.len() as u64,
-                parse_errors: 0,
+                duration_ms: started.elapsed().as_millis(),
+                rows_written,
+                bytes_read,
+                commit_count: processed_commits,
+                parse_errors,
             },
         }
     }
@@ -309,8 +572,9 @@ impl Phase0JobHandler {
         let mut bytes_read = 0u64;
         let mut parse_errors = 0u64;
         let mut processed_commits = 0u64;
-        let mut last_success_commit: Option<String> = None;
-        let mut anchor_message_pks = BTreeSet::new();
+        let last_success_commit: Option<String> = payload.commit_oids.last().cloned();
+        let mut anchor_message_pks: BTreeSet<i64> = BTreeSet::new();
+        let mut raw_commits = Vec::new();
 
         for (idx, commit_oid) in payload.commit_oids.iter().enumerate() {
             if idx % 8 == 0 {
@@ -357,72 +621,55 @@ impl Phase0JobHandler {
             bytes_read += raw_mail.len() as u64;
             processed_commits += 1;
 
-            let parsed = match parse_email(&raw_mail) {
-                Ok(v) => v,
-                Err(ParseEmailError::MissingMessageId | ParseEmailError::MissingAuthorEmail) => {
-                    parse_errors += 1;
-                    continue;
-                }
-                Err(err) => {
-                    parse_errors += 1;
-                    warn!(commit_oid = %commit_oid, error = %err, "mail parse error");
-                    continue;
-                }
-            };
+            raw_commits.push(RawCommitMail {
+                index: idx,
+                commit_oid: commit_oid.clone(),
+                raw_rfc822: raw_mail,
+            });
+        }
 
-            let parsed_input = ParsedMessageInput {
-                content_hash_sha256: parsed.content_hash_sha256,
-                subject_raw: parsed.subject_raw,
-                subject_norm: parsed.subject_norm,
-                from_name: parsed.from_name,
-                from_email: parsed.from_email,
-                date_utc: parsed.date_utc,
-                to_raw: parsed.to_raw,
-                cc_raw: parsed.cc_raw,
-                message_ids: parsed.message_ids,
-                message_id_primary: parsed.message_id_primary,
-                in_reply_to_ids: parsed.in_reply_to_ids,
-                references_ids: parsed.references_ids,
-                mime_type: parsed.mime_type,
-                body: ParsedBodyInput {
-                    raw_rfc822: raw_mail,
-                    body_text: parsed.body_text,
-                    diff_text: parsed.diff_text,
-                    search_text: parsed.search_text,
-                    has_diff: parsed.has_diff,
-                    has_attachments: parsed.has_attachments,
-                },
-            };
+        let parsed_outcome = parse_commit_rows(
+            raw_commits,
+            self.settings.worker.ingest_parse_concurrency.max(1),
+        )
+        .await;
+        parse_errors += parsed_outcome.parse_errors;
 
-            match self
-                .ingest
-                .ingest_message(&repo, commit_oid, &parsed_input)
-                .await
-            {
-                Ok(outcome) => {
-                    if outcome.instance_inserted {
-                        rows_written += 1;
-                    }
-                    if let Some(message_pk) = outcome.message_pk {
-                        anchor_message_pks.insert(message_pk);
-                    }
-                    last_success_commit = Some(commit_oid.clone());
-                }
-                Err(err) => {
-                    return retryable_error(
-                        format!("ingest write failed for commit {commit_oid}: {err}"),
-                        "db",
-                        &job,
-                        started.elapsed().as_millis(),
-                        &self.settings,
-                    );
-                }
+        let batch_outcome = match self
+            .write_ingest_rows(
+                &repo,
+                &parsed_outcome.rows,
+                self.settings.worker.db_relaxed_durability,
+            )
+            .await
+        {
+            Ok(v) => v,
+            Err(err) => {
+                return retryable_error(
+                    format!(
+                        "ingest batch write failed for repo {}: {err}",
+                        payload.repo_key
+                    ),
+                    "db",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
             }
+        };
+
+        rows_written += batch_outcome.inserted_instances;
+        for message_pk in batch_outcome.message_pks {
+            anchor_message_pks.insert(message_pk);
         }
 
         let anchor_message_pks: Vec<i64> = anchor_message_pks.into_iter().collect();
         let mut threading_enqueued = false;
-        if !anchor_message_pks.is_empty() {
+        let full_pipeline = matches!(
+            self.settings.worker.backfill_mode,
+            BackfillMode::FullPipeline
+        );
+        if full_pipeline && !anchor_message_pks.is_empty() {
             let dedupe_key = hash_message_pks(&anchor_message_pks);
             let threading_payload = ThreadingUpdateWindowPayload {
                 list_key: payload.list_key.clone(),
@@ -436,7 +683,7 @@ impl Phase0JobHandler {
                     job_type: "threading_update_window".to_string(),
                     payload_json: serde_json::to_value(threading_payload)
                         .unwrap_or_else(|_| serde_json::json!({})),
-                    priority: 12,
+                    priority: 5,
                     dedupe_scope: Some(format!("list:{}", payload.list_key)),
                     dedupe_key: Some(dedupe_key),
                     run_after: None,
@@ -453,6 +700,14 @@ impl Phase0JobHandler {
                 );
             }
             threading_enqueued = true;
+        } else if !full_pipeline && !anchor_message_pks.is_empty() {
+            info!(
+                list_key = %payload.list_key,
+                repo_key = %payload.repo_key,
+                chunk_index = payload.chunk_index,
+                anchor_message_count = anchor_message_pks.len(),
+                "skipping threading enqueue in ingest_only backfill mode"
+            );
         }
 
         if let Some(last_commit) = last_success_commit.as_deref()
@@ -481,6 +736,10 @@ impl Phase0JobHandler {
                 "last_success_commit": last_success_commit,
                 "threading_enqueued": threading_enqueued,
                 "anchor_message_count": anchor_message_pks.len(),
+                "backfill_mode": match self.settings.worker.backfill_mode {
+                    BackfillMode::FullPipeline => "full_pipeline",
+                    BackfillMode::IngestOnly => "ingest_only",
+                },
             }),
             metrics: JobStoreMetrics {
                 duration_ms: started.elapsed().as_millis(),
@@ -492,167 +751,81 @@ impl Phase0JobHandler {
         }
     }
 
-    async fn handle_threading_update_window(
+    async fn write_ingest_rows(
         &self,
-        job: Job,
-        _ctx: ExecutionContext,
-    ) -> JobExecutionOutcome {
-        let started = Instant::now();
-
-        let payload: ThreadingUpdateWindowPayload =
-            match serde_json::from_value(job.payload_json.clone()) {
-                Ok(v) => v,
-                Err(err) => {
-                    return JobExecutionOutcome::Terminal {
-                        reason: format!("invalid threading_update_window payload: {err}"),
-                        kind: "payload".to_string(),
-                        metrics: empty_metrics(started.elapsed().as_millis()),
-                    };
-                }
-            };
-
-        let list = match self.catalog.get_mailing_list(&payload.list_key).await {
-            Ok(Some(v)) => v,
-            Ok(None) => {
-                return JobExecutionOutcome::Terminal {
-                    reason: format!("mailing list not found for list_key={}", payload.list_key),
-                    kind: "not_found".to_string(),
-                    metrics: empty_metrics(started.elapsed().as_millis()),
-                };
+        repo: &nexus_db::MailingListRepo,
+        rows: &[IngestCommitRow],
+        relaxed_durability: bool,
+    ) -> nexus_db::Result<nexus_db::BatchWriteOutcome> {
+        match self.settings.worker.ingest_write_mode {
+            IngestWriteMode::Copy => {
+                self.ingest
+                    .ingest_messages_copy_batch(repo, rows, relaxed_durability)
+                    .await
             }
-            Err(err) => {
-                return retryable_error(
-                    format!("failed to load mailing list: {err}"),
-                    "db",
-                    &job,
-                    started.elapsed().as_millis(),
-                    &self.settings,
-                );
+            IngestWriteMode::BatchedSql => {
+                self.ingest
+                    .ingest_messages_batch(repo, rows, relaxed_durability)
+                    .await
             }
-        };
+        }
+    }
 
-        let mut anchors = payload.anchor_message_pks;
+    async fn apply_threading_for_anchors(
+        &self,
+        list_id: i64,
+        list_key: &str,
+        anchors: Vec<i64>,
+        source_job_id: Option<i64>,
+        enqueue_lineage: bool,
+    ) -> nexus_db::Result<ThreadingWindowOutcome> {
+        let mut anchors = anchors;
         anchors.sort_unstable();
         anchors.dedup();
         anchors.retain(|v| *v > 0);
 
         if anchors.is_empty() {
-            return JobExecutionOutcome::Success {
-                result_json: serde_json::json!({
-                    "list_key": payload.list_key,
-                    "affected_threads": 0,
-                    "threads_rebuilt": 0,
-                    "nodes_written": 0,
-                    "dummy_nodes_written": 0,
-                    "messages_written": 0,
-                }),
-                metrics: empty_metrics(started.elapsed().as_millis()),
-            };
+            return Ok(ThreadingWindowOutcome::default());
         }
 
-        let mut message_set: BTreeSet<i64> = match self
+        let mut message_set: BTreeSet<i64> = self
             .threading
-            .expand_ancestor_closure(list.id, &anchors)
-            .await
-        {
-            Ok(values) => values.into_iter().collect(),
-            Err(err) => {
-                return retryable_error(
-                    format!("failed to build ancestor closure: {err}"),
-                    "db",
-                    &job,
-                    started.elapsed().as_millis(),
-                    &self.settings,
-                );
-            }
-        };
+            .expand_ancestor_closure(list_id, &anchors)
+            .await?
+            .into_iter()
+            .collect();
 
-        let impacted_thread_ids = match self
+        let impacted_thread_ids = self
             .threading
-            .find_impacted_thread_ids(list.id, &message_set.iter().copied().collect::<Vec<_>>())
-            .await
-        {
-            Ok(v) => v,
-            Err(err) => {
-                return retryable_error(
-                    format!("failed to load impacted threads: {err}"),
-                    "db",
-                    &job,
-                    started.elapsed().as_millis(),
-                    &self.settings,
-                );
-            }
-        };
+            .find_impacted_thread_ids(list_id, &message_set.iter().copied().collect::<Vec<_>>())
+            .await?;
 
         if !impacted_thread_ids.is_empty() {
-            let prior_members = match self
+            let prior_members = self
                 .threading
-                .list_message_pks_for_threads(list.id, &impacted_thread_ids)
-                .await
-            {
-                Ok(v) => v,
-                Err(err) => {
-                    return retryable_error(
-                        format!("failed to load prior thread members: {err}"),
-                        "db",
-                        &job,
-                        started.elapsed().as_millis(),
-                        &self.settings,
-                    );
-                }
-            };
+                .list_message_pks_for_threads(list_id, &impacted_thread_ids)
+                .await?;
             for message_pk in prior_members {
                 message_set.insert(message_pk);
             }
         }
 
         let message_seed: Vec<i64> = message_set.iter().copied().collect();
-        let expanded_message_set: Vec<i64> = match self
+        let expanded_message_set = self
             .threading
-            .expand_ancestor_closure(list.id, &message_seed)
-            .await
-        {
-            Ok(v) => v,
-            Err(err) => {
-                return retryable_error(
-                    format!("failed to expand ancestor closure after thread merge: {err}"),
-                    "db",
-                    &job,
-                    started.elapsed().as_millis(),
-                    &self.settings,
-                );
-            }
-        };
+            .expand_ancestor_closure(list_id, &message_seed)
+            .await?;
 
-        let source_messages = match self
+        let source_messages = self
             .threading
-            .load_source_messages(list.id, &expanded_message_set)
-            .await
-        {
-            Ok(v) => v,
-            Err(err) => {
-                return retryable_error(
-                    format!("failed to load source messages: {err}"),
-                    "db",
-                    &job,
-                    started.elapsed().as_millis(),
-                    &self.settings,
-                );
-            }
-        };
-
+            .load_source_messages(list_id, &expanded_message_set)
+            .await?;
         if source_messages.is_empty() {
-            return JobExecutionOutcome::Success {
-                result_json: serde_json::json!({
-                    "list_key": payload.list_key,
-                    "affected_threads": impacted_thread_ids.len(),
-                    "threads_rebuilt": 0,
-                    "nodes_written": 0,
-                    "dummy_nodes_written": 0,
-                    "messages_written": 0,
-                }),
-                metrics: empty_metrics(started.elapsed().as_millis()),
-            };
+            return Ok(ThreadingWindowOutcome {
+                affected_threads: impacted_thread_ids.len() as u64,
+                source_messages_read: 0,
+                ..ThreadingWindowOutcome::default()
+            });
         }
 
         let build_outcome = build_threads(
@@ -709,15 +882,93 @@ impl Phase0JobHandler {
             })
             .collect();
 
-        let apply_stats = match self
+        let apply_stats = self
             .threading
-            .apply_components(list.id, &impacted_thread_ids, &components)
+            .apply_components(list_id, &impacted_thread_ids, &components)
+            .await?;
+
+        let mut lineage_enqueued = false;
+        if enqueue_lineage {
+            let patch_extract_payload = PatchExtractWindowPayload {
+                list_key: list_key.to_string(),
+                anchor_message_pks: anchors.clone(),
+                source_job_id,
+            };
+            self.jobs
+                .enqueue(EnqueueJobParams {
+                    job_type: "patch_extract_window".to_string(),
+                    payload_json: serde_json::to_value(patch_extract_payload)
+                        .unwrap_or_else(|_| serde_json::json!({})),
+                    priority: 11,
+                    dedupe_scope: Some(format!("list:{list_key}")),
+                    dedupe_key: Some(hash_message_pks(&anchors)),
+                    run_after: None,
+                    max_attempts: Some(8),
+                })
+                .await?;
+            lineage_enqueued = true;
+        }
+
+        Ok(ThreadingWindowOutcome {
+            affected_threads: impacted_thread_ids.len() as u64,
+            source_messages_read: source_messages.len() as u64,
+            apply_stats,
+            lineage_enqueued,
+        })
+    }
+
+    async fn handle_threading_update_window(
+        &self,
+        job: Job,
+        _ctx: ExecutionContext,
+    ) -> JobExecutionOutcome {
+        let started = Instant::now();
+
+        let payload: ThreadingUpdateWindowPayload =
+            match serde_json::from_value(job.payload_json.clone()) {
+                Ok(v) => v,
+                Err(err) => {
+                    return JobExecutionOutcome::Terminal {
+                        reason: format!("invalid threading_update_window payload: {err}"),
+                        kind: "payload".to_string(),
+                        metrics: empty_metrics(started.elapsed().as_millis()),
+                    };
+                }
+            };
+
+        let list = match self.catalog.get_mailing_list(&payload.list_key).await {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                return JobExecutionOutcome::Terminal {
+                    reason: format!("mailing list not found for list_key={}", payload.list_key),
+                    kind: "not_found".to_string(),
+                    metrics: empty_metrics(started.elapsed().as_millis()),
+                };
+            }
+            Err(err) => {
+                return retryable_error(
+                    format!("failed to load mailing list: {err}"),
+                    "db",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+        };
+        let outcome = match self
+            .apply_threading_for_anchors(
+                list.id,
+                &payload.list_key,
+                payload.anchor_message_pks.clone(),
+                Some(job.id),
+                true,
+            )
             .await
         {
             Ok(v) => v,
             Err(err) => {
                 return retryable_error(
-                    format!("failed to persist threading results: {err}"),
+                    format!("failed to apply threading update window: {err}"),
                     "db",
                     &job,
                     started.elapsed().as_millis(),
@@ -726,73 +977,41 @@ impl Phase0JobHandler {
             }
         };
 
+        let rows_written = outcome.apply_stats.threads_rebuilt
+            + outcome.apply_stats.nodes_written
+            + outcome.apply_stats.messages_written
+            + outcome.apply_stats.stale_threads_removed;
+
         info!(
             list_key = %payload.list_key,
             source_job_id = payload.source_job_id,
-            affected_threads = impacted_thread_ids.len(),
-            threads_rebuilt = apply_stats.threads_rebuilt,
-            nodes_written = apply_stats.nodes_written,
-            dummy_nodes_written = apply_stats.dummy_nodes_written,
-            messages_written = apply_stats.messages_written,
-            stale_threads_removed = apply_stats.stale_threads_removed,
+            affected_threads = outcome.affected_threads,
+            threads_rebuilt = outcome.apply_stats.threads_rebuilt,
+            nodes_written = outcome.apply_stats.nodes_written,
+            dummy_nodes_written = outcome.apply_stats.dummy_nodes_written,
+            messages_written = outcome.apply_stats.messages_written,
+            stale_threads_removed = outcome.apply_stats.stale_threads_removed,
+            lineage_enqueued = outcome.lineage_enqueued,
             "threading_update_window applied"
         );
-
-        let rows_written = apply_stats.threads_rebuilt
-            + apply_stats.nodes_written
-            + apply_stats.messages_written
-            + apply_stats.stale_threads_removed;
-
-        let mut lineage_enqueued = false;
-        if !anchors.is_empty() {
-            let patch_extract_payload = PatchExtractWindowPayload {
-                list_key: payload.list_key.clone(),
-                anchor_message_pks: anchors.clone(),
-                source_job_id: Some(job.id),
-            };
-
-            if let Err(err) = self
-                .jobs
-                .enqueue(EnqueueJobParams {
-                    job_type: "patch_extract_window".to_string(),
-                    payload_json: serde_json::to_value(patch_extract_payload)
-                        .unwrap_or_else(|_| serde_json::json!({})),
-                    priority: 11,
-                    dedupe_scope: Some(format!("list:{}", payload.list_key)),
-                    dedupe_key: Some(hash_message_pks(&anchors)),
-                    run_after: None,
-                    max_attempts: Some(8),
-                })
-                .await
-            {
-                return retryable_error(
-                    format!("failed to enqueue patch_extract_window: {err}"),
-                    "db",
-                    &job,
-                    started.elapsed().as_millis(),
-                    &self.settings,
-                );
-            }
-            lineage_enqueued = true;
-        }
 
         JobExecutionOutcome::Success {
             result_json: serde_json::json!({
                 "list_key": payload.list_key,
                 "source_job_id": payload.source_job_id,
-                "affected_threads": impacted_thread_ids.len(),
-                "threads_rebuilt": apply_stats.threads_rebuilt,
-                "nodes_written": apply_stats.nodes_written,
-                "dummy_nodes_written": apply_stats.dummy_nodes_written,
-                "messages_written": apply_stats.messages_written,
-                "stale_threads_removed": apply_stats.stale_threads_removed,
-                "lineage_enqueued": lineage_enqueued,
+                "affected_threads": outcome.affected_threads,
+                "threads_rebuilt": outcome.apply_stats.threads_rebuilt,
+                "nodes_written": outcome.apply_stats.nodes_written,
+                "dummy_nodes_written": outcome.apply_stats.dummy_nodes_written,
+                "messages_written": outcome.apply_stats.messages_written,
+                "stale_threads_removed": outcome.apply_stats.stale_threads_removed,
+                "lineage_enqueued": outcome.lineage_enqueued,
             }),
             metrics: JobStoreMetrics {
                 duration_ms: started.elapsed().as_millis(),
                 rows_written,
-                bytes_read: source_messages.len() as u64,
-                commit_count: components.len() as u64,
+                bytes_read: outcome.source_messages_read,
+                commit_count: outcome.apply_stats.threads_rebuilt,
                 parse_errors: 0,
             },
         }
@@ -801,7 +1020,7 @@ impl Phase0JobHandler {
     async fn handle_threading_rebuild_list(
         &self,
         job: Job,
-        _ctx: ExecutionContext,
+        ctx: ExecutionContext,
     ) -> JobExecutionOutcome {
         let started = Instant::now();
 
@@ -838,11 +1057,36 @@ impl Phase0JobHandler {
         };
 
         let mut cursor = 0i64;
-        let mut queued_chunks = 0u64;
-        let mut queued_messages = 0u64;
+        let mut processed_chunks = 0u64;
+        let mut processed_messages = 0u64;
+        let mut affected_threads = 0u64;
+        let mut apply_stats = ThreadingApplyStats::default();
         let batch_limit = self.settings.mail.commit_batch_size.max(1) as i64;
 
         loop {
+            if let Err(err) = ctx.heartbeat().await {
+                warn!(job_id = job.id, error = %err, "heartbeat update failed");
+            }
+            match ctx.is_cancel_requested().await {
+                Ok(true) => {
+                    return JobExecutionOutcome::Cancelled {
+                        reason: "cancel requested".to_string(),
+                        metrics: JobStoreMetrics {
+                            duration_ms: started.elapsed().as_millis(),
+                            rows_written: apply_stats.threads_rebuilt
+                                + apply_stats.nodes_written
+                                + apply_stats.messages_written
+                                + apply_stats.stale_threads_removed,
+                            bytes_read: 0,
+                            commit_count: processed_messages,
+                            parse_errors: 0,
+                        },
+                    };
+                }
+                Ok(false) => {}
+                Err(err) => warn!(job_id = job.id, error = %err, "cancel check failed"),
+            }
+
             let chunk = match self
                 .threading
                 .list_message_pks_for_rebuild(
@@ -871,60 +1115,75 @@ impl Phase0JobHandler {
             }
 
             cursor = *chunk.last().unwrap_or(&cursor);
-            let dedupe_key = hash_message_pks(&chunk);
-            let update_payload = ThreadingUpdateWindowPayload {
-                list_key: payload.list_key.clone(),
-                anchor_message_pks: chunk.clone(),
-                source_job_id: Some(job.id),
-            };
-
-            if let Err(err) = self
-                .jobs
-                .enqueue(EnqueueJobParams {
-                    job_type: "threading_update_window".to_string(),
-                    payload_json: serde_json::to_value(update_payload)
-                        .unwrap_or_else(|_| serde_json::json!({})),
-                    priority: 9,
-                    dedupe_scope: Some(format!("list:{}", payload.list_key)),
-                    dedupe_key: Some(dedupe_key),
-                    run_after: None,
-                    max_attempts: Some(8),
-                })
+            let outcome = match self
+                .apply_threading_for_anchors(
+                    list.id,
+                    &payload.list_key,
+                    chunk.clone(),
+                    Some(job.id),
+                    false,
+                )
                 .await
             {
-                return retryable_error(
-                    format!("failed to enqueue threading update chunk: {err}"),
-                    "db",
-                    &job,
-                    started.elapsed().as_millis(),
-                    &self.settings,
-                );
-            }
+                Ok(v) => v,
+                Err(err) => {
+                    return retryable_error(
+                        format!("failed to apply threading rebuild chunk: {err}"),
+                        "db",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
+                }
+            };
 
-            queued_chunks += 1;
-            queued_messages += chunk.len() as u64;
+            processed_chunks += 1;
+            processed_messages += chunk.len() as u64;
+            affected_threads += outcome.affected_threads;
+            apply_stats.threads_rebuilt += outcome.apply_stats.threads_rebuilt;
+            apply_stats.nodes_written += outcome.apply_stats.nodes_written;
+            apply_stats.dummy_nodes_written += outcome.apply_stats.dummy_nodes_written;
+            apply_stats.messages_written += outcome.apply_stats.messages_written;
+            apply_stats.stale_threads_removed += outcome.apply_stats.stale_threads_removed;
         }
 
         info!(
             list_key = %payload.list_key,
-            queued_chunks,
-            queued_messages,
-            "threading_rebuild_list enqueued update jobs"
+            processed_chunks,
+            processed_messages,
+            affected_threads,
+            threads_rebuilt = apply_stats.threads_rebuilt,
+            nodes_written = apply_stats.nodes_written,
+            dummy_nodes_written = apply_stats.dummy_nodes_written,
+            messages_written = apply_stats.messages_written,
+            stale_threads_removed = apply_stats.stale_threads_removed,
+            "threading_rebuild_list applied update chunks"
         );
+
+        let rows_written = apply_stats.threads_rebuilt
+            + apply_stats.nodes_written
+            + apply_stats.messages_written
+            + apply_stats.stale_threads_removed;
 
         JobExecutionOutcome::Success {
             result_json: serde_json::json!({
                 "list_key": payload.list_key,
-                "queued_chunks": queued_chunks,
-                "queued_messages": queued_messages,
+                "processed_chunks": processed_chunks,
+                "processed_messages": processed_messages,
+                "affected_threads": affected_threads,
+                "threads_rebuilt": apply_stats.threads_rebuilt,
+                "nodes_written": apply_stats.nodes_written,
+                "dummy_nodes_written": apply_stats.dummy_nodes_written,
+                "messages_written": apply_stats.messages_written,
+                "stale_threads_removed": apply_stats.stale_threads_removed,
                 "from_seen_at": payload.from_seen_at,
                 "to_seen_at": payload.to_seen_at,
             }),
             metrics: JobStoreMetrics {
                 duration_ms: started.elapsed().as_millis(),
-                rows_written: queued_chunks,
+                rows_written,
                 bytes_read: 0,
-                commit_count: queued_messages,
+                commit_count: processed_messages,
                 parse_errors: 0,
             },
         }
@@ -1311,6 +1570,148 @@ impl Phase0JobHandler {
             },
         }
     }
+}
+
+#[derive(Default)]
+struct ThreadingWindowOutcome {
+    affected_threads: u64,
+    source_messages_read: u64,
+    apply_stats: ThreadingApplyStats,
+    lineage_enqueued: bool,
+}
+
+struct RawCommitMail {
+    index: usize,
+    commit_oid: String,
+    raw_rfc822: Vec<u8>,
+}
+
+struct ParsedCommitRows {
+    rows: Vec<IngestCommitRow>,
+    parse_errors: u64,
+}
+
+struct IndexedParsedRow {
+    index: usize,
+    row: IngestCommitRow,
+}
+
+enum ParseCommitResult {
+    Parsed(Box<IndexedParsedRow>),
+    Skipped {
+        commit_oid: String,
+        reason: String,
+        warn: bool,
+    },
+}
+
+async fn parse_commit_rows(
+    raw_commits: Vec<RawCommitMail>,
+    concurrency: usize,
+) -> ParsedCommitRows {
+    if raw_commits.is_empty() {
+        return ParsedCommitRows {
+            rows: Vec::new(),
+            parse_errors: 0,
+        };
+    }
+
+    let mut joinset = JoinSet::new();
+    let mut iter = raw_commits.into_iter();
+    let max_concurrency = concurrency.max(1);
+
+    let mut parsed_rows = Vec::new();
+    let mut parse_errors = 0u64;
+
+    loop {
+        while joinset.len() < max_concurrency {
+            let Some(raw_commit) = iter.next() else {
+                break;
+            };
+            joinset.spawn_blocking(move || parse_one_commit(raw_commit));
+        }
+
+        let Some(next) = joinset.join_next().await else {
+            break;
+        };
+
+        match next {
+            Ok(ParseCommitResult::Parsed(parsed)) => parsed_rows.push(*parsed),
+            Ok(ParseCommitResult::Skipped {
+                commit_oid,
+                reason,
+                warn,
+            }) => {
+                parse_errors += 1;
+                if warn {
+                    warn!(commit_oid = %commit_oid, error = %reason, "mail parse error");
+                }
+            }
+            Err(err) => {
+                parse_errors += 1;
+                warn!(error = %err, "mail parse task failed");
+            }
+        }
+    }
+
+    parsed_rows.sort_by_key(|row| row.index);
+
+    ParsedCommitRows {
+        rows: parsed_rows.into_iter().map(|row| row.row).collect(),
+        parse_errors,
+    }
+}
+
+fn parse_one_commit(raw_commit: RawCommitMail) -> ParseCommitResult {
+    let parsed = match parse_email(&raw_commit.raw_rfc822) {
+        Ok(v) => v,
+        Err(ParseEmailError::MissingMessageId | ParseEmailError::MissingAuthorEmail) => {
+            return ParseCommitResult::Skipped {
+                commit_oid: raw_commit.commit_oid,
+                reason: "missing required message headers".to_string(),
+                warn: false,
+            };
+        }
+        Err(err) => {
+            return ParseCommitResult::Skipped {
+                commit_oid: raw_commit.commit_oid,
+                reason: err.to_string(),
+                warn: true,
+            };
+        }
+    };
+
+    let parsed_input = ParsedMessageInput {
+        content_hash_sha256: parsed.content_hash_sha256,
+        subject_raw: parsed.subject_raw,
+        subject_norm: parsed.subject_norm,
+        from_name: parsed.from_name,
+        from_email: parsed.from_email,
+        date_utc: parsed.date_utc,
+        to_raw: parsed.to_raw,
+        cc_raw: parsed.cc_raw,
+        message_ids: parsed.message_ids,
+        message_id_primary: parsed.message_id_primary,
+        in_reply_to_ids: parsed.in_reply_to_ids,
+        references_ids: parsed.references_ids,
+        mime_type: parsed.mime_type,
+        body: ParsedBodyInput {
+            raw_rfc822: raw_commit.raw_rfc822,
+            body_text: parsed.body_text,
+            diff_text: parsed.diff_text,
+            search_text: parsed.search_text,
+            has_diff: parsed.has_diff,
+            has_attachments: parsed.has_attachments,
+        },
+    };
+
+    ParseCommitResult::Parsed(Box::new(IndexedParsedRow {
+        index: raw_commit.index,
+        row: IngestCommitRow {
+            git_commit_oid: raw_commit.commit_oid,
+            parsed_message: parsed_input,
+        },
+    }))
 }
 
 fn empty_metrics(duration_ms: u128) -> JobStoreMetrics {

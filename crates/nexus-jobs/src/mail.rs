@@ -66,10 +66,12 @@ pub fn parse_email(raw_rfc822: &[u8]) -> Result<ParseOutcome, ParseEmailError> {
         return Err(ParseEmailError::MissingAuthorEmail);
     }
 
-    let date_utc = parsed
+    let date_raw = parsed
         .headers
         .get_first_value("Date")
-        .and_then(|v| parse_date(&v));
+        .map(|v| sanitize_text(&v))
+        .unwrap_or_default();
+    let date_utc = parse_date(&date_raw);
 
     let to_raw = parsed
         .headers
@@ -177,11 +179,7 @@ pub fn parse_email(raw_rfc822: &[u8]) -> Result<ParseOutcome, ParseEmailError> {
     let content_hash_sha256 = compute_content_hash(ContentHashInput {
         subject: &subject_raw,
         from: &from_header,
-        date: parsed
-            .headers
-            .get_first_value("Date")
-            .as_deref()
-            .unwrap_or(""),
+        date: &date_raw,
         references_ids: &references_ids,
         in_reply_to_ids: &in_reply_to_ids,
         to_raw: to_raw.as_deref().unwrap_or(""),
@@ -280,7 +278,7 @@ fn parse_primary_author(from_header: &str) -> (Option<String>, String) {
 }
 
 fn parse_date(raw: &str) -> Option<DateTime<Utc>> {
-    let timestamp = dateparse(raw).ok()?;
+    let timestamp = dateparse(&sanitize_text(raw)).ok()?;
     Utc.timestamp_opt(timestamp, 0).single()
 }
 
@@ -297,7 +295,7 @@ fn sanitize_email(value: &str) -> String {
 }
 
 fn normalize_subject(subject: &str) -> String {
-    let mut normalized = subject.trim().to_ascii_lowercase();
+    let mut normalized = sanitize_text(subject).to_ascii_lowercase();
 
     loop {
         let before = normalized.clone();
@@ -404,7 +402,7 @@ fn extract_message_ids(value: &str) -> Vec<String> {
 }
 
 pub fn normalize_message_id_token(raw: &str) -> Option<String> {
-    let mut value = raw.trim().to_string();
+    let mut value = sanitize_text(raw);
 
     loop {
         let before = value.clone();
@@ -548,5 +546,30 @@ mod tests {
         assert!(parsed.has_diff);
         let diff = parsed.diff_text.unwrap_or_default();
         assert!(diff.starts_with("diff --git a/foo.c b/foo.c"));
+    }
+
+    #[test]
+    fn parser_sanitizes_null_bytes_in_headers_and_message_ids() {
+        let raw = concat!(
+            "From: Al\0ice <ALICE@example.com>\r\n",
+            "Message-ID: \"<ab\0c@example.com>\"\r\n",
+            "References: <par\0ent@example.com>\r\n",
+            "Date: Tue, 1 Jan 2024 00:00:00 +0000\r\n",
+            "Subject: [PATCH] nu\0ll check\r\n",
+            "Content-Type: text/plain; charset=utf-8\r\n",
+            "\r\n",
+            "body\r\n"
+        )
+        .as_bytes()
+        .to_vec();
+
+        let parsed = parse_email(&raw).expect("parse should succeed");
+        assert_eq!(parsed.subject_raw, "[PATCH] null check");
+        assert_eq!(parsed.from_email, "alice@example.com");
+        assert_eq!(parsed.message_id_primary, "abc@example.com");
+        assert_eq!(
+            parsed.references_ids,
+            vec!["parent@example.com".to_string()]
+        );
     }
 }

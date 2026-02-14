@@ -19,6 +19,14 @@ pub struct IngestCommitBatchPayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoIngestRunPayload {
+    pub list_key: String,
+    pub repo_key: String,
+    pub mirror_path: String,
+    pub since_commit_oid: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadingUpdateWindowPayload {
     pub list_key: String,
     pub anchor_message_pks: Vec<i64>,

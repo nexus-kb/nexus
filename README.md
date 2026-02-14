@@ -21,6 +21,13 @@ Optional defaults:
 - `NEXUS__ADMIN__TOKEN=nexus-dev-admin`
 - `NEXUS__MAIL__MIRROR_ROOT=/opt/nexus/mailing-lists`
 - `NEXUS__MAIL__COMMIT_BATCH_SIZE=250`
+- `NEXUS__WORKER__BACKFILL_MODE=full_pipeline|ingest_only`
+- `NEXUS__WORKER__INGEST_PARSE_CONCURRENCY=8`
+- `NEXUS__WORKER__MAX_INFLIGHT_JOBS=1`
+- `NEXUS__WORKER__MAX_INFLIGHT_INGEST_JOBS=1`
+- `NEXUS__WORKER__BACKFILL_BATCH_SIZE=10000`
+- `NEXUS__WORKER__INGEST_WRITE_MODE=copy|batched_sql`
+- `NEXUS__WORKER__DB_RELAXED_DURABILITY=false`
 
 ## Run API
 
@@ -31,6 +38,48 @@ cargo run -p nexus-api
 ## Run worker
 
 ```bash
+cargo run -p nexus-jobs --bin worker
+```
+
+## Docker (standalone, not compose)
+
+Build:
+
+```bash
+docker build -t nexus-api-server:debug -f Dockerfile .
+```
+
+Run API long-lived:
+
+```bash
+docker run --name nexus-api --rm -p 3000:3000 \
+  -e NEXUS__DATABASE__URL=postgresql://nexus:nexus@host.docker.internal:5432/nexus_kb \
+  -e NEXUS__MAIL__MIRROR_ROOT=/opt/nexus/mailing-lists \
+  nexus-api-server:debug
+```
+
+For Podman, replace `host.docker.internal` with `host.containers.internal`.
+
+Run worker using the same image:
+
+```bash
+docker run --name nexus-worker --rm \
+  -e NEXUS__DATABASE__URL=postgresql://nexus:nexus@host.docker.internal:5432/nexus_kb \
+  -e NEXUS__MAIL__MIRROR_ROOT=/opt/nexus/mailing-lists \
+  --entrypoint /srv/nexus-api-server/target/release/worker \
+  nexus-api-server:debug
+```
+
+Backfill-oriented worker profile example:
+
+```bash
+NEXUS__WORKER__BACKFILL_MODE=ingest_only \
+NEXUS__WORKER__INGEST_PARSE_CONCURRENCY=8 \
+NEXUS__WORKER__MAX_INFLIGHT_JOBS=4 \
+NEXUS__WORKER__MAX_INFLIGHT_INGEST_JOBS=2 \
+NEXUS__WORKER__BACKFILL_BATCH_SIZE=10000 \
+NEXUS__WORKER__INGEST_WRITE_MODE=copy \
+NEXUS__WORKER__DB_RELAXED_DURABILITY=true \
 cargo run -p nexus-jobs --bin worker
 ```
 
@@ -46,14 +95,17 @@ cargo run -p nexus-cli -- seed-pilot
 - `GET /api/v1/readyz`
 - `GET /api/v1/version`
 - `GET /api/v1/openapi.json`
-- `GET /api/v1/lists/{list_key}/threads?sort=&limit=&cursor=&from=&to=&author=&has_diff=`
+- `GET /api/v1/lists?page=&page_size=`
+- `GET /api/v1/lists/{list_key}`
+- `GET /api/v1/lists/{list_key}/stats?window=30d`
+- `GET /api/v1/lists/{list_key}/threads?sort=&page=&page_size=&from=&to=&author=&has_diff=`
 - `GET /api/v1/lists/{list_key}/threads/{thread_id}`
-- `GET /api/v1/lists/{list_key}/threads/{thread_id}/messages?view=full|snippets`
+- `GET /api/v1/lists/{list_key}/threads/{thread_id}/messages?view=full|snippets&page=&page_size=`
 - `GET /api/v1/messages/{message_id}`
 - `GET /api/v1/messages/{message_id}/body?include_diff=true|false&strip_quotes=true|false`
 - `GET /api/v1/messages/{message_id}/raw`
 - `GET /api/v1/r/{msgid}`
-- `GET /api/v1/series?list_key=&limit=&cursor=`
+- `GET /api/v1/series?list_key=&sort=last_seen_desc&page=&page_size=`
 - `GET /api/v1/series/{series_id}`
 - `GET /api/v1/series/{series_id}/versions/{series_version_id}?assembled=true|false`
 - `GET /api/v1/series/{series_id}/compare?v1=&v2=&mode=summary|per_patch|per_file`

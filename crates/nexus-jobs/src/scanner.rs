@@ -1,39 +1,104 @@
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Child, ChildStdout, Command, Stdio};
 
-pub fn collect_new_commit_oids(
+pub struct CommitOidChunkStream {
+    child: Child,
+    stdout: BufReader<ChildStdout>,
+    chunk_size: usize,
+    finished: bool,
+}
+
+impl CommitOidChunkStream {
+    pub fn next_chunk(&mut self) -> anyhow::Result<Option<Vec<String>>> {
+        if self.finished {
+            return Ok(None);
+        }
+
+        let mut chunk = Vec::with_capacity(self.chunk_size);
+        while chunk.len() < self.chunk_size {
+            let mut line = String::new();
+            let read = self.stdout.read_line(&mut line)?;
+            if read == 0 {
+                break;
+            }
+
+            let oid = line.trim();
+            if !oid.is_empty() {
+                chunk.push(oid.to_string());
+            }
+        }
+
+        if !chunk.is_empty() {
+            return Ok(Some(chunk));
+        }
+
+        self.finished = true;
+        let status = self.child.wait()?;
+        if status.success() {
+            return Ok(None);
+        }
+
+        let mut stderr = String::new();
+        if let Some(mut stderr_pipe) = self.child.stderr.take() {
+            let _ = stderr_pipe.read_to_string(&mut stderr);
+        }
+
+        anyhow::bail!("git rev-list failed: {}", stderr.trim());
+    }
+}
+
+impl Drop for CommitOidChunkStream {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+pub fn stream_new_commit_oid_chunks(
     repo_path: &Path,
     since_commit_oid: Option<&str>,
-) -> anyhow::Result<Vec<String>> {
-    let output = Command::new("git")
-        .arg("-C")
+    chunk_size: usize,
+) -> anyhow::Result<CommitOidChunkStream> {
+    if chunk_size == 0 {
+        anyhow::bail!("chunk size must be > 0");
+    }
+
+    let incremental_since = match since_commit_oid {
+        Some(oid) if commit_exists(repo_path, oid)? => Some(oid),
+        _ => None,
+    };
+
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
         .arg(repo_path)
         .arg("rev-list")
         .arg("--reverse")
-        .arg("--all")
-        .output()?;
+        .arg("--all");
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("git rev-list failed: {stderr}");
+    if let Some(since) = incremental_since {
+        // Exclude the prior watermark and everything reachable from it to avoid a full scan.
+        cmd.arg(format!("^{since}"));
     }
 
-    let mut commits: Vec<String> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToString::to_string)
-        .collect();
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("missing git stdout pipe"))?;
 
-    if let Some(since) = since_commit_oid
-        && let Some(pos) = commits.iter().position(|oid| oid == since)
-    {
-        commits = commits.into_iter().skip(pos + 1).collect();
-    }
-
-    Ok(commits)
+    Ok(CommitOidChunkStream {
+        child,
+        stdout: BufReader::new(stdout),
+        chunk_size,
+        finished: false,
+    })
 }
 
+#[cfg(test)]
 pub fn chunk_commit_oids(commits: &[String], chunk_size: usize) -> Vec<Vec<String>> {
     if chunk_size == 0 {
         return Vec::new();
@@ -49,6 +114,19 @@ pub fn chunk_commit_oids(commits: &[String], chunk_size: usize) -> Vec<Vec<Strin
     }
 
     chunks
+}
+
+fn commit_exists(repo_path: &Path, commit_oid: &str) -> anyhow::Result<bool> {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .arg("cat-file")
+        .arg("-e")
+        .arg(format!("{commit_oid}^{{commit}}"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    Ok(status.success())
 }
 
 #[cfg(test)]

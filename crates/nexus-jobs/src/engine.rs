@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,11 +8,13 @@ use nexus_db::{
     CatalogStore, Db, IngestStore, Job, JobState, JobStore, JobStoreMetrics, LineageStore,
     RetryDecision, ThreadingStore,
 };
-use tokio::sync::Notify;
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinSet;
 use tokio::time::{MissedTickBehavior, interval};
 use tracing::{error, info, warn};
 
 use crate::JobExecutionOutcome;
+use crate::payloads::{IngestCommitBatchPayload, RepoIngestRunPayload};
 use crate::pipeline::Phase0JobHandler;
 
 #[derive(Debug, Clone)]
@@ -21,16 +24,21 @@ pub struct WorkerConfig {
     pub lease_ms: i64,
     pub heartbeat_ms: u64,
     pub sweep_ms: u64,
+    pub max_inflight_jobs: usize,
+    pub max_inflight_ingest_jobs: usize,
 }
 
 impl From<&nexus_core::config::WorkerConfig> for WorkerConfig {
     fn from(value: &nexus_core::config::WorkerConfig) -> Self {
+        let max_inflight_jobs = value.max_inflight_jobs.max(1);
         Self {
             poll_ms: value.poll_ms,
             claim_batch: value.claim_batch,
             lease_ms: value.lease_ms,
             heartbeat_ms: value.heartbeat_ms,
             sweep_ms: value.sweep_ms,
+            max_inflight_jobs,
+            max_inflight_ingest_jobs: value.max_inflight_ingest_jobs.max(1).min(max_inflight_jobs),
         }
     }
 }
@@ -55,6 +63,7 @@ impl ExecutionContext {
     }
 }
 
+#[derive(Clone)]
 pub struct Phase0Worker {
     settings: Settings,
     db: Db,
@@ -62,6 +71,8 @@ pub struct Phase0Worker {
     handler: Phase0JobHandler,
     cfg: WorkerConfig,
     worker_id: String,
+    ingest_job_semaphore: Arc<Semaphore>,
+    repo_ingest_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 impl Phase0Worker {
@@ -80,6 +91,7 @@ impl Phase0Worker {
             jobs.clone(),
         );
         let cfg = WorkerConfig::from(&settings.worker);
+        let ingest_limit = cfg.max_inflight_ingest_jobs;
 
         Self {
             settings,
@@ -88,6 +100,8 @@ impl Phase0Worker {
             handler,
             cfg,
             worker_id: format!("phase0-worker-{}", std::process::id()),
+            ingest_job_semaphore: Arc::new(Semaphore::new(ingest_limit)),
+            repo_ingest_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -142,14 +156,43 @@ impl Phase0Worker {
             .claim_jobs(self.cfg.claim_batch, &self.worker_id, self.cfg.lease_ms)
             .await?;
 
-        for job in claimed {
-            self.process_job(job).await;
+        if claimed.is_empty() {
+            return Ok(());
+        }
+
+        let mut joinset = JoinSet::new();
+        let mut iter = claimed.into_iter();
+
+        for _ in 0..self.cfg.max_inflight_jobs {
+            let Some(job) = iter.next() else {
+                break;
+            };
+            let worker = self.clone();
+            joinset.spawn(async move {
+                worker.process_job(job).await;
+            });
+        }
+
+        while let Some(result) = joinset.join_next().await {
+            if let Err(err) = result {
+                error!(error = %err, "job task failed");
+            }
+
+            if let Some(job) = iter.next() {
+                let worker = self.clone();
+                joinset.spawn(async move {
+                    worker.process_job(job).await;
+                });
+            }
         }
 
         Ok(())
     }
 
     async fn process_job(&self, job: Job) {
+        let _ingest_permit = self.acquire_ingest_permit(&job).await;
+        let _repo_guard = self.acquire_repo_ingest_lock(&job).await;
+
         let attempt = match self.jobs.start_attempt(job.id, job.attempt).await {
             Ok(v) => v,
             Err(err) => {
@@ -235,6 +278,76 @@ impl Phase0Worker {
             }
         }
     }
+
+    async fn acquire_ingest_permit(&self, job: &Job) -> Option<OwnedSemaphorePermit> {
+        if !is_ingest_job_type(&job.job_type) {
+            return None;
+        }
+
+        match self.ingest_job_semaphore.clone().acquire_owned().await {
+            Ok(permit) => Some(permit),
+            Err(err) => {
+                warn!(job_id = job.id, error = %err, "ingest concurrency limiter unavailable");
+                None
+            }
+        }
+    }
+
+    async fn acquire_repo_ingest_lock(
+        &self,
+        job: &Job,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        if !is_ingest_job_type(&job.job_type) {
+            return None;
+        }
+
+        let repo_key = match job.job_type.as_str() {
+            "ingest_commit_batch" => {
+                let payload: IngestCommitBatchPayload =
+                    match serde_json::from_value(job.payload_json.clone()) {
+                        Ok(v) => v,
+                        Err(err) => {
+                            warn!(
+                                job_id = job.id,
+                                error = %err,
+                                "failed to parse ingest payload for repo lock"
+                            );
+                            return None;
+                        }
+                    };
+                format!("{}:{}", payload.list_key, payload.repo_key)
+            }
+            "repo_ingest_run" => {
+                let payload: RepoIngestRunPayload =
+                    match serde_json::from_value(job.payload_json.clone()) {
+                        Ok(v) => v,
+                        Err(err) => {
+                            warn!(
+                                job_id = job.id,
+                                error = %err,
+                                "failed to parse repo_ingest_run payload for repo lock"
+                            );
+                            return None;
+                        }
+                    };
+                format!("{}:{}", payload.list_key, payload.repo_key)
+            }
+            _ => return None,
+        };
+        let lock = {
+            let mut locks = self.repo_ingest_locks.lock().await;
+            locks
+                .entry(repo_key)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+
+        Some(lock.lock_owned().await)
+    }
+}
+
+fn is_ingest_job_type(job_type: &str) -> bool {
+    matches!(job_type, "ingest_commit_batch" | "repo_ingest_run")
 }
 
 fn metrics_to_json(metrics: JobStoreMetrics) -> serde_json::Value {

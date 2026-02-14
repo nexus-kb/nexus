@@ -87,6 +87,22 @@ fn default_meili_master_key() -> String {
     "nexus-dev-key".to_string()
 }
 
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BackfillMode {
+    #[default]
+    FullPipeline,
+    IngestOnly,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum IngestWriteMode {
+    #[default]
+    Copy,
+    BatchedSql,
+}
+
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct WorkerConfig {
     #[serde(default = "default_worker_poll_ms")]
@@ -103,6 +119,20 @@ pub struct WorkerConfig {
     pub base_backoff_ms: u64,
     #[serde(default = "default_worker_max_backoff_ms")]
     pub max_backoff_ms: u64,
+    #[serde(default = "default_worker_backfill_mode")]
+    pub backfill_mode: BackfillMode,
+    #[serde(default = "default_worker_ingest_parse_concurrency")]
+    pub ingest_parse_concurrency: usize,
+    #[serde(default = "default_worker_max_inflight_jobs")]
+    pub max_inflight_jobs: usize,
+    #[serde(default = "default_worker_max_inflight_ingest_jobs")]
+    pub max_inflight_ingest_jobs: usize,
+    #[serde(default = "default_worker_backfill_batch_size")]
+    pub backfill_batch_size: usize,
+    #[serde(default = "default_worker_ingest_write_mode")]
+    pub ingest_write_mode: IngestWriteMode,
+    #[serde(default)]
+    pub db_relaxed_durability: bool,
 }
 
 fn default_worker_poll_ms() -> u64 {
@@ -131,6 +161,30 @@ fn default_worker_base_backoff_ms() -> u64 {
 
 fn default_worker_max_backoff_ms() -> u64 {
     3_600_000
+}
+
+fn default_worker_backfill_mode() -> BackfillMode {
+    BackfillMode::FullPipeline
+}
+
+fn default_worker_ingest_parse_concurrency() -> usize {
+    8
+}
+
+fn default_worker_max_inflight_jobs() -> usize {
+    1
+}
+
+fn default_worker_max_inflight_ingest_jobs() -> usize {
+    1
+}
+
+fn default_worker_backfill_batch_size() -> usize {
+    10_000
+}
+
+fn default_worker_ingest_write_mode() -> IngestWriteMode {
+    IngestWriteMode::Copy
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -202,6 +256,21 @@ pub fn load() -> Result<Settings, crate::Error> {
     }
     if settings.worker.max_backoff_ms == 0 {
         settings.worker.max_backoff_ms = default_worker_max_backoff_ms();
+    }
+    if settings.worker.ingest_parse_concurrency == 0 {
+        settings.worker.ingest_parse_concurrency = default_worker_ingest_parse_concurrency();
+    }
+    if settings.worker.max_inflight_jobs == 0 {
+        settings.worker.max_inflight_jobs = default_worker_max_inflight_jobs();
+    }
+    if settings.worker.max_inflight_ingest_jobs == 0 {
+        settings.worker.max_inflight_ingest_jobs = default_worker_max_inflight_ingest_jobs();
+    }
+    if settings.worker.max_inflight_ingest_jobs > settings.worker.max_inflight_jobs {
+        settings.worker.max_inflight_ingest_jobs = settings.worker.max_inflight_jobs;
+    }
+    if settings.worker.backfill_batch_size == 0 {
+        settings.worker.backfill_batch_size = default_worker_backfill_batch_size();
     }
 
     Ok(settings)

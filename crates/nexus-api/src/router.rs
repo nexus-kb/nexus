@@ -12,6 +12,9 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/readyz", get(health::readyz))
         .route("/version", get(health::version))
         .route("/openapi.json", get(public::openapi_json))
+        .route("/lists", get(public::list_catalog))
+        .route("/lists/{list_key}", get(public::list_detail))
+        .route("/lists/{list_key}/stats", get(public::list_stats))
         .route("/lists/{list_key}/threads", get(public::list_threads))
         .route(
             "/lists/{list_key}/threads/{thread_id}",

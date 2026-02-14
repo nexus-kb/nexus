@@ -213,8 +213,8 @@ pub struct ListThreadsParams {
     pub to_ts: Option<DateTime<Utc>>,
     pub author_email: Option<String>,
     pub has_diff: Option<bool>,
-    pub cursor: Option<(DateTime<Utc>, i64)>,
-    pub limit: i64,
+    pub page: i64,
+    pub page_size: i64,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -1130,28 +1130,94 @@ impl LineageStore {
                 );
             }
         }
-        if let Some((cursor_ts, cursor_id)) = params.cursor {
-            qb.push(" AND (");
-            qb.push(cursor_column);
-            qb.push(" < ");
-            qb.push_bind(cursor_ts);
-            qb.push(" OR (");
-            qb.push(cursor_column);
-            qb.push(" = ");
-            qb.push_bind(cursor_ts);
-            qb.push(" AND t.id < ");
-            qb.push_bind(cursor_id);
-            qb.push("))");
-        }
-
+        let page_size = params.page_size.clamp(1, 200);
+        let page = params.page.max(1);
+        let offset = (page - 1) * page_size;
         qb.push(" ORDER BY ");
         qb.push(cursor_column);
         qb.push(" DESC, t.id DESC LIMIT ");
-        qb.push_bind(params.limit.clamp(1, 200));
+        qb.push_bind(page_size);
+        qb.push(" OFFSET ");
+        qb.push_bind(offset);
 
         qb.build_query_as::<ThreadListItemRecord>()
             .fetch_all(&self.pool)
             .await
+    }
+
+    pub async fn count_threads(
+        &self,
+        mailing_list_id: i64,
+        params: &ListThreadsParams,
+    ) -> Result<i64> {
+        let mut qb: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
+            r#"SELECT COUNT(*)::bigint
+            FROM threads t
+            WHERE t.mailing_list_id = "#,
+        );
+        qb.push_bind(mailing_list_id);
+
+        let cursor_column = if params.sort == "date_desc" {
+            "t.created_at"
+        } else {
+            "t.last_activity_at"
+        };
+
+        if let Some(from_ts) = params.from_ts {
+            qb.push(" AND ");
+            qb.push(cursor_column);
+            qb.push(" >= ");
+            qb.push_bind(from_ts);
+        }
+        if let Some(to_ts) = params.to_ts {
+            qb.push(" AND ");
+            qb.push(cursor_column);
+            qb.push(" < ");
+            qb.push_bind(to_ts);
+        }
+        if let Some(author_email) = params.author_email.as_deref() {
+            qb.push(
+                r#" AND EXISTS (
+                    SELECT 1
+                    FROM thread_messages tm
+                    JOIN messages m ON m.id = tm.message_pk
+                    WHERE tm.mailing_list_id = t.mailing_list_id
+                      AND tm.thread_id = t.id
+                      AND lower(m.from_email) = lower("#,
+            );
+            qb.push_bind(author_email);
+            qb.push("))");
+        }
+        if let Some(has_diff) = params.has_diff {
+            if has_diff {
+                qb.push(
+                    r#" AND EXISTS (
+                        SELECT 1
+                        FROM thread_messages tm
+                        JOIN messages m ON m.id = tm.message_pk
+                        JOIN message_bodies mb ON mb.id = m.body_id
+                        WHERE tm.mailing_list_id = t.mailing_list_id
+                          AND tm.thread_id = t.id
+                          AND mb.has_diff = true
+                    )"#,
+                );
+            } else {
+                qb.push(
+                    r#" AND NOT EXISTS (
+                        SELECT 1
+                        FROM thread_messages tm
+                        JOIN messages m ON m.id = tm.message_pk
+                        JOIN message_bodies mb ON mb.id = m.body_id
+                        WHERE tm.mailing_list_id = t.mailing_list_id
+                          AND tm.thread_id = t.id
+                          AND mb.has_diff = true
+                    )"#,
+                );
+            }
+        }
+
+        let row = qb.build_query_scalar::<i64>().fetch_one(&self.pool).await?;
+        Ok(row)
     }
 
     pub async fn list_thread_participants(
@@ -1219,7 +1285,12 @@ impl LineageStore {
         &self,
         mailing_list_id: i64,
         thread_id: i64,
+        page: i64,
+        page_size: i64,
     ) -> Result<Vec<ThreadMessageRecord>> {
+        let page_size = page_size.max(1);
+        let page = page.max(1);
+        let offset = (page - 1) * page_size;
         sqlx::query_as::<_, ThreadMessageRecord>(
             r#"SELECT
                 tm.message_pk,
@@ -1248,11 +1319,27 @@ impl LineageStore {
             ) patch_ref ON true
             WHERE tm.mailing_list_id = $1
               AND tm.thread_id = $2
-            ORDER BY tm.sort_key ASC"#,
+            ORDER BY tm.sort_key ASC
+            LIMIT $3 OFFSET $4"#,
         )
         .bind(mailing_list_id)
         .bind(thread_id)
+        .bind(page_size)
+        .bind(offset)
         .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn count_thread_messages(&self, mailing_list_id: i64, thread_id: i64) -> Result<i64> {
+        sqlx::query_scalar::<_, i64>(
+            r#"SELECT COUNT(*)::bigint
+            FROM thread_messages
+            WHERE mailing_list_id = $1
+              AND thread_id = $2"#,
+        )
+        .bind(mailing_list_id)
+        .bind(thread_id)
+        .fetch_one(&self.pool)
         .await
     }
 
@@ -1291,8 +1378,8 @@ impl LineageStore {
     pub async fn list_series(
         &self,
         list_key: Option<&str>,
-        cursor: Option<(DateTime<Utc>, i64)>,
-        limit: i64,
+        page: i64,
+        page_size: i64,
     ) -> Result<Vec<SeriesListItemRecord>> {
         let mut qb: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
             r#"SELECT
@@ -1328,22 +1415,35 @@ impl LineageStore {
             qb.push_bind(list_key);
         }
 
-        if let Some((cursor_ts, cursor_id)) = cursor {
-            qb.push(" AND (ps.last_seen_at < ");
-            qb.push_bind(cursor_ts);
-            qb.push(" OR (ps.last_seen_at = ");
-            qb.push_bind(cursor_ts);
-            qb.push(" AND ps.id < ");
-            qb.push_bind(cursor_id);
-            qb.push("))");
-        }
-
+        let page_size = page_size.clamp(1, 200);
+        let page = page.max(1);
+        let offset = (page - 1) * page_size;
         qb.push(" ORDER BY ps.last_seen_at DESC, ps.id DESC LIMIT ");
-        qb.push_bind(limit.clamp(1, 200));
+        qb.push_bind(page_size);
+        qb.push(" OFFSET ");
+        qb.push_bind(offset);
 
         qb.build_query_as::<SeriesListItemRecord>()
             .fetch_all(&self.pool)
             .await
+    }
+
+    pub async fn count_series(&self, list_key: Option<&str>) -> Result<i64> {
+        let mut qb: QueryBuilder<'_, sqlx::Postgres> =
+            QueryBuilder::new("SELECT COUNT(*)::bigint FROM patch_series ps");
+
+        if let Some(list_key) = list_key {
+            qb.push(
+                r#" JOIN patch_series_lists psl
+                     ON psl.patch_series_id = ps.id
+                    JOIN mailing_lists ml
+                     ON ml.id = psl.mailing_list_id
+                    WHERE ml.list_key = "#,
+            );
+            qb.push_bind(list_key);
+        }
+
+        qb.build_query_scalar::<i64>().fetch_one(&self.pool).await
     }
 
     pub async fn list_series_list_keys(&self, patch_series_id: i64) -> Result<Vec<String>> {

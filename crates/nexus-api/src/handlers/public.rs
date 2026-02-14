@@ -1,11 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::str::FromStr;
 
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
-use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
 use nexus_db::{
     ListThreadsParams, PatchItemDetailRecord, SeriesExportMessageRecord, SeriesLogicalCompareRow,
 };
@@ -17,6 +16,99 @@ use crate::state::ApiState;
 
 const CACHE_THREAD: &str = "public, max-age=300, stale-while-revalidate=86400";
 const CACHE_LONG: &str = "public, max-age=86400, stale-while-revalidate=604800";
+
+#[derive(Debug, Serialize, Clone)]
+pub struct PaginationResponse {
+    pub page: i64,
+    pub page_size: i64,
+    pub total_items: i64,
+    pub total_pages: i64,
+    pub has_prev: bool,
+    pub has_next: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PageQuery {
+    #[serde(default)]
+    pub page: Option<i64>,
+    #[serde(default)]
+    pub page_size: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListSummaryResponse {
+    pub list_key: String,
+    pub description: Option<String>,
+    pub posting_address: Option<String>,
+    pub latest_activity_at: Option<DateTime<Utc>>,
+    pub thread_count_30d: i64,
+    pub message_count_30d: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListCatalogResponse {
+    pub items: Vec<ListSummaryResponse>,
+    pub pagination: PaginationResponse,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListMirrorStateResponse {
+    pub active_repos: i64,
+    pub total_repos: i64,
+    pub latest_repo_watermark_updated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListCountsResponse {
+    pub messages: i64,
+    pub threads: i64,
+    pub patch_series: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListFacetsHintResponse {
+    pub default_scope: String,
+    pub available_scopes: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListDetailResponse {
+    pub list_key: String,
+    pub description: Option<String>,
+    pub posting_address: Option<String>,
+    pub mirror_state: ListMirrorStateResponse,
+    pub counts: ListCountsResponse,
+    pub facets_hint: ListFacetsHintResponse,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListStatsQuery {
+    #[serde(default)]
+    pub window: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListTopAuthorResponse {
+    pub from_email: String,
+    pub from_name: Option<String>,
+    pub message_count: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListActivityByDayResponse {
+    pub day_utc: DateTime<Utc>,
+    pub messages: i64,
+    pub threads: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListStatsResponse {
+    pub messages: i64,
+    pub threads: i64,
+    pub patch_series: i64,
+    pub top_authors: Vec<ListTopAuthorResponse>,
+    pub activity_by_day: Vec<ListActivityByDayResponse>,
+}
 
 #[derive(Debug, Serialize)]
 pub struct PatchItemResponse {
@@ -160,7 +252,7 @@ pub struct ThreadListItemResponse {
 #[derive(Debug, Serialize)]
 pub struct ThreadListResponse {
     pub items: Vec<ThreadListItemResponse>,
-    pub next_cursor: Option<String>,
+    pub pagination: PaginationResponse,
 }
 
 #[derive(Debug, Deserialize)]
@@ -168,9 +260,9 @@ pub struct ThreadListQuery {
     #[serde(default)]
     pub sort: Option<String>,
     #[serde(default)]
-    pub limit: Option<i64>,
+    pub page: Option<i64>,
     #[serde(default)]
-    pub cursor: Option<String>,
+    pub page_size: Option<i64>,
     #[serde(default)]
     pub from: Option<String>,
     #[serde(default)]
@@ -185,6 +277,10 @@ pub struct ThreadListQuery {
 pub struct ThreadMessagesQuery {
     #[serde(default)]
     pub view: Option<String>,
+    #[serde(default)]
+    pub page: Option<i64>,
+    #[serde(default)]
+    pub page_size: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -193,6 +289,7 @@ pub struct ThreadMessagesResponse {
     pub list_key: String,
     pub view: String,
     pub messages: Vec<ThreadMessageEntry>,
+    pub pagination: PaginationResponse,
 }
 
 #[derive(Debug, Deserialize)]
@@ -220,9 +317,11 @@ pub struct SeriesListQuery {
     #[serde(default)]
     pub list_key: Option<String>,
     #[serde(default)]
-    pub limit: Option<i64>,
+    pub sort: Option<String>,
     #[serde(default)]
-    pub cursor: Option<String>,
+    pub page: Option<i64>,
+    #[serde(default)]
+    pub page_size: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -238,7 +337,7 @@ pub struct SeriesListItemResponse {
 #[derive(Debug, Serialize)]
 pub struct SeriesListResponse {
     pub items: Vec<SeriesListItemResponse>,
-    pub next_cursor: Option<String>,
+    pub pagination: PaginationResponse,
 }
 
 #[derive(Debug, Serialize)]
@@ -374,6 +473,142 @@ pub struct SeriesCompareResponse {
     pub patches: Option<Vec<SeriesComparePatchRow>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub files: Option<Vec<SeriesCompareFileRow>>,
+}
+
+pub async fn list_catalog(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<PageQuery>,
+) -> Result<Response, StatusCode> {
+    let (page, page_size) = normalize_page(query.page, query.page_size);
+    let total_items = state
+        .catalog
+        .count_mailing_lists()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let rows = state
+        .catalog
+        .list_mailing_lists(page, page_size)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let response = ListCatalogResponse {
+        items: rows
+            .into_iter()
+            .map(|row| ListSummaryResponse {
+                list_key: row.list_key,
+                description: row.description,
+                posting_address: row.posting_address,
+                latest_activity_at: row.latest_activity_at,
+                thread_count_30d: row.thread_count_30d,
+                message_count_30d: row.message_count_30d,
+            })
+            .collect(),
+        pagination: build_pagination(page, page_size, total_items),
+    };
+
+    json_response_with_cache(&headers, &response, CACHE_THREAD, None)
+}
+
+pub async fn list_detail(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(list_key): Path<String>,
+) -> Result<Response, StatusCode> {
+    let Some(record) = state
+        .catalog
+        .get_mailing_list_detail(&list_key)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+
+    let response = ListDetailResponse {
+        list_key: record.list_key,
+        description: record.description,
+        posting_address: record.posting_address,
+        mirror_state: ListMirrorStateResponse {
+            active_repos: record.active_repo_count,
+            total_repos: record.repo_count,
+            latest_repo_watermark_updated_at: record.latest_repo_watermark_updated_at,
+        },
+        counts: ListCountsResponse {
+            messages: record.message_count,
+            threads: record.thread_count,
+            patch_series: record.patch_series_count,
+        },
+        facets_hint: ListFacetsHintResponse {
+            default_scope: "thread".to_string(),
+            available_scopes: vec![
+                "thread".to_string(),
+                "series".to_string(),
+                "patch_item".to_string(),
+                "email".to_string(),
+            ],
+        },
+    };
+
+    json_response_with_cache(&headers, &response, CACHE_THREAD, None)
+}
+
+pub async fn list_stats(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(list_key): Path<String>,
+    Query(query): Query<ListStatsQuery>,
+) -> Result<Response, StatusCode> {
+    let Some(list) = state
+        .catalog
+        .get_mailing_list(&list_key)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+
+    let window_days =
+        parse_window_days(query.window.as_deref()).ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+    let since = Utc::now() - Duration::days(window_days);
+    let totals = state
+        .catalog
+        .get_list_stats_totals(list.id, since)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let top_authors = state
+        .catalog
+        .get_list_top_authors(list.id, since, 10)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let activity = state
+        .catalog
+        .get_list_activity_by_day(list.id, since)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let response = ListStatsResponse {
+        messages: totals.messages,
+        threads: totals.threads,
+        patch_series: totals.patch_series,
+        top_authors: top_authors
+            .into_iter()
+            .map(|author| ListTopAuthorResponse {
+                from_email: author.from_email,
+                from_name: author.from_name,
+                message_count: author.message_count,
+            })
+            .collect(),
+        activity_by_day: activity
+            .into_iter()
+            .map(|day| ListActivityByDayResponse {
+                day_utc: day.day_utc,
+                messages: day.messages,
+                threads: day.threads,
+            })
+            .collect(),
+    };
+
+    json_response_with_cache(&headers, &response, CACHE_THREAD, None)
 }
 
 pub async fn patch_item(
@@ -622,11 +857,7 @@ pub async fn list_threads(
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
     }
 
-    let limit = query.limit.unwrap_or(50).clamp(1, 200);
-    let cursor = match query.cursor.as_deref() {
-        Some(raw) => Some(decode_time_cursor(raw).ok_or(StatusCode::UNPROCESSABLE_ENTITY)?),
-        None => None,
-    };
+    let (page, page_size) = normalize_page(query.page, query.page_size);
     let from_ts = match query.from.as_deref() {
         Some(raw) => Some(parse_timestamp(raw).ok_or(StatusCode::UNPROCESSABLE_ENTITY)?),
         None => None,
@@ -636,20 +867,23 @@ pub async fn list_threads(
         None => None,
     };
 
+    let params = ListThreadsParams {
+        sort: sort.to_string(),
+        from_ts,
+        to_ts,
+        author_email: query.author.clone(),
+        has_diff: query.has_diff,
+        page,
+        page_size,
+    };
+    let total_items = state
+        .lineage
+        .count_threads(list.id, &params)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let items = state
         .lineage
-        .list_threads(
-            list.id,
-            &ListThreadsParams {
-                sort: sort.to_string(),
-                from_ts,
-                to_ts,
-                author_email: query.author.clone(),
-                has_diff: query.has_diff,
-                cursor,
-                limit,
-            },
-        )
+        .list_threads(list.id, &params)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -672,19 +906,6 @@ pub async fn list_threads(
         }
     }
 
-    let next_cursor = if items.len() as i64 == limit {
-        items.last().map(|last| {
-            let ts = if sort == "date_desc" {
-                last.created_at
-            } else {
-                last.last_activity_at
-            };
-            encode_time_cursor(ts, last.thread_id)
-        })
-    } else {
-        None
-    };
-
     let response = ThreadListResponse {
         items: items
             .into_iter()
@@ -700,7 +921,7 @@ pub async fn list_threads(
                 has_diff: item.has_diff,
             })
             .collect(),
-        next_cursor,
+        pagination: build_pagination(page, page_size, total_items),
     };
 
     json_response_with_cache(&headers, &response, CACHE_THREAD, None)
@@ -731,7 +952,7 @@ pub async fn list_thread_detail(
 
     let messages = state
         .lineage
-        .list_thread_messages(list.id, path.thread_id)
+        .list_thread_messages(list.id, path.thread_id, 1, 10_000)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .into_iter()
@@ -790,6 +1011,7 @@ pub async fn thread_messages(
         "snippets" => false,
         _ => return Err(StatusCode::UNPROCESSABLE_ENTITY),
     };
+    let (page, page_size) = normalize_page(query.page, query.page_size);
 
     let exists = state
         .lineage
@@ -801,9 +1023,14 @@ pub async fn thread_messages(
         return Err(StatusCode::NOT_FOUND);
     }
 
+    let total_items = state
+        .lineage
+        .count_thread_messages(list.id, path.thread_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let messages = state
         .lineage
-        .list_thread_messages(list.id, path.thread_id)
+        .list_thread_messages(list.id, path.thread_id, page, page_size)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .into_iter()
@@ -836,6 +1063,7 @@ pub async fn thread_messages(
             list_key: path.list_key,
             view: view.to_string(),
             messages,
+            pagination: build_pagination(page, page_size, total_items),
         },
         CACHE_THREAD,
         None,
@@ -847,25 +1075,22 @@ pub async fn series_list(
     headers: HeaderMap,
     Query(query): Query<SeriesListQuery>,
 ) -> Result<Response, StatusCode> {
-    let limit = query.limit.unwrap_or(50).clamp(1, 200);
-    let cursor = match query.cursor.as_deref() {
-        Some(raw) => Some(decode_time_cursor(raw).ok_or(StatusCode::UNPROCESSABLE_ENTITY)?),
-        None => None,
-    };
+    let (page, page_size) = normalize_page(query.page, query.page_size);
+    let sort = query.sort.as_deref().unwrap_or("last_seen_desc");
+    if sort != "last_seen_desc" {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
 
-    let items = state
+    let total_items = state
         .lineage
-        .list_series(query.list_key.as_deref(), cursor, limit)
+        .count_series(query.list_key.as_deref())
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let next_cursor = if items.len() as i64 == limit {
-        items
-            .last()
-            .map(|last| encode_time_cursor(last.last_seen_at, last.series_id))
-    } else {
-        None
-    };
+    let items = state
+        .lineage
+        .list_series(query.list_key.as_deref(), page, page_size)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     json_response_with_cache(
         &headers,
@@ -881,7 +1106,7 @@ pub async fn series_list(
                     is_rfc_latest: item.is_rfc_latest,
                 })
                 .collect(),
-            next_cursor,
+            pagination: build_pagination(page, page_size, total_items),
         },
         CACHE_THREAD,
         None,
@@ -1259,6 +1484,9 @@ pub async fn openapi_json(headers: HeaderMap) -> Result<Response, StatusCode> {
             "/api/v1/readyz": { "get": { "summary": "Readiness probe" } },
             "/api/v1/version": { "get": { "summary": "Build metadata" } },
             "/api/v1/openapi.json": { "get": { "summary": "OpenAPI contract" } },
+            "/api/v1/lists": { "get": { "summary": "List catalog" } },
+            "/api/v1/lists/{list_key}": { "get": { "summary": "List detail" } },
+            "/api/v1/lists/{list_key}/stats": { "get": { "summary": "List stats window" } },
             "/api/v1/lists/{list_key}/threads": { "get": { "summary": "List threads for list" } },
             "/api/v1/lists/{list_key}/threads/{thread_id}": { "get": { "summary": "Thread detail" } },
             "/api/v1/lists/{list_key}/threads/{thread_id}/messages": { "get": { "summary": "Thread messages (full|snippets)" } },
@@ -1428,16 +1656,37 @@ fn redirect_response(location: &str) -> Result<Response, StatusCode> {
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-fn encode_time_cursor(ts: DateTime<Utc>, id: i64) -> String {
-    format!("{}:{id}", ts.timestamp_millis())
+fn normalize_page(page: Option<i64>, page_size: Option<i64>) -> (i64, i64) {
+    let page = page.unwrap_or(1).max(1);
+    let page_size = page_size.unwrap_or(50).clamp(1, 200);
+    (page, page_size)
 }
 
-fn decode_time_cursor(raw: &str) -> Option<(DateTime<Utc>, i64)> {
-    let (left, right) = raw.split_once(':')?;
-    let millis = i64::from_str(left).ok()?;
-    let id = i64::from_str(right).ok()?;
-    let ts = Utc.timestamp_millis_opt(millis).single()?;
-    Some((ts, id))
+fn build_pagination(page: i64, page_size: i64, total_items: i64) -> PaginationResponse {
+    let total_items = total_items.max(0);
+    let total_pages = if total_items == 0 {
+        0
+    } else {
+        (total_items + page_size - 1) / page_size
+    };
+    PaginationResponse {
+        page,
+        page_size,
+        total_items,
+        total_pages,
+        has_prev: page > 1 && total_pages > 0,
+        has_next: page < total_pages,
+    }
+}
+
+fn parse_window_days(window: Option<&str>) -> Option<i64> {
+    let raw = window.unwrap_or("30d");
+    let raw = raw.trim().to_ascii_lowercase();
+    let days = raw.strip_suffix('d')?.parse::<i64>().ok()?;
+    if !(1..=3650).contains(&days) {
+        return None;
+    }
+    Some(days)
 }
 
 fn parse_timestamp(raw: &str) -> Option<DateTime<Utc>> {
@@ -1580,8 +1829,9 @@ mod tests {
     use nexus_db::{SeriesExportMessageRecord, SeriesLogicalCompareRow};
 
     use super::{
-        decode_time_cursor, encode_time_cursor, if_none_match_matches, parse_timestamp,
-        render_mbox, slice_by_offsets, strip_quoted_lines, to_patch_compare_rows,
+        build_pagination, if_none_match_matches, normalize_page, parse_timestamp,
+        parse_window_days, render_mbox, slice_by_offsets, strip_quoted_lines,
+        to_patch_compare_rows,
     };
 
     #[test]
@@ -1606,12 +1856,31 @@ mod tests {
     }
 
     #[test]
-    fn cursor_round_trip() {
-        let ts = Utc::now();
-        let cursor = encode_time_cursor(ts, 42);
-        let decoded = decode_time_cursor(&cursor).expect("cursor decode");
-        assert_eq!(decoded.1, 42);
-        assert_eq!(decoded.0.timestamp_millis(), ts.timestamp_millis());
+    fn normalizes_page_params() {
+        assert_eq!(normalize_page(None, None), (1, 50));
+        assert_eq!(normalize_page(Some(0), Some(1_000)), (1, 200));
+        assert_eq!(normalize_page(Some(4), Some(25)), (4, 25));
+    }
+
+    #[test]
+    fn builds_pagination_metadata() {
+        let page = build_pagination(2, 50, 120);
+        assert_eq!(page.total_pages, 3);
+        assert!(page.has_prev);
+        assert!(page.has_next);
+
+        let empty = build_pagination(1, 50, 0);
+        assert_eq!(empty.total_pages, 0);
+        assert!(!empty.has_prev);
+        assert!(!empty.has_next);
+    }
+
+    #[test]
+    fn parses_window_days() {
+        assert_eq!(parse_window_days(None), Some(30));
+        assert_eq!(parse_window_days(Some("7d")), Some(7));
+        assert_eq!(parse_window_days(Some("0d")), None);
+        assert_eq!(parse_window_days(Some("bad")), None);
     }
 
     #[test]

@@ -8,9 +8,15 @@ mod lineage;
 mod models;
 mod threading;
 
-pub use crate::catalog::{CatalogStore, MailingList, MailingListRepo};
+pub use crate::catalog::{
+    CatalogStore, ListActivityByDayRecord, ListCatalogItemRecord, ListDetailRecord,
+    ListStatsTotalsRecord, ListTopAuthorRecord, MailingList, MailingListRepo,
+};
 pub use crate::db::Db;
-pub use crate::ingest::{IngestStore, ParsedBodyInput, ParsedMessageInput, WriteOutcome};
+pub use crate::ingest::{
+    BatchWriteOutcome, IngestCommitRow, IngestStore, ParsedBodyInput, ParsedMessageInput,
+    WriteOutcome,
+};
 pub use crate::jobs::{
     EnqueueJobParams, JobAttempt, JobStore, JobStoreMetrics, ListJobsParams, RetryDecision,
 };
