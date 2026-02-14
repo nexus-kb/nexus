@@ -243,9 +243,12 @@ pub struct ThreadListItemResponse {
     pub thread_id: i64,
     pub subject: String,
     pub root_message_id: Option<i64>,
+    pub created_at: DateTime<Utc>,
     pub last_activity_at: DateTime<Utc>,
     pub message_count: i32,
     pub participants: Vec<ThreadMessageParticipant>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub starter: Option<ThreadMessageParticipant>,
     pub has_diff: bool,
 }
 
@@ -909,16 +912,25 @@ pub async fn list_threads(
     let response = ThreadListResponse {
         items: items
             .into_iter()
-            .map(|item| ThreadListItemResponse {
-                thread_id: item.thread_id,
-                subject: item.subject_norm,
-                root_message_id: item.root_message_pk,
-                last_activity_at: item.last_activity_at,
-                message_count: item.message_count,
-                participants: participants_by_thread
-                    .remove(&item.thread_id)
-                    .unwrap_or_default(),
-                has_diff: item.has_diff,
+            .map(|item| {
+                let starter = item.starter_email.map(|email| ThreadMessageParticipant {
+                    name: item.starter_name,
+                    email,
+                });
+
+                ThreadListItemResponse {
+                    thread_id: item.thread_id,
+                    subject: item.subject_norm,
+                    root_message_id: item.root_message_pk,
+                    created_at: item.created_at,
+                    last_activity_at: item.last_activity_at,
+                    message_count: item.message_count,
+                    participants: participants_by_thread
+                        .remove(&item.thread_id)
+                        .unwrap_or_default(),
+                    starter,
+                    has_diff: item.has_diff,
+                }
             })
             .collect(),
         pagination: build_pagination(page, page_size, total_items),
