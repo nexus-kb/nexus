@@ -1,6 +1,6 @@
-use axum::Router;
 use axum::middleware;
-use axum::routing::{get, post};
+use axum::routing::{get, options, post};
+use axum::{Router, http::StatusCode};
 
 use crate::auth::require_admin;
 use crate::handlers::{admin, health, public};
@@ -51,7 +51,8 @@ pub fn build_router(state: ApiState) -> Router {
         .route(
             "/series/{series_id}/versions/{series_version_id}/export/mbox",
             get(public::series_version_export_mbox),
-        );
+        )
+        .route("/{*path}", options(preflight_options));
 
     let admin_routes = Router::new()
         .route("/jobs/enqueue", post(admin::enqueue_job))
@@ -69,4 +70,8 @@ pub fn build_router(state: ApiState) -> Router {
         .nest("/api/v1", public_routes)
         .nest("/admin/v1", admin_routes)
         .with_state(state)
+}
+
+async fn preflight_options() -> StatusCode {
+    StatusCode::NO_CONTENT
 }

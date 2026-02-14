@@ -33,7 +33,7 @@ pub async fn healthz() -> Json<HealthResponse> {
 }
 
 pub async fn readyz(State(state): State<ApiState>) -> Json<ReadyResponse> {
-    let postgres = match sqlx::query_scalar::<_, i64>("SELECT 1")
+    let postgres = match sqlx::query_scalar::<_, i32>("SELECT 1")
         .fetch_one(state.db.pool())
         .await
     {

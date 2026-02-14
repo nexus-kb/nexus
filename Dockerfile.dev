@@ -1,0 +1,29 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV CARGO_HOME=/opt/cargo
+ENV RUSTUP_HOME=/opt/rustup
+ENV PATH=/opt/cargo/bin:${PATH}
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash \
+    build-essential \
+    ca-certificates \
+    clang \
+    curl \
+    git \
+    libpq-dev \
+    libssl-dev \
+    pkg-config \
+    procps \
+    tini \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable \
+    && rustup component add rustfmt clippy \
+    && cargo install cargo-watch --locked
+
+WORKDIR /workspace/nexus-api-server
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["bash", "-lc", "cargo --version"]

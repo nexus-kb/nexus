@@ -10,6 +10,29 @@ Hard-reset backend focused on job orchestration + ingestion tickets 1-5.
 - `crates/nexus-cli`: minimal CLI helper (`seed-pilot`).
 - `crates/nexus-core`: shared config.
 
+## Container-first dev workflow (recommended)
+
+Use the root `compose.yml` as the canonical dev workflow for API + worker + dependencies.
+
+From repo root:
+
+```bash
+podman compose -f compose.yml up -d --build api worker postgres meilisearch
+```
+
+or:
+
+```bash
+docker compose -f compose.yml up -d --build api worker postgres meilisearch
+```
+
+Notes:
+
+- API and worker use `nexus-api-server/Dockerfile.dev`.
+- Source is bind-mounted from host (`./nexus-api-server`), and both services run under `cargo watch`.
+- Rust edits on host trigger rebuild/restart in the corresponding container.
+- Dev defaults are injected by compose (no shell sourcing required).
+
 ## Required environment
 
 - `NEXUS__DATABASE__URL`
@@ -28,11 +51,22 @@ Optional defaults:
 - `NEXUS__WORKER__BACKFILL_BATCH_SIZE=10000`
 - `NEXUS__WORKER__INGEST_WRITE_MODE=copy|batched_sql`
 - `NEXUS__WORKER__DB_RELAXED_DURABILITY=false`
+- `NEXUS_CORS_ALLOWED_ORIGINS` (optional, comma-separated, defaults to `http://127.0.0.1:3001,http://localhost:3001,http://host.containers.internal:3001,http://host.docker.internal:3001`)
 
 ## Run API
 
 ```bash
 cargo run -p nexus-api
+```
+
+Cross-origin requests from the web app are supported with local dev defaults for
+`http://127.0.0.1:3001`, `http://localhost:3001`, `http://host.containers.internal:3001`, and
+`http://host.docker.internal:3001` so a Next frontend on port 3001 can call live API routes.
+
+Override the allowed origins as needed:
+
+```bash
+NEXUS_CORS_ALLOWED_ORIGINS=http://localhost:3001,http://127.0.0.1:3001,http://host.containers.internal:3001,https://nexus.local cargo run -p nexus-api
 ```
 
 ## Run worker
@@ -47,6 +81,12 @@ Build:
 
 ```bash
 docker build -t nexus-api-server:debug -f Dockerfile .
+```
+
+Build dev image (compose-compatible tooling image):
+
+```bash
+docker build -t nexus-api-server:dev -f Dockerfile.dev .
 ```
 
 Run API long-lived:
