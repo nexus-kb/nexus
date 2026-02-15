@@ -1,14 +1,20 @@
 mod auth;
 mod handlers;
+mod logging;
 mod router;
 mod state;
 
+use std::net::SocketAddr;
+
 use axum::http::{HeaderValue, Method, header::CONTENT_TYPE};
+use axum::middleware;
 use nexus_core::config;
 use nexus_db::Db;
 use tower_http::cors::CorsLayer;
 use tracing::info;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::Layer;
+use tracing_subscriber::filter::Targets;
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::router::build_router;
 use crate::state::ApiState;
@@ -42,12 +48,28 @@ fn build_cors() -> CorsLayer {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+    let app_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"))
+        .add_directive(
+            "access_clf=off"
+                .parse()
+                .expect("valid access_clf directive"),
+        );
+
+    let app_log_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
         .with_level(true)
+        .with_filter(app_filter);
+    let access_log_layer = tracing_subscriber::fmt::layer()
+        .with_target(false)
+        .with_level(false)
+        .without_time()
+        .with_ansi(false)
+        .with_filter(Targets::new().with_target("access_clf", tracing::Level::INFO));
+
+    tracing_subscriber::registry()
+        .with(app_log_layer)
+        .with(access_log_layer)
         .init();
 
     let settings = config::load()?;
@@ -55,13 +77,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     db.migrate().await?;
 
     let state = ApiState::new(settings.clone(), db);
-    let app = build_router(state).layer(build_cors());
+    let app = build_router(state)
+        .layer(build_cors())
+        .layer(middleware::from_fn(logging::common_log_middleware));
 
     let listener =
         tokio::net::TcpListener::bind((settings.app.host.as_str(), settings.app.port)).await?;
     let addr = listener.local_addr()?;
     info!(%addr, "nexus phase0 api listening");
 
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }

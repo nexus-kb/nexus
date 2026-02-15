@@ -8,7 +8,7 @@ use nexus_db::{
     CatalogStore, Db, EmbeddingsStore, IngestStore, Job, JobState, JobStore, JobStoreMetrics,
     LineageStore, PipelineStore, RetryDecision, SearchStore, ThreadingStore,
 };
-use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::{MissedTickBehavior, interval};
 use tracing::{error, info, warn};
@@ -16,6 +16,8 @@ use tracing::{error, info, warn};
 use crate::JobExecutionOutcome;
 use crate::payloads::{IngestCommitBatchPayload, RepoIngestRunPayload};
 use crate::pipeline::Phase0JobHandler;
+
+const MAX_LOG_REASON_CHARS: usize = 180;
 
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
@@ -73,6 +75,24 @@ pub struct Phase0Worker {
     worker_id: String,
     ingest_job_semaphore: Arc<Semaphore>,
     repo_ingest_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct JobPayloadContext {
+    list_key: Option<String>,
+    repo_key: Option<String>,
+    run_id: Option<i64>,
+    scope: Option<String>,
+    batch_count: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct JobOutcomeSummary {
+    outcome: &'static str,
+    kind: Option<String>,
+    reason: Option<String>,
+    backoff_ms: Option<u64>,
+    metrics: JobStoreMetrics,
 }
 
 impl Phase0Worker {
@@ -208,6 +228,13 @@ impl Phase0Worker {
         };
 
         if job.cancel_requested {
+            let cancel_metrics = JobStoreMetrics {
+                duration_ms: 0,
+                rows_written: 0,
+                bytes_read: 0,
+                commit_count: 0,
+                parse_errors: 0,
+            };
             if let Err(err) = self
                 .jobs
                 .mark_cancelled(job.id, "cancel requested before execution")
@@ -221,15 +248,14 @@ impl Phase0Worker {
                     attempt.id,
                     "cancelled",
                     Some("cancel requested before execution"),
-                    Some(metrics_to_json(JobStoreMetrics {
-                        duration_ms: 0,
-                        rows_written: 0,
-                        bytes_read: 0,
-                        commit_count: 0,
-                        parse_errors: 0,
-                    })),
+                    Some(metrics_to_json(cancel_metrics.clone())),
                 )
                 .await;
+            let outcome = JobExecutionOutcome::Cancelled {
+                reason: "cancel requested before execution".to_string(),
+                metrics: cancel_metrics,
+            };
+            log_job_attempt_completion(&job, &outcome);
             return;
         }
 
@@ -240,8 +266,7 @@ impl Phase0Worker {
             lease_ms: self.cfg.lease_ms,
         };
 
-        let stop = Arc::new(Notify::new());
-        let stop_clone = stop.clone();
+        let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
         let jobs = self.jobs.clone();
         let worker_id = self.worker_id.clone();
         let heartbeat_ms = self.cfg.heartbeat_ms;
@@ -257,14 +282,14 @@ impl Phase0Worker {
                             warn!(job_id = heartbeat_job_id, error = %err, "heartbeat failed");
                         }
                     }
-                    _ = stop_clone.notified() => break,
+                    _ = &mut stop_rx => break,
                 }
             }
         });
 
         let outcome = self.handler.handle(job.clone(), context).await;
 
-        stop.notify_waiters();
+        let _ = stop_tx.send(());
         let _ = heartbeat_task.await;
 
         match finalize_job(
@@ -283,6 +308,8 @@ impl Phase0Worker {
                 error!(job_id = job.id, error = %err, "failed to finalize job result");
             }
         }
+
+        log_job_attempt_completion(&job, &outcome);
     }
 
     async fn acquire_ingest_permit(&self, job: &Job) -> Option<OwnedSemaphorePermit> {
@@ -367,6 +394,169 @@ fn metrics_to_json(metrics: JobStoreMetrics) -> serde_json::Value {
         "commit_count": metrics.commit_count,
         "parse_errors": metrics.parse_errors,
     })
+}
+
+fn log_job_attempt_completion(job: &Job, outcome: &JobExecutionOutcome) {
+    let context = extract_job_payload_context(&job.payload_json);
+    let summary = summarize_outcome(outcome);
+
+    let list_key = context.list_key.as_deref().unwrap_or("-");
+    let repo_key = context.repo_key.as_deref().unwrap_or("-");
+    let run_id = context
+        .run_id
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let scope = context.scope.as_deref().unwrap_or("-");
+    let batch_count = context
+        .batch_count
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string());
+
+    if summary.kind.is_some() || summary.reason.is_some() || summary.backoff_ms.is_some() {
+        let kind = summary.kind.as_deref().unwrap_or("-");
+        let reason = summary.reason.as_deref().unwrap_or("-");
+        let backoff_ms = summary
+            .backoff_ms
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string());
+
+        info!(
+            target: "worker_job",
+            job_id = job.id,
+            job_type = %job.job_type,
+            attempt = job.attempt,
+            max_attempts = job.max_attempts,
+            outcome = summary.outcome,
+            duration_ms = %summary.metrics.duration_ms,
+            rows_written = summary.metrics.rows_written,
+            bytes_read = summary.metrics.bytes_read,
+            commit_count = summary.metrics.commit_count,
+            parse_errors = summary.metrics.parse_errors,
+            list_key = %list_key,
+            repo_key = %repo_key,
+            run_id = %run_id,
+            scope = %scope,
+            batch_count = %batch_count,
+            kind = %kind,
+            reason = %reason,
+            backoff_ms = %backoff_ms,
+            "job attempt completed"
+        );
+    } else {
+        info!(
+            target: "worker_job",
+            job_id = job.id,
+            job_type = %job.job_type,
+            attempt = job.attempt,
+            max_attempts = job.max_attempts,
+            outcome = summary.outcome,
+            duration_ms = %summary.metrics.duration_ms,
+            rows_written = summary.metrics.rows_written,
+            bytes_read = summary.metrics.bytes_read,
+            commit_count = summary.metrics.commit_count,
+            parse_errors = summary.metrics.parse_errors,
+            list_key = %list_key,
+            repo_key = %repo_key,
+            run_id = %run_id,
+            scope = %scope,
+            batch_count = %batch_count,
+            "job attempt completed"
+        );
+    }
+}
+
+fn extract_job_payload_context(payload: &serde_json::Value) -> JobPayloadContext {
+    let list_key = payload
+        .get("list_key")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string);
+    let repo_key = payload
+        .get("repo_key")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string);
+    let run_id = payload.get("run_id").and_then(serde_json::Value::as_i64);
+    let scope = payload
+        .get("scope")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string);
+
+    let batch_count = ["ids", "commit_oids", "anchor_message_pks", "patch_item_ids"]
+        .iter()
+        .find_map(|key| {
+            payload
+                .get(*key)
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len)
+        });
+
+    JobPayloadContext {
+        list_key,
+        repo_key,
+        run_id,
+        scope,
+        batch_count,
+    }
+}
+
+fn summarize_outcome(outcome: &JobExecutionOutcome) -> JobOutcomeSummary {
+    match outcome {
+        JobExecutionOutcome::Success { metrics, .. } => JobOutcomeSummary {
+            outcome: "succeeded",
+            kind: None,
+            reason: None,
+            backoff_ms: None,
+            metrics: metrics.clone(),
+        },
+        JobExecutionOutcome::Retryable {
+            reason,
+            kind,
+            backoff_ms,
+            metrics,
+        } => JobOutcomeSummary {
+            outcome: "retryable",
+            kind: Some(kind.clone()),
+            reason: Some(truncate_for_log(reason, MAX_LOG_REASON_CHARS)),
+            backoff_ms: Some(*backoff_ms),
+            metrics: metrics.clone(),
+        },
+        JobExecutionOutcome::Terminal {
+            reason,
+            kind,
+            metrics,
+        } => JobOutcomeSummary {
+            outcome: "terminal",
+            kind: Some(kind.clone()),
+            reason: Some(truncate_for_log(reason, MAX_LOG_REASON_CHARS)),
+            backoff_ms: None,
+            metrics: metrics.clone(),
+        },
+        JobExecutionOutcome::Cancelled { reason, metrics } => JobOutcomeSummary {
+            outcome: "cancelled",
+            kind: Some("cancelled".to_string()),
+            reason: Some(truncate_for_log(reason, MAX_LOG_REASON_CHARS)),
+            backoff_ms: None,
+            metrics: metrics.clone(),
+        },
+    }
+}
+
+fn truncate_for_log(value: &str, max_chars: usize) -> String {
+    let compact = value
+        .replace(['\r', '\n', '\t'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if compact.chars().count() <= max_chars {
+        return compact;
+    }
+
+    if max_chars <= 3 {
+        return "...".chars().take(max_chars).collect();
+    }
+
+    let prefix: String = compact.chars().take(max_chars - 3).collect();
+    format!("{prefix}...")
 }
 
 async fn finalize_job(
@@ -476,4 +666,123 @@ async fn finalize_job(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{
+        MAX_LOG_REASON_CHARS, extract_job_payload_context, summarize_outcome, truncate_for_log,
+    };
+    use crate::JobExecutionOutcome;
+    use nexus_db::JobStoreMetrics;
+
+    fn metrics() -> JobStoreMetrics {
+        JobStoreMetrics {
+            duration_ms: 123,
+            rows_written: 9,
+            bytes_read: 88,
+            commit_count: 7,
+            parse_errors: 1,
+        }
+    }
+
+    #[test]
+    fn payload_context_extracts_common_fields() {
+        let payload = json!({
+            "list_key": "bpf",
+            "repo_key": "linux.git",
+            "run_id": 42,
+            "scope": "thread",
+            "ids": [11, 22, 33]
+        });
+
+        let context = extract_job_payload_context(&payload);
+        assert_eq!(context.list_key.as_deref(), Some("bpf"));
+        assert_eq!(context.repo_key.as_deref(), Some("linux.git"));
+        assert_eq!(context.run_id, Some(42));
+        assert_eq!(context.scope.as_deref(), Some("thread"));
+        assert_eq!(context.batch_count, Some(3));
+    }
+
+    #[test]
+    fn payload_context_uses_commit_oid_batch_count_when_ids_missing() {
+        let payload = json!({
+            "list_key": "lkml",
+            "commit_oids": ["a", "b"]
+        });
+
+        let context = extract_job_payload_context(&payload);
+        assert_eq!(context.list_key.as_deref(), Some("lkml"));
+        assert_eq!(context.batch_count, Some(2));
+    }
+
+    #[test]
+    fn summarize_outcome_success_has_no_error_fields() {
+        let summary = summarize_outcome(&JobExecutionOutcome::Success {
+            result_json: json!({"ok": true}),
+            metrics: metrics(),
+        });
+
+        assert_eq!(summary.outcome, "succeeded");
+        assert!(summary.kind.is_none());
+        assert!(summary.reason.is_none());
+        assert!(summary.backoff_ms.is_none());
+        assert_eq!(summary.metrics.rows_written, 9);
+    }
+
+    #[test]
+    fn summarize_outcome_retryable_includes_kind_reason_and_backoff() {
+        let summary = summarize_outcome(&JobExecutionOutcome::Retryable {
+            reason: "temporary meili timeout".to_string(),
+            kind: "transient".to_string(),
+            backoff_ms: 15_000,
+            metrics: metrics(),
+        });
+
+        assert_eq!(summary.outcome, "retryable");
+        assert_eq!(summary.kind.as_deref(), Some("transient"));
+        assert_eq!(summary.reason.as_deref(), Some("temporary meili timeout"));
+        assert_eq!(summary.backoff_ms, Some(15_000));
+    }
+
+    #[test]
+    fn summarize_outcome_terminal_includes_kind_and_reason() {
+        let summary = summarize_outcome(&JobExecutionOutcome::Terminal {
+            reason: "invalid payload shape".to_string(),
+            kind: "payload".to_string(),
+            metrics: metrics(),
+        });
+
+        assert_eq!(summary.outcome, "terminal");
+        assert_eq!(summary.kind.as_deref(), Some("payload"));
+        assert_eq!(summary.reason.as_deref(), Some("invalid payload shape"));
+        assert!(summary.backoff_ms.is_none());
+    }
+
+    #[test]
+    fn summarize_outcome_cancelled_uses_cancelled_kind() {
+        let summary = summarize_outcome(&JobExecutionOutcome::Cancelled {
+            reason: "cancel requested".to_string(),
+            metrics: metrics(),
+        });
+
+        assert_eq!(summary.outcome, "cancelled");
+        assert_eq!(summary.kind.as_deref(), Some("cancelled"));
+        assert_eq!(summary.reason.as_deref(), Some("cancel requested"));
+        assert!(summary.backoff_ms.is_none());
+    }
+
+    #[test]
+    fn truncates_and_normalizes_reason_for_logs() {
+        let raw = "line one\nline two\tline three";
+        let normalized = truncate_for_log(raw, MAX_LOG_REASON_CHARS);
+        assert_eq!(normalized, "line one line two line three");
+
+        let long = "x".repeat(MAX_LOG_REASON_CHARS + 20);
+        let truncated = truncate_for_log(&long, 24);
+        assert_eq!(truncated.len(), 24);
+        assert!(truncated.ends_with("..."));
+    }
 }
