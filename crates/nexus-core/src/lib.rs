@@ -1,4 +1,5 @@
 pub mod config;
+pub mod embeddings;
 pub mod search;
 
 pub type Result<T> = std::result::Result<T, Error>;

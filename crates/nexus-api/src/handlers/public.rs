@@ -1548,18 +1548,34 @@ pub async fn search(
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
     }
 
-    if hybrid_requested(query.hybrid, query.semantic_ratio) {
-        return json_error_response(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            json!({ "error": "hybrid is phase 2" }),
-        );
-    }
-
     let scope = match query.scope.as_deref() {
         Some(raw) => SearchScope::parse(raw).ok_or(StatusCode::UNPROCESSABLE_ENTITY)?,
         None => SearchScope::Thread,
     };
     let spec = scope.index_kind().spec();
+
+    let hybrid_enabled = hybrid_requested(query.hybrid, query.semantic_ratio);
+    let semantic_ratio = if hybrid_enabled {
+        let semantic_ratio = query.semantic_ratio.unwrap_or(0.35);
+        if !(0.0..=1.0).contains(&semantic_ratio) {
+            return Err(StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        if !state.settings.embeddings.enabled {
+            return json_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                json!({ "error": "hybrid requires embeddings to be enabled" }),
+            );
+        }
+        if !matches!(scope, SearchScope::Thread | SearchScope::Series) {
+            return json_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                json!({ "error": "hybrid is only available for thread and series scopes" }),
+            );
+        }
+        Some(semantic_ratio)
+    } else {
+        None
+    };
 
     let sort = query.sort.as_deref().unwrap_or("relevance");
     if sort != "relevance" && sort != "date_desc" {
@@ -1586,6 +1602,13 @@ pub async fn search(
         query.has_diff,
         sort,
         limit,
+        hybrid_enabled,
+        semantic_ratio,
+        if hybrid_enabled {
+            Some(state.settings.embeddings.model.as_str())
+        } else {
+            None
+        },
     );
     let offset = if let Some(cursor) = query.cursor.as_deref() {
         let (offset, cursor_hash) =
@@ -1637,6 +1660,19 @@ pub async fn search(
     }
     if sort == "date_desc" {
         request_body["sort"] = json!(["date_ts:desc"]);
+    }
+    if hybrid_enabled {
+        let vector = match compute_or_get_query_embedding(&state, scope, q).await {
+            Ok(value) => value,
+            Err(message) => {
+                return json_error_response(StatusCode::BAD_GATEWAY, json!({ "error": message }));
+            }
+        };
+        request_body["hybrid"] = json!({
+            "embedder": state.settings.embeddings.embedder_name.clone(),
+            "semanticRatio": semantic_ratio.unwrap_or(0.35),
+        });
+        request_body["vector"] = json!(vector);
     }
 
     let search_response = reqwest::Client::new()
@@ -1883,6 +1919,9 @@ fn search_request_hash(
     has_diff: Option<bool>,
     sort: &str,
     limit: usize,
+    hybrid: bool,
+    semantic_ratio: Option<f32>,
+    model_key: Option<&str>,
 ) -> String {
     let normalized = json!({
         "q": q,
@@ -1893,7 +1932,10 @@ fn search_request_hash(
         "to_ts": to_ts.map(|value| value.timestamp()),
         "has_diff": has_diff,
         "sort": sort,
-        "limit": limit
+        "limit": limit,
+        "hybrid": hybrid,
+        "semantic_ratio": semantic_ratio,
+        "model_key": model_key.unwrap_or(""),
     });
     let mut hasher = Sha256::new();
     hasher.update(serde_json::to_vec(&normalized).unwrap_or_default());
@@ -1974,6 +2016,68 @@ fn normalize_search_facets(raw: Value, author_field: &str) -> Value {
 
 fn hybrid_requested(hybrid: Option<bool>, semantic_ratio: Option<f32>) -> bool {
     hybrid.unwrap_or(false) || semantic_ratio.is_some()
+}
+
+async fn compute_or_get_query_embedding(
+    state: &ApiState,
+    scope: SearchScope,
+    query: &str,
+) -> Result<Vec<f32>, String> {
+    let normalized_query = normalize_embedding_query(query);
+    let cache_key = format!(
+        "{}:{}:{}:{}",
+        state.settings.embeddings.model,
+        state.settings.embeddings.dimensions,
+        scope.as_str(),
+        normalized_query
+    );
+    if let Some(vector) = state.query_embedding_cache.get(&cache_key).await {
+        return Ok(vector);
+    }
+
+    let client = state
+        .embedding_client
+        .as_ref()
+        .ok_or_else(|| "embeddings client is not configured".to_string())?;
+    let prompt = hybrid_query_prompt(scope, &normalized_query);
+    let vector = client
+        .embed_query(&prompt)
+        .await
+        .map_err(|err| format!("query embedding request failed: {err}"))?;
+    if vector.len() != state.settings.embeddings.dimensions {
+        return Err(format!(
+            "query embedding dimensions mismatch: expected={} got={}",
+            state.settings.embeddings.dimensions,
+            vector.len()
+        ));
+    }
+    state
+        .query_embedding_cache
+        .insert(cache_key, vector.clone())
+        .await;
+    Ok(vector)
+}
+
+fn normalize_embedding_query(raw: &str) -> String {
+    raw.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string()
+}
+
+fn hybrid_query_prompt(scope: SearchScope, query: &str) -> String {
+    match scope {
+        SearchScope::Thread => {
+            format!("Represent this mailing-list thread search query for retrieval: {query}")
+        }
+        SearchScope::Series => {
+            format!("Represent this patch-series search query for retrieval: {query}")
+        }
+        SearchScope::PatchItem => {
+            format!("Represent this patch search query for retrieval: {query}")
+        }
+    }
 }
 
 fn json_error_response(status: StatusCode, payload: Value) -> Result<Response, StatusCode> {
@@ -2247,18 +2351,14 @@ mod tests {
     use std::path::Path;
     use std::process::Command;
 
-    use axum::body::to_bytes;
-    use axum::http::StatusCode;
     use axum::http::{HeaderMap, header};
     use chrono::Utc;
     use nexus_db::{SeriesExportMessageRecord, SeriesLogicalCompareRow};
-    use serde_json::Value;
 
     use super::{
         build_pagination, encode_search_cursor, hybrid_requested, if_none_match_matches,
-        json_error_response, normalize_page, parse_search_cursor, parse_timestamp,
-        parse_window_days, render_mbox, search_request_hash, slice_by_offsets, strip_quoted_lines,
-        to_patch_compare_rows,
+        normalize_page, parse_search_cursor, parse_timestamp, parse_window_days, render_mbox,
+        search_request_hash, slice_by_offsets, strip_quoted_lines, to_patch_compare_rows,
     };
 
     #[test]
@@ -2379,6 +2479,9 @@ mod tests {
             Some(true),
             "relevance",
             20,
+            false,
+            None,
+            None,
         );
         let second = search_request_hash(
             "mm reclaim",
@@ -2390,34 +2493,51 @@ mod tests {
             Some(true),
             "relevance",
             20,
+            false,
+            None,
+            None,
         );
         assert_ne!(first, second);
     }
 
     #[test]
-    fn hybrid_flag_detection_matches_phase1_contract() {
+    fn hybrid_flag_detection_matches_expected_contract() {
         assert!(!hybrid_requested(None, None));
         assert!(hybrid_requested(Some(true), None));
         assert!(hybrid_requested(None, Some(0.4)));
     }
 
-    #[tokio::test]
-    async fn hybrid_error_response_matches_contract() {
-        let response = json_error_response(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            serde_json::json!({ "error": "hybrid is phase 2" }),
-        )
-        .expect("response");
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body");
-        let payload: Value = serde_json::from_slice(&body).expect("json");
-        assert_eq!(
-            payload.get("error").and_then(Value::as_str),
-            Some("hybrid is phase 2")
+    #[test]
+    fn search_request_hash_changes_for_hybrid_shape() {
+        let lexical = search_request_hash(
+            "mm reclaim",
+            nexus_core::search::SearchScope::Thread,
+            Some("lkml"),
+            None,
+            None,
+            None,
+            Some(true),
+            "relevance",
+            20,
+            false,
+            None,
+            None,
         );
+        let hybrid = search_request_hash(
+            "mm reclaim",
+            nexus_core::search::SearchScope::Thread,
+            Some("lkml"),
+            None,
+            None,
+            None,
+            Some(true),
+            "relevance",
+            20,
+            true,
+            Some(0.35),
+            Some("qwen/qwen3-embedding-4b"),
+        );
+        assert_ne!(lexical, hybrid);
     }
 
     #[test]

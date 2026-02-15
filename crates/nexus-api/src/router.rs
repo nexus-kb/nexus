@@ -67,6 +67,14 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/pipeline/runs/{run_id}", get(admin::get_pipeline_run))
         .route("/threading/rebuild", post(admin::threading_rebuild))
         .route("/lineage/rebuild", post(admin::lineage_rebuild))
+        .route(
+            "/search/embeddings/backfill",
+            post(admin::search_embeddings_backfill),
+        )
+        .route(
+            "/search/embeddings/backfill/{run_id}",
+            get(admin::get_search_embeddings_backfill),
+        )
         .route_layer(middleware::from_fn_with_state(state.clone(), require_admin));
 
     Router::new()

@@ -87,6 +87,76 @@ fn default_meili_master_key() -> String {
     "nexus-dev-key".to_string()
 }
 
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct EmbeddingsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_embeddings_base_url")]
+    pub base_url: String,
+    #[serde(default = "default_embeddings_api_key")]
+    pub api_key: String,
+    #[serde(default = "default_embeddings_model")]
+    pub model: String,
+    #[serde(default = "default_embeddings_dimensions")]
+    pub dimensions: usize,
+    #[serde(default = "default_embeddings_embedder_name")]
+    pub embedder_name: String,
+    #[serde(default = "default_embeddings_query_cache_ttl_secs")]
+    pub query_cache_ttl_secs: u64,
+    #[serde(default = "default_embeddings_query_cache_max_entries")]
+    pub query_cache_max_entries: usize,
+    #[serde(default = "default_embeddings_batch_size")]
+    pub batch_size: usize,
+    #[serde(default = "default_embeddings_max_inflight_requests")]
+    pub max_inflight_requests: usize,
+    #[serde(default = "default_embeddings_min_request_interval_ms")]
+    pub min_request_interval_ms: u64,
+    #[serde(default)]
+    pub openrouter_referer: Option<String>,
+    #[serde(default)]
+    pub openrouter_title: Option<String>,
+}
+
+fn default_embeddings_base_url() -> String {
+    "https://openrouter.ai/api/v1".to_string()
+}
+
+fn default_embeddings_api_key() -> String {
+    String::new()
+}
+
+fn default_embeddings_model() -> String {
+    "qwen/qwen3-embedding-4b".to_string()
+}
+
+fn default_embeddings_dimensions() -> usize {
+    768
+}
+
+fn default_embeddings_embedder_name() -> String {
+    "qwen3".to_string()
+}
+
+fn default_embeddings_query_cache_ttl_secs() -> u64 {
+    120
+}
+
+fn default_embeddings_query_cache_max_entries() -> usize {
+    10_000
+}
+
+fn default_embeddings_batch_size() -> usize {
+    32
+}
+
+fn default_embeddings_max_inflight_requests() -> usize {
+    2
+}
+
+fn default_embeddings_min_request_interval_ms() -> u64 {
+    50
+}
+
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum BackfillMode {
@@ -237,6 +307,8 @@ pub struct Settings {
     #[serde(default)]
     pub meili: MeiliConfig,
     #[serde(default)]
+    pub embeddings: EmbeddingsConfig,
+    #[serde(default)]
     pub worker: WorkerConfig,
 }
 
@@ -273,6 +345,47 @@ pub fn load() -> Result<Settings, crate::Error> {
     }
     if settings.meili.master_key.trim().is_empty() {
         settings.meili.master_key = default_meili_master_key();
+    }
+    if settings.embeddings.base_url.trim().is_empty() {
+        settings.embeddings.base_url = default_embeddings_base_url();
+    }
+    if settings.embeddings.model.trim().is_empty() {
+        settings.embeddings.model = default_embeddings_model();
+    }
+    if settings.embeddings.dimensions == 0 {
+        settings.embeddings.dimensions = default_embeddings_dimensions();
+    }
+    if settings.embeddings.embedder_name.trim().is_empty() {
+        settings.embeddings.embedder_name = default_embeddings_embedder_name();
+    }
+    if settings.embeddings.query_cache_ttl_secs == 0 {
+        settings.embeddings.query_cache_ttl_secs = default_embeddings_query_cache_ttl_secs();
+    }
+    if settings.embeddings.query_cache_max_entries == 0 {
+        settings.embeddings.query_cache_max_entries = default_embeddings_query_cache_max_entries();
+    }
+    if settings.embeddings.batch_size == 0 {
+        settings.embeddings.batch_size = default_embeddings_batch_size();
+    }
+    if settings.embeddings.max_inflight_requests == 0 {
+        settings.embeddings.max_inflight_requests = default_embeddings_max_inflight_requests();
+    }
+    if settings.embeddings.enabled {
+        if settings.embeddings.api_key.trim().is_empty() {
+            return Err(crate::Error::Config(
+                "embeddings.enabled=true requires NEXUS__EMBEDDINGS__API_KEY".to_string(),
+            ));
+        }
+        if settings.embeddings.base_url.trim().is_empty() {
+            return Err(crate::Error::Config(
+                "embeddings.enabled=true requires NEXUS__EMBEDDINGS__BASE_URL".to_string(),
+            ));
+        }
+        if settings.embeddings.model.trim().is_empty() {
+            return Err(crate::Error::Config(
+                "embeddings.enabled=true requires NEXUS__EMBEDDINGS__MODEL".to_string(),
+            ));
+        }
     }
     if settings.worker.poll_ms == 0 {
         settings.worker.poll_ms = default_worker_poll_ms();

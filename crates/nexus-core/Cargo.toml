@@ -9,3 +9,4 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
 config = { workspace = true }
+reqwest = { workspace = true }

@@ -2,6 +2,7 @@
 
 mod catalog;
 mod db;
+mod embeddings;
 mod ingest;
 mod jobs;
 mod lineage;
@@ -15,6 +16,7 @@ pub use crate::catalog::{
     ListStatsTotalsRecord, ListTopAuthorRecord, MailingList, MailingListRepo,
 };
 pub use crate::db::Db;
+pub use crate::embeddings::{EmbeddingInputRow, EmbeddingVectorUpsert, EmbeddingsStore};
 pub use crate::ingest::{
     BatchWriteOutcome, IngestCommitRow, IngestStore, ParsedBodyInput, ParsedMessageInput,
     WriteOutcome,
@@ -32,7 +34,7 @@ pub use crate::lineage::{
     ThreadRefRecord, ThreadSummaryRecord, UpsertPatchItemFileInput, UpsertPatchItemInput,
     UpsertPatchSeriesInput, UpsertPatchSeriesVersionInput,
 };
-pub use crate::models::{Job, JobState, PipelineRun, PipelineStageRun};
+pub use crate::models::{EmbeddingBackfillRun, Job, JobState, PipelineRun, PipelineStageRun};
 pub use crate::pipeline::{ListPipelineRunsParams, PipelineArtifactCount, PipelineStore};
 pub use crate::search::SearchStore;
 pub use crate::threading::{

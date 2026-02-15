@@ -66,3 +66,26 @@ pub struct PipelineStageRun {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct EmbeddingBackfillRun {
+    pub id: i64,
+    pub scope: String,
+    pub list_key: Option<String>,
+    pub from_seen_at: Option<DateTime<Utc>>,
+    pub to_seen_at: Option<DateTime<Utc>>,
+    pub state: String,
+    pub model_key: String,
+    pub cursor_id: i64,
+    pub total_candidates: i64,
+    pub processed_count: i64,
+    pub embedded_count: i64,
+    pub failed_count: i64,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub progress_json: serde_json::Value,
+    pub result_json: Option<serde_json::Value>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}

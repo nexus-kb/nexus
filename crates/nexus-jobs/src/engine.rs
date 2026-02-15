@@ -5,8 +5,8 @@ use std::time::Duration;
 use chrono::Utc;
 use nexus_core::config::Settings;
 use nexus_db::{
-    CatalogStore, Db, IngestStore, Job, JobState, JobStore, JobStoreMetrics, LineageStore,
-    PipelineStore, RetryDecision, SearchStore, ThreadingStore,
+    CatalogStore, Db, EmbeddingsStore, IngestStore, Job, JobState, JobStore, JobStoreMetrics,
+    LineageStore, PipelineStore, RetryDecision, SearchStore, ThreadingStore,
 };
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
@@ -84,6 +84,7 @@ impl Phase0Worker {
         let lineage = LineageStore::new(db.pool().clone());
         let pipeline = PipelineStore::new(db.pool().clone());
         let search = SearchStore::new(db.pool().clone());
+        let embeddings = EmbeddingsStore::new(db.pool().clone());
         let handler = Phase0JobHandler::new(
             settings.clone(),
             catalog,
@@ -92,6 +93,7 @@ impl Phase0Worker {
             lineage,
             pipeline,
             search,
+            embeddings,
             jobs.clone(),
         );
         let cfg = WorkerConfig::from(&settings.worker);

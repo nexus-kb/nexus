@@ -275,7 +275,7 @@ impl SearchStore {
             snippets AS (
                 SELECT
                     tm.thread_id,
-                    STRING_AGG(LEFT((COALESCE(mb.search_text, '') || ''), 400), ' ' ORDER BY tm.sort_key) AS snippet_corpus,
+                    STRING_AGG(nexus_safe_prefix(mb.search_text, 400), ' ' ORDER BY tm.sort_key) AS snippet_corpus,
                     BOOL_OR(mb.has_diff) AS has_diff
                 FROM thread_messages tm
                 JOIN targets t

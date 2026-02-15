@@ -8,8 +8,8 @@ use std::fmt::Write as _;
 use crate::{MailingListRepo, Result};
 
 const COPY_NULL_SENTINEL: &str = "\u{001f}NEXUS_NULL\u{001f}";
-const COPY_VALIDATION_SAMPLE_LIMIT: usize = 4_000;
-const COPY_VALIDATION_OFFENDER_LIMIT: usize = 5;
+const UTF8_INTEGRITY_SAMPLE_LIMIT: usize = 4_000;
+const UTF8_INTEGRITY_OFFENDER_LIMIT: usize = 5;
 
 #[derive(Debug, Clone)]
 pub struct ParsedBodyInput {
@@ -495,6 +495,8 @@ impl IngestStore {
         message_pks.sort_unstable();
         message_pks.dedup();
 
+        validate_text_integrity(&mut tx, &message_pks).await?;
+
         tx.commit().await?;
 
         Ok(BatchWriteOutcome {
@@ -790,7 +792,7 @@ impl IngestStore {
         message_pks.sort_unstable();
         message_pks.dedup();
 
-        validate_copy_text_integrity(&mut tx, &message_pks).await?;
+        validate_text_integrity(&mut tx, &message_pks).await?;
 
         tx.commit().await?;
 
@@ -1053,7 +1055,7 @@ fn encode_text_array(values: &[String]) -> String {
     out
 }
 
-async fn validate_copy_text_integrity(
+async fn validate_text_integrity(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     message_pks: &[i64],
 ) -> Result<()> {
@@ -1064,17 +1066,17 @@ async fn validate_copy_text_integrity(
     let mut sample = message_pks.to_vec();
     sample.sort_unstable();
     sample.dedup();
-    if sample.len() > COPY_VALIDATION_SAMPLE_LIMIT {
-        sample.truncate(COPY_VALIDATION_SAMPLE_LIMIT);
+    if sample.len() > UTF8_INTEGRITY_SAMPLE_LIMIT {
+        sample.truncate(UTF8_INTEGRITY_SAMPLE_LIMIT);
     }
 
-    let probe_error = match run_copy_validation_probe(tx, &sample).await {
+    let probe_error = match run_text_integrity_probe(tx, &sample).await {
         Ok(()) => return Ok(()),
         Err(err) => err,
     };
 
     let offenders =
-        collect_copy_validation_offenders(tx, &sample, COPY_VALIDATION_OFFENDER_LIMIT).await?;
+        collect_text_integrity_offenders(tx, &sample, UTF8_INTEGRITY_OFFENDER_LIMIT).await?;
     let offenders_text = if offenders.is_empty() {
         "none".to_string()
     } else {
@@ -1086,14 +1088,14 @@ async fn validate_copy_text_integrity(
     };
 
     Err(protocol_error(format!(
-        "copy text validation failed: sampled_ids={} offenders=[{}] probe_error={}",
+        "utf8 integrity validation failed: stage=text_integrity_probe sampled_ids={} offenders=[{}] probe_error={}",
         sample.len(),
         offenders_text,
         probe_error
     )))
 }
 
-async fn run_copy_validation_probe(
+async fn run_text_integrity_probe(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     message_pks: &[i64],
 ) -> Result<()> {
@@ -1105,9 +1107,9 @@ async fn run_copy_validation_probe(
         r#"SELECT
             m.id,
             m.body_id,
-            LENGTH(LEFT((COALESCE(mb.search_text, '') || ''), 256)),
-            LENGTH(LEFT(COALESCE(m.from_email, ''), 128)),
-            LENGTH(LEFT(COALESCE(m.subject_norm, ''), 256))
+            LENGTH(nexus_safe_prefix(mb.search_text, 256)),
+            LENGTH(nexus_safe_prefix(m.from_email, 128)),
+            LENGTH(nexus_safe_prefix(m.subject_norm, 256))
         FROM messages m
         JOIN message_bodies mb
           ON mb.id = m.body_id
@@ -1139,7 +1141,7 @@ async fn run_copy_validation_probe(
     }
 }
 
-async fn collect_copy_validation_offenders(
+async fn collect_text_integrity_offenders(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     message_pks: &[i64],
     max_offenders: usize,
@@ -1159,9 +1161,9 @@ async fn collect_copy_validation_offenders(
             .await?;
         let check_result = sqlx::query(
             r#"SELECT
-                LENGTH(LEFT((COALESCE(mb.search_text, '') || ''), 256)),
-                LENGTH(LEFT(COALESCE(m.from_email, ''), 128)),
-                LENGTH(LEFT(COALESCE(m.subject_norm, ''), 256))
+                LENGTH(nexus_safe_prefix(mb.search_text, 256)),
+                LENGTH(nexus_safe_prefix(m.from_email, 128)),
+                LENGTH(nexus_safe_prefix(m.subject_norm, 256))
             FROM messages m
             JOIN message_bodies mb
               ON mb.id = m.body_id

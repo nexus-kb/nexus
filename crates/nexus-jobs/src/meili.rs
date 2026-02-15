@@ -204,6 +204,7 @@ pub fn settings_differ(current: Option<&Value>, target: &Value) -> bool {
         "sortableAttributes",
         "displayedAttributes",
         "rankingRules",
+        "embedders",
     ] {
         if current.get(key) != target.get(key) {
             return true;

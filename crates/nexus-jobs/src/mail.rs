@@ -19,6 +19,8 @@ pub enum ParseEmailError {
     MissingMessageId,
     #[error("missing author email")]
     MissingAuthorEmail,
+    #[error("sanitization invariant violation: {0}")]
+    SanitizationInvariantViolation(&'static str),
 }
 
 #[derive(Debug, Clone)]
@@ -195,7 +197,7 @@ pub fn parse_email(raw_rfc822: &[u8]) -> Result<ParseOutcome, ParseEmailError> {
         diff_text.as_deref(),
     );
 
-    Ok(ParseOutcome {
+    let outcome = ParseOutcome {
         content_hash_sha256,
         subject_raw,
         subject_norm,
@@ -214,7 +216,9 @@ pub fn parse_email(raw_rfc822: &[u8]) -> Result<ParseOutcome, ParseEmailError> {
         search_text,
         has_diff,
         has_attachments,
-    })
+    };
+    assert_parse_outcome_invariants(&outcome)?;
+    Ok(outcome)
 }
 
 fn build_search_text(subject: &str, from: &str, body: Option<&str>, diff: Option<&str>) -> String {
@@ -302,6 +306,60 @@ fn sanitize_email(value: &str) -> String {
         .trim_matches('>')
         .trim_matches('"')
         .to_ascii_lowercase()
+}
+
+fn assert_parse_outcome_invariants(outcome: &ParseOutcome) -> Result<(), ParseEmailError> {
+    for (field, value) in [
+        ("subject_raw", outcome.subject_raw.as_str()),
+        ("subject_norm", outcome.subject_norm.as_str()),
+        ("from_email", outcome.from_email.as_str()),
+        ("message_id_primary", outcome.message_id_primary.as_str()),
+        ("search_text", outcome.search_text.as_str()),
+    ] {
+        assert_text_invariant(field, value)?;
+    }
+
+    if let Some(value) = outcome.from_name.as_deref() {
+        assert_text_invariant("from_name", value)?;
+    }
+    if let Some(value) = outcome.to_raw.as_deref() {
+        assert_text_invariant("to_raw", value)?;
+    }
+    if let Some(value) = outcome.cc_raw.as_deref() {
+        assert_text_invariant("cc_raw", value)?;
+    }
+    if let Some(value) = outcome.body_text.as_deref() {
+        assert_text_invariant("body_text", value)?;
+    }
+    if let Some(value) = outcome.diff_text.as_deref() {
+        assert_text_invariant("diff_text", value)?;
+    }
+    if let Some(value) = outcome.mime_type.as_deref() {
+        assert_text_invariant("mime_type", value)?;
+    }
+
+    for value in &outcome.message_ids {
+        assert_text_invariant("message_ids", value)?;
+    }
+    for value in &outcome.in_reply_to_ids {
+        assert_text_invariant("in_reply_to_ids", value)?;
+    }
+    for value in &outcome.references_ids {
+        assert_text_invariant("references_ids", value)?;
+    }
+
+    Ok(())
+}
+
+fn assert_text_invariant(field: &'static str, value: &str) -> Result<(), ParseEmailError> {
+    if value.chars().any(is_disallowed_char) {
+        return Err(ParseEmailError::SanitizationInvariantViolation(field));
+    }
+    Ok(())
+}
+
+fn is_disallowed_char(ch: char) -> bool {
+    ch == '\0' || (ch.is_control() && ch != '\n' && ch != '\t')
 }
 
 fn normalize_subject(subject: &str) -> String {
@@ -621,5 +679,14 @@ mod tests {
             Some("hello Привет \ncafé\tline")
         );
         assert!(parsed.search_text.contains("Привет"));
+    }
+
+    #[test]
+    fn sanitization_invariant_rejects_disallowed_controls() {
+        assert!(super::is_disallowed_char('\u{0001}'));
+        assert!(super::is_disallowed_char('\0'));
+        assert!(!super::is_disallowed_char('\n'));
+        assert!(!super::is_disallowed_char('\t'));
+        assert!(!super::is_disallowed_char('é'));
     }
 }
