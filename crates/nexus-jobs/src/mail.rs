@@ -159,8 +159,9 @@ pub fn parse_email(raw_rfc822: &[u8]) -> Result<ParseOutcome, ParseEmailError> {
     let diff_text = if diff_parts.is_empty() {
         None
     } else {
-        Some(diff_parts.join("\n"))
-    };
+        Some(sanitize_text(&diff_parts.join("\n")))
+    }
+    .filter(|v| !v.is_empty());
 
     let has_diff = diff_text
         .as_ref()
@@ -228,11 +229,10 @@ fn build_search_text(subject: &str, from: &str, body: Option<&str>, diff: Option
 }
 
 fn limit_for_search(text: &str, limit: usize) -> String {
-    if text.len() <= limit {
-        text.to_string()
-    } else {
-        text[..limit].to_string()
+    if limit == 0 {
+        return String::new();
     }
+    text.chars().take(limit).collect()
 }
 
 fn collect_mail_parts<'a, F>(part: &'a ParsedMail<'a>, callback: &mut F)
@@ -283,7 +283,17 @@ fn parse_date(raw: &str) -> Option<DateTime<Utc>> {
 }
 
 fn sanitize_text(value: &str) -> String {
-    value.replace('\0', "").trim().to_string()
+    let normalized = normalize_line_endings(value);
+    let mut out = String::with_capacity(normalized.len());
+    for ch in normalized.chars() {
+        if ch == '\0' {
+            continue;
+        }
+        if ch == '\n' || ch == '\t' || !ch.is_control() {
+            out.push(ch);
+        }
+    }
+    out.trim().to_string()
 }
 
 fn sanitize_email(value: &str) -> String {
@@ -439,7 +449,10 @@ fn dedupe_preserve_order(ids: Vec<String>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ContentHashInput, compute_content_hash, normalize_message_id_token, parse_email};
+    use super::{
+        ContentHashInput, compute_content_hash, limit_for_search, normalize_message_id_token,
+        parse_email, sanitize_text,
+    };
 
     #[test]
     fn hash_normalizes_line_endings_and_trailing_whitespace() {
@@ -571,5 +584,42 @@ mod tests {
             parsed.references_ids,
             vec!["parent@example.com".to_string()]
         );
+    }
+
+    #[test]
+    fn sanitize_text_removes_controls_and_normalizes_line_endings() {
+        let input = "  a\0b\r\nc\rd\tz\u{0007}\u{0085}  ";
+        assert_eq!(sanitize_text(input), "ab\nc\nd\tz");
+    }
+
+    #[test]
+    fn limit_for_search_truncates_on_char_boundaries() {
+        let input = "🙂épatch";
+        assert_eq!(limit_for_search(input, 1), "🙂");
+        assert_eq!(limit_for_search(input, 2), "🙂é");
+        assert_eq!(limit_for_search(input, 6), "🙂épatc");
+    }
+
+    #[test]
+    fn parser_keeps_unicode_body_text_while_dropping_controls() {
+        let raw = concat!(
+            "From: Alice <alice@example.com>\r\n",
+            "Message-ID: <utf8@example.com>\r\n",
+            "Date: Tue, 1 Jan 2024 00:00:00 +0000\r\n",
+            "Subject: [PATCH] utf8 body\r\n",
+            "Content-Type: text/plain; charset=utf-8\r\n",
+            "\r\n",
+            "hello Привет \u{0007}\r\n",
+            "café\tline\r\n"
+        )
+        .as_bytes()
+        .to_vec();
+
+        let parsed = parse_email(&raw).expect("parse should succeed");
+        assert_eq!(
+            parsed.body_text.as_deref(),
+            Some("hello Привет \ncafé\tline")
+        );
+        assert!(parsed.search_text.contains("Привет"));
     }
 }

@@ -6,7 +6,7 @@ use chrono::Utc;
 use nexus_core::config::Settings;
 use nexus_db::{
     CatalogStore, Db, IngestStore, Job, JobState, JobStore, JobStoreMetrics, LineageStore,
-    RetryDecision, ThreadingStore,
+    PipelineStore, RetryDecision, SearchStore, ThreadingStore,
 };
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
@@ -82,12 +82,16 @@ impl Phase0Worker {
         let ingest = IngestStore::new(db.pool().clone());
         let threading = ThreadingStore::new(db.pool().clone());
         let lineage = LineageStore::new(db.pool().clone());
+        let pipeline = PipelineStore::new(db.pool().clone());
+        let search = SearchStore::new(db.pool().clone());
         let handler = Phase0JobHandler::new(
             settings.clone(),
             catalog,
             ingest,
             threading,
             lineage,
+            pipeline,
+            search,
             jobs.clone(),
         );
         let cfg = WorkerConfig::from(&settings.worker);
@@ -347,7 +351,10 @@ impl Phase0Worker {
 }
 
 fn is_ingest_job_type(job_type: &str) -> bool {
-    matches!(job_type, "ingest_commit_batch" | "repo_ingest_run")
+    matches!(
+        job_type,
+        "ingest_commit_batch" | "repo_ingest_run" | "pipeline_stage_ingest"
+    )
 }
 
 fn metrics_to_json(metrics: JobStoreMetrics) -> serde_json::Value {

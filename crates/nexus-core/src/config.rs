@@ -103,6 +103,14 @@ pub enum IngestWriteMode {
     BatchedSql,
 }
 
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PipelineExecutionMode {
+    Legacy,
+    #[default]
+    Staged,
+}
+
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct WorkerConfig {
     #[serde(default = "default_worker_poll_ms")]
@@ -123,6 +131,12 @@ pub struct WorkerConfig {
     pub backfill_mode: BackfillMode,
     #[serde(default = "default_worker_ingest_parse_concurrency")]
     pub ingest_parse_concurrency: usize,
+    #[serde(default = "default_worker_ingest_parse_cpu_ratio")]
+    pub ingest_parse_cpu_ratio: f64,
+    #[serde(default = "default_worker_ingest_parse_workers_min")]
+    pub ingest_parse_workers_min: usize,
+    #[serde(default = "default_worker_ingest_parse_workers_max")]
+    pub ingest_parse_workers_max: usize,
     #[serde(default = "default_worker_max_inflight_jobs")]
     pub max_inflight_jobs: usize,
     #[serde(default = "default_worker_max_inflight_ingest_jobs")]
@@ -131,6 +145,10 @@ pub struct WorkerConfig {
     pub backfill_batch_size: usize,
     #[serde(default = "default_worker_ingest_write_mode")]
     pub ingest_write_mode: IngestWriteMode,
+    #[serde(default = "default_worker_pipeline_execution_mode")]
+    pub pipeline_execution_mode: PipelineExecutionMode,
+    #[serde(default = "default_worker_stage_search_parallelism")]
+    pub stage_search_parallelism: usize,
     #[serde(default)]
     pub db_relaxed_durability: bool,
 }
@@ -171,6 +189,18 @@ fn default_worker_ingest_parse_concurrency() -> usize {
     8
 }
 
+fn default_worker_ingest_parse_cpu_ratio() -> f64 {
+    0.6
+}
+
+fn default_worker_ingest_parse_workers_min() -> usize {
+    2
+}
+
+fn default_worker_ingest_parse_workers_max() -> usize {
+    32
+}
+
 fn default_worker_max_inflight_jobs() -> usize {
     1
 }
@@ -185,6 +215,14 @@ fn default_worker_backfill_batch_size() -> usize {
 
 fn default_worker_ingest_write_mode() -> IngestWriteMode {
     IngestWriteMode::Copy
+}
+
+fn default_worker_pipeline_execution_mode() -> PipelineExecutionMode {
+    PipelineExecutionMode::Staged
+}
+
+fn default_worker_stage_search_parallelism() -> usize {
+    2
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -260,6 +298,21 @@ pub fn load() -> Result<Settings, crate::Error> {
     if settings.worker.ingest_parse_concurrency == 0 {
         settings.worker.ingest_parse_concurrency = default_worker_ingest_parse_concurrency();
     }
+    if !settings.worker.ingest_parse_cpu_ratio.is_finite()
+        || settings.worker.ingest_parse_cpu_ratio <= 0.0
+        || settings.worker.ingest_parse_cpu_ratio > 1.0
+    {
+        settings.worker.ingest_parse_cpu_ratio = default_worker_ingest_parse_cpu_ratio();
+    }
+    if settings.worker.ingest_parse_workers_min == 0 {
+        settings.worker.ingest_parse_workers_min = default_worker_ingest_parse_workers_min();
+    }
+    if settings.worker.ingest_parse_workers_max == 0 {
+        settings.worker.ingest_parse_workers_max = default_worker_ingest_parse_workers_max();
+    }
+    if settings.worker.ingest_parse_workers_min > settings.worker.ingest_parse_workers_max {
+        settings.worker.ingest_parse_workers_min = settings.worker.ingest_parse_workers_max;
+    }
     if settings.worker.max_inflight_jobs == 0 {
         settings.worker.max_inflight_jobs = default_worker_max_inflight_jobs();
     }
@@ -271,6 +324,9 @@ pub fn load() -> Result<Settings, crate::Error> {
     }
     if settings.worker.backfill_batch_size == 0 {
         settings.worker.backfill_batch_size = default_worker_backfill_batch_size();
+    }
+    if settings.worker.stage_search_parallelism == 0 {
+        settings.worker.stage_search_parallelism = default_worker_stage_search_parallelism();
     }
 
     Ok(settings)

@@ -52,6 +52,7 @@ pub fn build_router(state: ApiState) -> Router {
             "/series/{series_id}/versions/{series_version_id}/export/mbox",
             get(public::series_version_export_mbox),
         )
+        .route("/search", get(public::search))
         .route("/{*path}", options(preflight_options));
 
     let admin_routes = Router::new()
@@ -62,6 +63,8 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/jobs/{job_id}/retry", post(admin::retry_job))
         .route("/ingest/sync", post(admin::ingest_sync))
         .route("/ingest/reset-watermark", post(admin::reset_watermark))
+        .route("/pipeline/runs", get(admin::list_pipeline_runs))
+        .route("/pipeline/runs/{run_id}", get(admin::get_pipeline_run))
         .route("/threading/rebuild", post(admin::threading_rebuild))
         .route("/lineage/rebuild", post(admin::lineage_rebuild))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_admin));

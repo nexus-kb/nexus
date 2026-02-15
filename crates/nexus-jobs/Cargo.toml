@@ -21,3 +21,4 @@ once_cell = { workspace = true }
 gix = { workspace = true }
 sha2 = { workspace = true }
 anyhow = { workspace = true }
+reqwest = { workspace = true }

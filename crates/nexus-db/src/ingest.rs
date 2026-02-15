@@ -1,9 +1,15 @@
 use chrono::{DateTime, Utc};
+use csv::{QuoteStyle, Terminator, WriterBuilder};
 use sqlx::{PgPool, Postgres, QueryBuilder};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 use crate::{MailingListRepo, Result};
+
+const COPY_NULL_SENTINEL: &str = "\u{001f}NEXUS_NULL\u{001f}";
+const COPY_VALIDATION_SAMPLE_LIMIT: usize = 4_000;
+const COPY_VALIDATION_OFFENDER_LIMIT: usize = 5;
 
 #[derive(Debug, Clone)]
 pub struct ParsedBodyInput {
@@ -730,22 +736,24 @@ impl IngestStore {
         }
 
         if !body_rows.is_empty() {
+            let payload = build_message_bodies_copy_payload(&body_rows)?;
             copy_into_table(
                 &mut tx,
                 "COPY message_bodies (id, raw_rfc822, body_text, diff_text, search_text, has_diff, has_attachments) \
                  FROM STDIN WITH (FORMAT CSV, NULL '\\N')",
-                build_message_bodies_copy_payload(&body_rows),
+                payload,
             )
             .await?;
         }
 
         if !message_rows.is_empty() {
+            let payload = build_messages_copy_payload(&message_rows)?;
             copy_into_table(
                 &mut tx,
                 "COPY messages (id, content_hash_sha256, subject_raw, subject_norm, from_name, from_email, \
                  date_utc, to_raw, cc_raw, message_ids, message_id_primary, in_reply_to_ids, references_ids, \
                  mime_type, body_id) FROM STDIN WITH (FORMAT CSV, NULL '\\N')",
-                build_messages_copy_payload(&message_rows),
+                payload,
             )
             .await?;
         }
@@ -755,11 +763,12 @@ impl IngestStore {
         }
 
         if !message_id_insert_rows.is_empty() {
+            let payload = build_message_id_copy_payload(&message_id_insert_rows)?;
             copy_into_table(
                 &mut tx,
                 "COPY message_id_map (message_id, message_pk, is_primary) \
                  FROM STDIN WITH (FORMAT CSV, NULL '\\N')",
-                build_message_id_copy_payload(&message_id_insert_rows),
+                payload,
             )
             .await?;
         }
@@ -767,11 +776,12 @@ impl IngestStore {
         let inserted_instances = if instance_rows.is_empty() {
             0
         } else {
+            let payload = build_instances_copy_payload(&instance_rows)?;
             copy_into_table(
                 &mut tx,
                 "COPY list_message_instances (mailing_list_id, message_pk, repo_id, git_commit_oid) \
                  FROM STDIN WITH (FORMAT CSV, NULL '\\N')",
-                build_instances_copy_payload(&instance_rows),
+                payload,
             )
             .await?
         };
@@ -779,6 +789,8 @@ impl IngestStore {
         let mut message_pks: Vec<i64> = message_pk_by_commit.values().copied().collect();
         message_pks.sort_unstable();
         message_pks.dedup();
+
+        validate_copy_text_integrity(&mut tx, &message_pks).await?;
 
         tx.commit().await?;
 
@@ -863,120 +875,149 @@ async fn reserve_ids(
 async fn copy_into_table(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     statement: &str,
-    payload: String,
+    payload: Vec<u8>,
 ) -> Result<u64> {
     if payload.is_empty() {
         return Ok(0);
     }
 
     let mut copy = (&mut **tx).copy_in_raw(statement).await?;
-    copy.send(payload.as_bytes()).await?;
+    copy.send(payload).await?;
     copy.finish().await
 }
 
-fn build_message_bodies_copy_payload(rows: &[CopyMessageBodyRow]) -> String {
-    let mut out = String::new();
+fn build_message_bodies_copy_payload(rows: &[CopyMessageBodyRow]) -> Result<Vec<u8>> {
+    let mut writer = make_copy_writer();
     for row in rows {
-        let fields = [
-            row.id.to_string(),
-            encode_bytea_hex(&row.raw_rfc822),
-            encode_nullable_text(row.body_text.as_deref()),
-            encode_nullable_text(row.diff_text.as_deref()),
-            encode_nullable_text(Some(&row.search_text)),
-            encode_bool(row.has_diff),
-            encode_bool(row.has_attachments),
-        ];
-        out.push_str(&fields.join(","));
-        out.push('\n');
+        let id = row.id.to_string();
+        let raw_rfc822 = encode_bytea_hex(&row.raw_rfc822);
+        write_copy_record(
+            &mut writer,
+            [
+                Some(Cow::Owned(id)),
+                Some(Cow::Owned(raw_rfc822)),
+                row.body_text.as_deref().map(Cow::Borrowed),
+                row.diff_text.as_deref().map(Cow::Borrowed),
+                Some(Cow::Borrowed(row.search_text.as_str())),
+                Some(Cow::Borrowed(encode_bool(row.has_diff))),
+                Some(Cow::Borrowed(encode_bool(row.has_attachments))),
+            ],
+        )?;
     }
-    out
+    finish_copy_payload(writer)
 }
 
-fn build_messages_copy_payload(rows: &[CopyMessageRow]) -> String {
-    let mut out = String::new();
+fn build_messages_copy_payload(rows: &[CopyMessageRow]) -> Result<Vec<u8>> {
+    let mut writer = make_copy_writer();
     for row in rows {
-        let fields = [
-            row.id.to_string(),
-            encode_bytea_hex(&row.content_hash_sha256),
-            encode_nullable_text(Some(&row.subject_raw)),
-            encode_nullable_text(Some(&row.subject_norm)),
-            encode_nullable_text(row.from_name.as_deref()),
-            encode_nullable_text(Some(&row.from_email)),
-            encode_nullable_datetime(row.date_utc),
-            encode_nullable_text(row.to_raw.as_deref()),
-            encode_nullable_text(row.cc_raw.as_deref()),
-            encode_nullable_text(Some(&encode_text_array(&row.message_ids))),
-            encode_nullable_text(Some(&row.message_id_primary)),
-            encode_nullable_text(Some(&encode_text_array(&row.in_reply_to_ids))),
-            encode_nullable_text(Some(&encode_text_array(&row.references_ids))),
-            encode_nullable_text(row.mime_type.as_deref()),
-            row.body_id.to_string(),
-        ];
-        out.push_str(&fields.join(","));
-        out.push('\n');
+        let id = row.id.to_string();
+        let content_hash = encode_bytea_hex(&row.content_hash_sha256);
+        let date_utc = encode_nullable_datetime(row.date_utc);
+        let message_ids = encode_text_array(&row.message_ids);
+        let in_reply_to_ids = encode_text_array(&row.in_reply_to_ids);
+        let references_ids = encode_text_array(&row.references_ids);
+        let body_id = row.body_id.to_string();
+        write_copy_record(
+            &mut writer,
+            [
+                Some(Cow::Owned(id)),
+                Some(Cow::Owned(content_hash)),
+                Some(Cow::Borrowed(row.subject_raw.as_str())),
+                Some(Cow::Borrowed(row.subject_norm.as_str())),
+                row.from_name.as_deref().map(Cow::Borrowed),
+                Some(Cow::Borrowed(row.from_email.as_str())),
+                date_utc.as_deref().map(Cow::Borrowed),
+                row.to_raw.as_deref().map(Cow::Borrowed),
+                row.cc_raw.as_deref().map(Cow::Borrowed),
+                Some(Cow::Owned(message_ids)),
+                Some(Cow::Borrowed(row.message_id_primary.as_str())),
+                Some(Cow::Owned(in_reply_to_ids)),
+                Some(Cow::Owned(references_ids)),
+                row.mime_type.as_deref().map(Cow::Borrowed),
+                Some(Cow::Owned(body_id)),
+            ],
+        )?;
     }
-    out
+    finish_copy_payload(writer)
 }
 
-fn build_message_id_copy_payload(rows: &[CopyMessageIdRow]) -> String {
-    let mut out = String::new();
+fn build_message_id_copy_payload(rows: &[CopyMessageIdRow]) -> Result<Vec<u8>> {
+    let mut writer = make_copy_writer();
     for row in rows {
-        let fields = [
-            encode_nullable_text(Some(&row.message_id)),
-            row.message_pk.to_string(),
-            encode_bool(row.is_primary),
-        ];
-        out.push_str(&fields.join(","));
-        out.push('\n');
+        let message_pk = row.message_pk.to_string();
+        write_copy_record(
+            &mut writer,
+            [
+                Some(Cow::Borrowed(row.message_id.as_str())),
+                Some(Cow::Owned(message_pk)),
+                Some(Cow::Borrowed(encode_bool(row.is_primary))),
+            ],
+        )?;
     }
-    out
+    finish_copy_payload(writer)
 }
 
-fn build_instances_copy_payload(rows: &[CopyInstanceRow]) -> String {
-    let mut out = String::new();
+fn build_instances_copy_payload(rows: &[CopyInstanceRow]) -> Result<Vec<u8>> {
+    let mut writer = make_copy_writer();
     for row in rows {
-        let fields = [
-            row.mailing_list_id.to_string(),
-            row.message_pk.to_string(),
-            row.repo_id.to_string(),
-            encode_nullable_text(Some(&row.git_commit_oid)),
-        ];
-        out.push_str(&fields.join(","));
-        out.push('\n');
+        let mailing_list_id = row.mailing_list_id.to_string();
+        let message_pk = row.message_pk.to_string();
+        let repo_id = row.repo_id.to_string();
+        write_copy_record(
+            &mut writer,
+            [
+                Some(Cow::Owned(mailing_list_id)),
+                Some(Cow::Owned(message_pk)),
+                Some(Cow::Owned(repo_id)),
+                Some(Cow::Borrowed(row.git_commit_oid.as_str())),
+            ],
+        )?;
     }
-    out
+    finish_copy_payload(writer)
 }
 
-fn encode_nullable_text(value: Option<&str>) -> String {
-    match value {
-        Some(v) => {
-            let mut escaped = String::with_capacity(v.len() + 2);
-            escaped.push('"');
-            for ch in v.chars() {
-                if ch == '"' {
-                    escaped.push('"');
-                }
-                escaped.push(ch);
-            }
-            escaped.push('"');
-            escaped
-        }
-        None => "\\N".to_string(),
-    }
+fn make_copy_writer() -> csv::Writer<Vec<u8>> {
+    WriterBuilder::new()
+        .has_headers(false)
+        .quote_style(QuoteStyle::Always)
+        .terminator(Terminator::Any(b'\n'))
+        .from_writer(Vec::new())
 }
 
-fn encode_nullable_datetime(value: Option<DateTime<Utc>>) -> String {
-    value
-        .map(|v| encode_nullable_text(Some(&v.to_rfc3339())))
-        .unwrap_or_else(|| "\\N".to_string())
+fn write_copy_record<'a, const N: usize>(
+    writer: &mut csv::Writer<Vec<u8>>,
+    fields: [Option<Cow<'a, str>>; N],
+) -> Result<()> {
+    let encoded_fields: Vec<Cow<'a, str>> = fields
+        .into_iter()
+        .map(|field| field.unwrap_or_else(|| Cow::Borrowed(COPY_NULL_SENTINEL)))
+        .collect();
+    writer
+        .write_record(encoded_fields.iter().map(|value| value.as_ref()))
+        .map_err(|err| protocol_error(format!("failed to encode COPY row as CSV: {err}")))?;
+    Ok(())
 }
 
-fn encode_bool(value: bool) -> String {
-    if value {
-        "t".to_string()
-    } else {
-        "f".to_string()
-    }
+fn finish_copy_payload(writer: csv::Writer<Vec<u8>>) -> Result<Vec<u8>> {
+    let payload = writer.into_inner().map_err(|err| {
+        protocol_error(format!("failed to finalize COPY payload: {}", err.error()))
+    })?;
+    let quoted_sentinel = format!("\"{COPY_NULL_SENTINEL}\"");
+    let payload = String::from_utf8(payload)
+        .map_err(|err| protocol_error(format!("COPY payload is not UTF-8: {err}")))?;
+    Ok(payload.replace(&quoted_sentinel, "\\N").into_bytes())
+}
+
+fn protocol_error(message: String) -> sqlx::Error {
+    sqlx::Error::Protocol(message)
+}
+
+fn encode_nullable_datetime(value: Option<DateTime<Utc>>) -> Option<String> {
+    value.map(|v| v.to_rfc3339())
+}
+
+fn encode_bool(value: bool) -> &'static str {
+    if value { "t" } else { "f" }
 }
 
 fn encode_bytea_hex(bytes: &[u8]) -> String {
@@ -986,7 +1027,7 @@ fn encode_bytea_hex(bytes: &[u8]) -> String {
     for byte in bytes {
         let _ = write!(&mut text, "{byte:02x}");
     }
-    encode_nullable_text(Some(&text))
+    text
 }
 
 fn encode_text_array(values: &[String]) -> String {
@@ -1010,6 +1051,150 @@ fn encode_text_array(values: &[String]) -> String {
     }
     out.push('}');
     out
+}
+
+async fn validate_copy_text_integrity(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    message_pks: &[i64],
+) -> Result<()> {
+    if message_pks.is_empty() {
+        return Ok(());
+    }
+
+    let mut sample = message_pks.to_vec();
+    sample.sort_unstable();
+    sample.dedup();
+    if sample.len() > COPY_VALIDATION_SAMPLE_LIMIT {
+        sample.truncate(COPY_VALIDATION_SAMPLE_LIMIT);
+    }
+
+    let probe_error = match run_copy_validation_probe(tx, &sample).await {
+        Ok(()) => return Ok(()),
+        Err(err) => err,
+    };
+
+    let offenders =
+        collect_copy_validation_offenders(tx, &sample, COPY_VALIDATION_OFFENDER_LIMIT).await?;
+    let offenders_text = if offenders.is_empty() {
+        "none".to_string()
+    } else {
+        offenders
+            .iter()
+            .map(|(message_pk, body_id)| format!("message_pk={message_pk} body_id={body_id:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    Err(protocol_error(format!(
+        "copy text validation failed: sampled_ids={} offenders=[{}] probe_error={}",
+        sample.len(),
+        offenders_text,
+        probe_error
+    )))
+}
+
+async fn run_copy_validation_probe(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    message_pks: &[i64],
+) -> Result<()> {
+    sqlx::query("SAVEPOINT copy_validate_probe")
+        .execute(&mut **tx)
+        .await?;
+
+    let probe = sqlx::query(
+        r#"SELECT
+            m.id,
+            m.body_id,
+            LENGTH(LEFT((COALESCE(mb.search_text, '') || ''), 256)),
+            LENGTH(LEFT(COALESCE(m.from_email, ''), 128)),
+            LENGTH(LEFT(COALESCE(m.subject_norm, ''), 256))
+        FROM messages m
+        JOIN message_bodies mb
+          ON mb.id = m.body_id
+        WHERE m.id = ANY($1)
+        ORDER BY m.id
+        LIMIT $2"#,
+    )
+    .bind(message_pks)
+    .bind(message_pks.len() as i64)
+    .fetch_all(&mut **tx)
+    .await;
+
+    match probe {
+        Ok(_) => {
+            sqlx::query("RELEASE SAVEPOINT copy_validate_probe")
+                .execute(&mut **tx)
+                .await?;
+            Ok(())
+        }
+        Err(err) => {
+            sqlx::query("ROLLBACK TO SAVEPOINT copy_validate_probe")
+                .execute(&mut **tx)
+                .await?;
+            sqlx::query("RELEASE SAVEPOINT copy_validate_probe")
+                .execute(&mut **tx)
+                .await?;
+            Err(err)
+        }
+    }
+}
+
+async fn collect_copy_validation_offenders(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    message_pks: &[i64],
+    max_offenders: usize,
+) -> Result<Vec<(i64, Option<i64>)>> {
+    if max_offenders == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut offenders = Vec::new();
+    for message_pk in message_pks {
+        if offenders.len() >= max_offenders {
+            break;
+        }
+
+        sqlx::query("SAVEPOINT copy_validate_row")
+            .execute(&mut **tx)
+            .await?;
+        let check_result = sqlx::query(
+            r#"SELECT
+                LENGTH(LEFT((COALESCE(mb.search_text, '') || ''), 256)),
+                LENGTH(LEFT(COALESCE(m.from_email, ''), 128)),
+                LENGTH(LEFT(COALESCE(m.subject_norm, ''), 256))
+            FROM messages m
+            JOIN message_bodies mb
+              ON mb.id = m.body_id
+            WHERE m.id = $1"#,
+        )
+        .bind(*message_pk)
+        .fetch_optional(&mut **tx)
+        .await;
+
+        match check_result {
+            Ok(_) => {
+                sqlx::query("RELEASE SAVEPOINT copy_validate_row")
+                    .execute(&mut **tx)
+                    .await?;
+            }
+            Err(_) => {
+                sqlx::query("ROLLBACK TO SAVEPOINT copy_validate_row")
+                    .execute(&mut **tx)
+                    .await?;
+                sqlx::query("RELEASE SAVEPOINT copy_validate_row")
+                    .execute(&mut **tx)
+                    .await?;
+                let body_id =
+                    sqlx::query_scalar::<_, i64>("SELECT body_id FROM messages WHERE id = $1")
+                        .bind(*message_pk)
+                        .fetch_optional(&mut **tx)
+                        .await?;
+                offenders.push((*message_pk, body_id));
+            }
+        }
+    }
+
+    Ok(offenders)
 }
 
 fn dedupe_message_id_rows(rows: Vec<(String, i64, bool)>) -> Vec<CopyMessageIdRow> {
@@ -1095,11 +1280,14 @@ async fn promote_message_id_rows(
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_bytea_hex, encode_nullable_text, encode_text_array};
+    use super::{
+        CopyMessageBodyRow, CopyMessageRow, build_message_bodies_copy_payload,
+        build_messages_copy_payload, encode_bytea_hex, encode_text_array,
+    };
 
     #[test]
     fn encode_bytea_hex_uses_postgres_hex_prefix() {
-        assert_eq!(encode_bytea_hex(&[0x00, 0x7f, 0xff]), "\"\\x007fff\"");
+        assert_eq!(encode_bytea_hex(&[0x00, 0x7f, 0xff]), "\\x007fff");
     }
 
     #[test]
@@ -1116,11 +1304,61 @@ mod tests {
     }
 
     #[test]
-    fn encode_nullable_text_handles_commas_quotes_and_newlines() {
+    fn copy_payload_handles_csv_sensitive_content_and_nulls() {
+        let payload = build_message_bodies_copy_payload(&[CopyMessageBodyRow {
+            id: 42,
+            raw_rfc822: b"hello".to_vec(),
+            body_text: Some("a,\"b\"\nline".to_string()),
+            diff_text: None,
+            search_text: "\\N".to_string(),
+            has_diff: true,
+            has_attachments: false,
+        }])
+        .expect("payload should be encoded");
+        let encoded = String::from_utf8(payload).expect("payload should be utf-8");
+        assert!(encoded.contains(",\\N,"));
+        assert!(encoded.contains("\"\\N\""));
+        assert!(encoded.contains("\"a,\"\"b\"\"\nline\""));
+    }
+
+    #[test]
+    fn copy_messages_payload_round_trips_arrays_and_bytea() {
+        let payload = build_messages_copy_payload(&[CopyMessageRow {
+            id: 7,
+            content_hash_sha256: vec![0x00, 0x7f, 0xff],
+            subject_raw: "[PATCH] csv".to_string(),
+            subject_norm: "csv".to_string(),
+            from_name: None,
+            from_email: "alice@example.com".to_string(),
+            date_utc: None,
+            to_raw: Some("list@example.com".to_string()),
+            cc_raw: None,
+            message_ids: vec![
+                "id@example.com".to_string(),
+                "with\"quote".to_string(),
+                "with\\slash".to_string(),
+            ],
+            message_id_primary: "id@example.com".to_string(),
+            in_reply_to_ids: vec!["parent@example.com".to_string()],
+            references_ids: vec!["root@example.com".to_string()],
+            mime_type: Some("text/plain".to_string()),
+            body_id: 11,
+        }])
+        .expect("payload should be encoded");
+
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .from_reader(payload.as_slice());
+        let record = reader
+            .records()
+            .next()
+            .expect("one row")
+            .expect("valid csv row");
+        assert_eq!(record.get(1), Some("\\x007fff"));
         assert_eq!(
-            encode_nullable_text(Some("a,\"b\"\nline")),
-            "\"a,\"\"b\"\"\nline\""
+            record.get(9),
+            Some("{\"id@example.com\",\"with\\\"quote\",\"with\\\\slash\"}")
         );
-        assert_eq!(encode_nullable_text(None), "\\N");
+        assert_eq!(record.get(4), Some("\\N"));
     }
 }

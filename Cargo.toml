@@ -31,6 +31,7 @@ sha2 = "0.10"
 regex = "1"
 mailparse = "0.15"
 anyhow = "1"
+csv = "1"
 
 sqlx = { version = "0.8", default-features = false, features = [
   "runtime-tokio-rustls",

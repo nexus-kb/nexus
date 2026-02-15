@@ -35,3 +35,34 @@ pub struct Job {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct PipelineRun {
+    pub id: i64,
+    pub mailing_list_id: i64,
+    pub list_key: String,
+    pub state: String,
+    pub current_stage: String,
+    pub source: String,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub ingest_window_from: Option<DateTime<Utc>>,
+    pub ingest_window_to: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct PipelineStageRun {
+    pub run_id: i64,
+    pub stage: String,
+    pub state: String,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub progress_json: serde_json::Value,
+    pub result_json: Option<serde_json::Value>,
+    pub last_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}

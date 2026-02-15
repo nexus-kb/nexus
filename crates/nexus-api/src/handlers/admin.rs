@@ -5,9 +5,11 @@ use std::path::{Path, PathBuf};
 use axum::Json;
 use axum::extract::{Path as AxumPath, Query, State};
 use chrono::{DateTime, Utc};
-use nexus_db::{EnqueueJobParams, Job, JobState, ListJobsParams};
+use nexus_core::config::PipelineExecutionMode;
+use nexus_db::{EnqueueJobParams, Job, JobState, ListJobsParams, ListPipelineRunsParams};
 use nexus_jobs::payloads::{
-    LineageRebuildListPayload, RepoScanPayload, ThreadingRebuildListPayload,
+    LineageRebuildListPayload, PipelineStageIngestPayload, RepoScanPayload,
+    ThreadingRebuildListPayload,
 };
 use serde::{Deserialize, Serialize};
 
@@ -154,6 +156,9 @@ pub struct IngestSyncQuery {
 pub struct IngestSyncResponse {
     pub queued: usize,
     pub repos: Vec<String>,
+    pub mode: String,
+    pub pipeline_run_id: Option<i64>,
+    pub current_stage: Option<String>,
 }
 
 pub async fn ingest_sync(
@@ -174,14 +179,51 @@ pub async fn ingest_sync(
         return Err(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    let mut queued = 0usize;
     for repo_relpath in &repos {
         state
             .catalog
             .ensure_repo(list.id, repo_relpath, repo_relpath)
             .await
             .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
 
+    if matches!(
+        state.settings.worker.pipeline_execution_mode,
+        PipelineExecutionMode::Staged
+    ) {
+        let run = state
+            .pipeline
+            .create_or_get_active_run(list.id, &query.list_key, "admin_ingest_sync")
+            .await
+            .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        let payload = PipelineStageIngestPayload { run_id: run.id };
+        state
+            .jobs
+            .enqueue(EnqueueJobParams {
+                job_type: "pipeline_stage_ingest".to_string(),
+                payload_json: serde_json::to_value(payload)
+                    .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?,
+                priority: 20,
+                dedupe_scope: Some(format!("list:{}:pipeline", query.list_key)),
+                dedupe_key: Some(format!("run:{}:stage:ingest", run.id)),
+                run_after: None,
+                max_attempts: Some(8),
+            })
+            .await
+            .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        return Ok(Json(IngestSyncResponse {
+            queued: 1,
+            repos,
+            mode: "staged".to_string(),
+            pipeline_run_id: Some(run.id),
+            current_stage: Some(run.current_stage),
+        }));
+    }
+
+    let mut queued = 0usize;
+    for repo_relpath in &repos {
         let payload = RepoScanPayload {
             list_key: query.list_key.clone(),
             repo_key: repo_relpath.clone(),
@@ -207,7 +249,13 @@ pub async fn ingest_sync(
         queued += 1;
     }
 
-    Ok(Json(IngestSyncResponse { queued, repos }))
+    Ok(Json(IngestSyncResponse {
+        queued,
+        repos,
+        mode: "legacy".to_string(),
+        pipeline_run_id: None,
+        current_stage: None,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -246,6 +294,20 @@ pub async fn threading_rebuild(
     State(state): State<ApiState>,
     Query(query): Query<ThreadingRebuildQuery>,
 ) -> Result<Json<EnqueueResponse>, axum::http::StatusCode> {
+    if matches!(
+        state.settings.worker.pipeline_execution_mode,
+        PipelineExecutionMode::Staged
+    ) {
+        let ingest_active = state
+            .pipeline
+            .is_list_ingest_stage_active(&query.list_key)
+            .await
+            .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+        if ingest_active {
+            return Err(axum::http::StatusCode::CONFLICT);
+        }
+    }
+
     let exists = state
         .catalog
         .get_mailing_list(&query.list_key)
@@ -308,6 +370,20 @@ pub async fn lineage_rebuild(
     State(state): State<ApiState>,
     Query(query): Query<LineageRebuildQuery>,
 ) -> Result<Json<EnqueueResponse>, axum::http::StatusCode> {
+    if matches!(
+        state.settings.worker.pipeline_execution_mode,
+        PipelineExecutionMode::Staged
+    ) {
+        let ingest_active = state
+            .pipeline
+            .is_list_ingest_stage_active(&query.list_key)
+            .await
+            .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+        if ingest_active {
+            return Err(axum::http::StatusCode::CONFLICT);
+        }
+    }
+
     let exists = state
         .catalog
         .get_mailing_list(&query.list_key)
@@ -355,6 +431,89 @@ pub async fn lineage_rebuild(
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(EnqueueResponse { job_id: job.id }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PipelineRunsQuery {
+    #[serde(default)]
+    pub list_key: Option<String>,
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default = "default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub cursor: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListPipelineRunsResponse {
+    pub items: Vec<nexus_db::PipelineRun>,
+    pub next_cursor: Option<i64>,
+}
+
+pub async fn list_pipeline_runs(
+    State(state): State<ApiState>,
+    Query(query): Query<PipelineRunsQuery>,
+) -> Result<Json<ListPipelineRunsResponse>, axum::http::StatusCode> {
+    let runs = state
+        .pipeline
+        .list_runs(ListPipelineRunsParams {
+            list_key: query.list_key,
+            state: query.state,
+            limit: query.limit.clamp(1, 200),
+            cursor: query.cursor,
+        })
+        .await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let next_cursor = if runs.len() >= query.limit.clamp(1, 200) as usize {
+        runs.last().map(|run| run.id)
+    } else {
+        None
+    };
+
+    Ok(Json(ListPipelineRunsResponse {
+        items: runs,
+        next_cursor,
+    }))
+}
+
+#[derive(Debug, Serialize)]
+pub struct PipelineRunDetailResponse {
+    pub run: nexus_db::PipelineRun,
+    pub stages: Vec<nexus_db::PipelineStageRun>,
+    pub artifacts: Vec<nexus_db::PipelineArtifactCount>,
+}
+
+pub async fn get_pipeline_run(
+    State(state): State<ApiState>,
+    AxumPath(run_id): AxumPath<i64>,
+) -> Result<Json<PipelineRunDetailResponse>, axum::http::StatusCode> {
+    let Some(run) = state
+        .pipeline
+        .get_run(run_id)
+        .await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?
+    else {
+        return Err(axum::http::StatusCode::NOT_FOUND);
+    };
+
+    let stages = state
+        .pipeline
+        .list_stage_runs(run_id)
+        .await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    let artifacts = state
+        .pipeline
+        .list_artifact_counts(run_id)
+        .await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(PipelineRunDetailResponse {
+        run,
+        stages,
+        artifacts,
+    }))
 }
 
 fn discover_repo_relpaths(list_root: &Path) -> Result<Vec<String>, std::io::Error> {

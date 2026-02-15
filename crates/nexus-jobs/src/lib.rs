@@ -2,6 +2,7 @@ mod diff_metadata;
 mod engine;
 mod lineage;
 pub mod mail;
+mod meili;
 mod patch_detect;
 mod patch_id;
 mod patch_subject;

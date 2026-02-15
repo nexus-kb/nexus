@@ -1,26 +1,34 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
+use std::fs;
 use std::path::Path;
 use std::time::Instant;
 
+use chrono::Utc;
 use gix::hash::ObjectId;
-use nexus_core::config::{BackfillMode, IngestWriteMode, Settings};
+use nexus_core::config::{BackfillMode, IngestWriteMode, PipelineExecutionMode, Settings};
+use nexus_core::search::MeiliIndexKind;
 use nexus_db::{
     CatalogStore, EnqueueJobParams, IngestCommitRow, IngestStore, Job, JobStore, JobStoreMetrics,
-    LineageStore, ParsedBodyInput, ParsedMessageInput, ThreadComponentWrite, ThreadMessageWrite,
-    ThreadNodeWrite, ThreadSummaryWrite, ThreadingApplyStats, ThreadingStore,
+    LineageStore, ParsedBodyInput, ParsedMessageInput, PipelineStore, SearchStore,
+    ThreadComponentWrite, ThreadMessageWrite, ThreadNodeWrite, ThreadSummaryWrite,
+    ThreadingApplyStats, ThreadingStore,
 };
 use sha2::{Digest, Sha256};
 use tokio::task::JoinSet;
+use tokio::time::{Duration, sleep};
 use tracing::{info, warn};
 
 use crate::lineage::{
     process_diff_parse_patch_items, process_patch_extract_window, process_patch_id_compute_batch,
 };
 use crate::mail::{ParseEmailError, parse_email};
+use crate::meili::{MeiliClient, MeiliClientError, settings_differ};
 use crate::payloads::{
     DiffParsePatchItemsPayload, IngestCommitBatchPayload, LineageRebuildListPayload,
-    PatchExtractWindowPayload, PatchIdComputeBatchPayload, RepoIngestRunPayload, RepoScanPayload,
+    MeiliUpsertBatchPayload, PatchExtractWindowPayload, PatchIdComputeBatchPayload,
+    PipelineStageIngestPayload, PipelineStageLineageDiffPayload, PipelineStageSearchPayload,
+    PipelineStageThreadingPayload, RepoIngestRunPayload, RepoScanPayload,
     ThreadingRebuildListPayload, ThreadingUpdateWindowPayload,
 };
 use crate::scanner::stream_new_commit_oid_chunks;
@@ -34,8 +42,16 @@ pub struct Phase0JobHandler {
     ingest: IngestStore,
     threading: ThreadingStore,
     lineage: LineageStore,
+    pipeline: PipelineStore,
+    search: SearchStore,
     jobs: JobStore,
+    meili: MeiliClient,
 }
+
+const STAGE_INGEST: &str = "ingest";
+const STAGE_THREADING: &str = "threading";
+const STAGE_LINEAGE_DIFF: &str = "lineage_diff";
+const STAGE_SEARCH: &str = "search";
 
 impl Phase0JobHandler {
     pub fn new(
@@ -44,15 +60,21 @@ impl Phase0JobHandler {
         ingest: IngestStore,
         threading: ThreadingStore,
         lineage: LineageStore,
+        pipeline: PipelineStore,
+        search: SearchStore,
         jobs: JobStore,
     ) -> Self {
+        let meili = MeiliClient::from_settings(&settings);
         Self {
             settings,
             catalog,
             ingest,
             threading,
             lineage,
+            pipeline,
+            search,
             jobs,
+            meili,
         }
     }
 
@@ -61,12 +83,19 @@ impl Phase0JobHandler {
             "repo_scan" => self.handle_repo_scan(job, ctx).await,
             "repo_ingest_run" => self.handle_repo_ingest_run(job, ctx).await,
             "ingest_commit_batch" => self.handle_ingest_commit_batch(job, ctx).await,
+            "pipeline_stage_ingest" => self.handle_pipeline_stage_ingest(job, ctx).await,
+            "pipeline_stage_threading" => self.handle_pipeline_stage_threading(job, ctx).await,
+            "pipeline_stage_lineage_diff" => {
+                self.handle_pipeline_stage_lineage_diff(job, ctx).await
+            }
+            "pipeline_stage_search" => self.handle_pipeline_stage_search(job, ctx).await,
             "threading_update_window" => self.handle_threading_update_window(job, ctx).await,
             "threading_rebuild_list" => self.handle_threading_rebuild_list(job, ctx).await,
             "lineage_rebuild_list" => self.handle_lineage_rebuild_list(job, ctx).await,
             "patch_extract_window" => self.handle_patch_extract_window(job, ctx).await,
             "patch_id_compute_batch" => self.handle_patch_id_compute_batch(job, ctx).await,
             "diff_parse_patch_items" => self.handle_diff_parse_patch_items(job, ctx).await,
+            "meili_upsert_batch" => self.handle_meili_upsert_batch(job, ctx).await,
             other => JobExecutionOutcome::Terminal {
                 reason: format!("unknown job type: {other}"),
                 kind: "invalid_job_type".to_string(),
@@ -375,10 +404,17 @@ impl Phase0JobHandler {
             {
                 Ok(v) => v,
                 Err(err) => {
+                    let first_commit_oids: Vec<String> = parsed_outcome
+                        .rows
+                        .iter()
+                        .take(5)
+                        .map(|row| row.git_commit_oid.clone())
+                        .collect();
                     return retryable_error(
                         format!(
-                            "ingest batch write failed for repo {}: {err}",
-                            payload.repo_key
+                            "ingest batch write failed for repo {}: parsed_rows={} first_commit_oids={first_commit_oids:?} error={err}",
+                            payload.repo_key,
+                            parsed_outcome.rows.len()
                         ),
                         "db",
                         &job,
@@ -396,6 +432,9 @@ impl Phase0JobHandler {
             let full_pipeline = matches!(
                 self.settings.worker.backfill_mode,
                 BackfillMode::FullPipeline
+            ) && matches!(
+                self.settings.worker.pipeline_execution_mode,
+                PipelineExecutionMode::Legacy
             );
             if full_pipeline && !anchor_message_pks.is_empty() {
                 let dedupe_key = hash_message_pks(&anchor_message_pks);
@@ -461,6 +500,10 @@ impl Phase0JobHandler {
                 "backfill_mode": match self.settings.worker.backfill_mode {
                     BackfillMode::FullPipeline => "full_pipeline",
                     BackfillMode::IngestOnly => "ingest_only",
+                },
+                "pipeline_execution_mode": match self.settings.worker.pipeline_execution_mode {
+                    PipelineExecutionMode::Legacy => "legacy",
+                    PipelineExecutionMode::Staged => "staged",
                 },
                 "ingest_write_mode": match self.settings.worker.ingest_write_mode {
                     IngestWriteMode::Copy => "copy",
@@ -645,10 +688,17 @@ impl Phase0JobHandler {
         {
             Ok(v) => v,
             Err(err) => {
+                let first_commit_oids: Vec<String> = parsed_outcome
+                    .rows
+                    .iter()
+                    .take(5)
+                    .map(|row| row.git_commit_oid.clone())
+                    .collect();
                 return retryable_error(
                     format!(
-                        "ingest batch write failed for repo {}: {err}",
-                        payload.repo_key
+                        "ingest batch write failed for repo {}: parsed_rows={} first_commit_oids={first_commit_oids:?} error={err}",
+                        payload.repo_key,
+                        parsed_outcome.rows.len()
                     ),
                     "db",
                     &job,
@@ -668,6 +718,9 @@ impl Phase0JobHandler {
         let full_pipeline = matches!(
             self.settings.worker.backfill_mode,
             BackfillMode::FullPipeline
+        ) && matches!(
+            self.settings.worker.pipeline_execution_mode,
+            PipelineExecutionMode::Legacy
         );
         if full_pipeline && !anchor_message_pks.is_empty() {
             let dedupe_key = hash_message_pks(&anchor_message_pks);
@@ -740,6 +793,10 @@ impl Phase0JobHandler {
                     BackfillMode::FullPipeline => "full_pipeline",
                     BackfillMode::IngestOnly => "ingest_only",
                 },
+                "pipeline_execution_mode": match self.settings.worker.pipeline_execution_mode {
+                    PipelineExecutionMode::Legacy => "legacy",
+                    PipelineExecutionMode::Staged => "staged",
+                },
             }),
             metrics: JobStoreMetrics {
                 duration_ms: started.elapsed().as_millis(),
@@ -749,6 +806,1604 @@ impl Phase0JobHandler {
                 parse_errors,
             },
         }
+    }
+
+    async fn handle_pipeline_stage_ingest(
+        &self,
+        job: Job,
+        ctx: ExecutionContext,
+    ) -> JobExecutionOutcome {
+        let started = Instant::now();
+        let payload: PipelineStageIngestPayload =
+            match serde_json::from_value(job.payload_json.clone()) {
+                Ok(value) => value,
+                Err(err) => {
+                    return JobExecutionOutcome::Terminal {
+                        reason: format!("invalid pipeline_stage_ingest payload: {err}"),
+                        kind: "payload".to_string(),
+                        metrics: empty_metrics(started.elapsed().as_millis()),
+                    };
+                }
+            };
+
+        let run = match self.pipeline.get_run(payload.run_id).await {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                return JobExecutionOutcome::Terminal {
+                    reason: format!("pipeline run {} not found", payload.run_id),
+                    kind: "not_found".to_string(),
+                    metrics: empty_metrics(started.elapsed().as_millis()),
+                };
+            }
+            Err(err) => {
+                return retryable_error(
+                    format!("failed to load pipeline run {}: {err}", payload.run_id),
+                    "db",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+        };
+
+        if run.state != "running" {
+            return JobExecutionOutcome::Success {
+                result_json: serde_json::json!({
+                    "run_id": run.id,
+                    "skipped": format!("run is in terminal state {}", run.state),
+                }),
+                metrics: empty_metrics(started.elapsed().as_millis()),
+            };
+        }
+        if run.current_stage != STAGE_INGEST {
+            let Some(current_rank) = stage_rank(&run.current_stage) else {
+                return JobExecutionOutcome::Terminal {
+                    reason: format!(
+                        "run {} has invalid current_stage={}",
+                        run.id, run.current_stage
+                    ),
+                    kind: "pipeline_state".to_string(),
+                    metrics: empty_metrics(started.elapsed().as_millis()),
+                };
+            };
+            let expected_rank = stage_rank(STAGE_INGEST).expect("known ingest stage");
+            if current_rank < expected_rank {
+                return retryable_error(
+                    format!(
+                        "stage barrier: run {} is at stage {} and cannot execute ingest yet",
+                        run.id, run.current_stage
+                    ),
+                    "stage_barrier",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+            return JobExecutionOutcome::Success {
+                result_json: serde_json::json!({
+                    "run_id": run.id,
+                    "skipped": format!(
+                        "run stage already advanced to {}",
+                        run.current_stage
+                    ),
+                }),
+                metrics: empty_metrics(started.elapsed().as_millis()),
+            };
+        }
+
+        if let Err(err) = self
+            .pipeline
+            .ensure_stage_running(run.id, STAGE_INGEST)
+            .await
+        {
+            return retryable_error(
+                format!(
+                    "failed to mark ingest stage running for run {}: {err}",
+                    run.id
+                ),
+                "db",
+                &job,
+                started.elapsed().as_millis(),
+                &self.settings,
+            );
+        }
+
+        let list_root = Path::new(&self.settings.mail.mirror_root).join(&run.list_key);
+        let mut repos = match self.catalog.list_repos_for_list(&run.list_key).await {
+            Ok(value) => value,
+            Err(err) => {
+                return retryable_error(
+                    format!("failed to list repos for list {}: {err}", run.list_key),
+                    "db",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+        };
+
+        if repos.is_empty() {
+            let relpaths = match discover_repo_relpaths(&list_root) {
+                Ok(value) => value,
+                Err(err) => {
+                    return retryable_error(
+                        format!(
+                            "failed to discover repos under {}: {err}",
+                            list_root.display()
+                        ),
+                        "io",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
+                }
+            };
+            for relpath in &relpaths {
+                if let Err(err) = self
+                    .catalog
+                    .ensure_repo(run.mailing_list_id, relpath, relpath)
+                    .await
+                {
+                    return retryable_error(
+                        format!(
+                            "failed to ensure repo {} exists for list {}: {err}",
+                            relpath, run.list_key
+                        ),
+                        "db",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
+                }
+            }
+            repos = match self.catalog.list_repos_for_list(&run.list_key).await {
+                Ok(value) => value,
+                Err(err) => {
+                    return retryable_error(
+                        format!(
+                            "failed to list repos for list {} after discovery: {err}",
+                            run.list_key
+                        ),
+                        "db",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
+                }
+            };
+        }
+
+        let repos_total = repos.len() as u64;
+        let stage_started_at = Utc::now();
+        let batch_size = if matches!(self.settings.worker.backfill_mode, BackfillMode::IngestOnly) {
+            self.settings.worker.backfill_batch_size.max(1)
+        } else {
+            self.settings.mail.commit_batch_size.max(1)
+        };
+
+        let mut repos_done = 0u64;
+        let mut chunks_done = 0u64;
+        let mut commit_count = 0u64;
+        let mut rows_written = 0u64;
+        let mut bytes_read = 0u64;
+        let mut parse_errors = 0u64;
+        let mut message_artifacts_written = 0u64;
+        let mut parse_workers_effective = 0usize;
+
+        for repo in repos {
+            if let Err(err) = ctx.heartbeat().await {
+                warn!(job_id = job.id, error = %err, "heartbeat update failed");
+            }
+            match ctx.is_cancel_requested().await {
+                Ok(true) => {
+                    return JobExecutionOutcome::Cancelled {
+                        reason: "cancel requested".to_string(),
+                        metrics: JobStoreMetrics {
+                            duration_ms: started.elapsed().as_millis(),
+                            rows_written,
+                            bytes_read,
+                            commit_count,
+                            parse_errors,
+                        },
+                    };
+                }
+                Ok(false) => {}
+                Err(err) => warn!(job_id = job.id, error = %err, "cancel check failed"),
+            }
+
+            let repo_path = list_root.join(&repo.repo_relpath);
+            let since_commit_oid = match self.catalog.get_watermark(repo.id).await {
+                Ok(value) => value,
+                Err(err) => {
+                    return retryable_error(
+                        format!("failed to read watermark for repo {}: {err}", repo.repo_key),
+                        "db",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
+                }
+            };
+
+            let mut stream = match stream_new_commit_oid_chunks(
+                &repo_path,
+                since_commit_oid.as_deref(),
+                batch_size,
+            ) {
+                Ok(value) => value,
+                Err(err) => {
+                    return retryable_error(
+                        format!("repo scan failed for {}: {err}", repo.repo_key),
+                        "io",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
+                }
+            };
+
+            let mut gix_repo = match gix::open(&repo_path) {
+                Ok(value) => value,
+                Err(err) => {
+                    return retryable_error(
+                        format!("failed to open repo {:?}: {err}", repo_path),
+                        "io",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
+                }
+            };
+            gix_repo.object_cache_size_if_unset(64 * 1024 * 1024);
+
+            loop {
+                if let Err(err) = ctx.heartbeat().await {
+                    warn!(job_id = job.id, error = %err, "heartbeat update failed");
+                }
+                match ctx.is_cancel_requested().await {
+                    Ok(true) => {
+                        return JobExecutionOutcome::Cancelled {
+                            reason: "cancel requested".to_string(),
+                            metrics: JobStoreMetrics {
+                                duration_ms: started.elapsed().as_millis(),
+                                rows_written,
+                                bytes_read,
+                                commit_count,
+                                parse_errors,
+                            },
+                        };
+                    }
+                    Ok(false) => {}
+                    Err(err) => warn!(job_id = job.id, error = %err, "cancel check failed"),
+                }
+
+                let chunk = match stream.next_chunk() {
+                    Ok(Some(value)) => value,
+                    Ok(None) => break,
+                    Err(err) => {
+                        return retryable_error(
+                            format!("repo scan failed for {}: {err}", repo.repo_key),
+                            "io",
+                            &job,
+                            started.elapsed().as_millis(),
+                            &self.settings,
+                        );
+                    }
+                };
+
+                chunks_done += 1;
+                commit_count += chunk.len() as u64;
+                let mut raw_commits = Vec::with_capacity(chunk.len());
+                for (idx, commit_oid) in chunk.iter().enumerate() {
+                    let raw_mail = match read_mail_blob(&gix_repo, commit_oid) {
+                        Ok(Some(value)) => value,
+                        Ok(None) => {
+                            parse_errors += 1;
+                            continue;
+                        }
+                        Err(err) => {
+                            return retryable_error(
+                                format!("failed to read commit blob {}: {err}", commit_oid),
+                                "io",
+                                &job,
+                                started.elapsed().as_millis(),
+                                &self.settings,
+                            );
+                        }
+                    };
+
+                    bytes_read += raw_mail.len() as u64;
+                    raw_commits.push(RawCommitMail {
+                        index: idx,
+                        commit_oid: commit_oid.clone(),
+                        raw_rfc822: raw_mail,
+                    });
+                }
+
+                let workers = effective_parse_worker_count(
+                    self.settings.worker.ingest_parse_cpu_ratio,
+                    self.settings.worker.ingest_parse_workers_min,
+                    self.settings.worker.ingest_parse_workers_max,
+                    raw_commits.len(),
+                );
+                parse_workers_effective = workers;
+                let parsed_outcome = parse_commit_rows(raw_commits, workers).await;
+                parse_errors += parsed_outcome.parse_errors;
+
+                let batch_outcome = match self
+                    .write_ingest_rows(
+                        &repo,
+                        &parsed_outcome.rows,
+                        self.settings.worker.db_relaxed_durability,
+                    )
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(err) => {
+                        let first_commit_oids: Vec<String> = parsed_outcome
+                            .rows
+                            .iter()
+                            .take(5)
+                            .map(|row| row.git_commit_oid.clone())
+                            .collect();
+                        return retryable_error(
+                            format!(
+                                "ingest batch write failed for repo {}: parsed_rows={} first_commit_oids={first_commit_oids:?} error={err}",
+                                repo.repo_key,
+                                parsed_outcome.rows.len()
+                            ),
+                            "db",
+                            &job,
+                            started.elapsed().as_millis(),
+                            &self.settings,
+                        );
+                    }
+                };
+
+                rows_written += batch_outcome.inserted_instances;
+                let inserted_messages = match self
+                    .pipeline
+                    .insert_artifacts(run.id, "message_pk", &batch_outcome.message_pks)
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(err) => {
+                        return retryable_error(
+                            format!(
+                                "failed to insert ingest message artifacts for run {}: {err}",
+                                run.id
+                            ),
+                            "db",
+                            &job,
+                            started.elapsed().as_millis(),
+                            &self.settings,
+                        );
+                    }
+                };
+                message_artifacts_written += inserted_messages;
+
+                if let Some(last_commit) = chunk.last()
+                    && let Err(err) = self
+                        .catalog
+                        .update_watermark(repo.id, Some(last_commit))
+                        .await
+                {
+                    return retryable_error(
+                        format!(
+                            "failed to update watermark for repo {}: {err}",
+                            repo.repo_key
+                        ),
+                        "db",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
+                }
+
+                if let Err(err) = self
+                    .pipeline
+                    .update_stage_progress(
+                        run.id,
+                        STAGE_INGEST,
+                        serde_json::json!({
+                            "repos_total": repos_total,
+                            "repos_done": repos_done,
+                            "chunks_done": chunks_done,
+                            "commit_count": commit_count,
+                            "rows_written": rows_written,
+                            "parse_errors": parse_errors,
+                            "parse_workers_effective": parse_workers_effective,
+                            "message_artifacts_written": message_artifacts_written,
+                        }),
+                    )
+                    .await
+                {
+                    return retryable_error(
+                        format!(
+                            "failed to update ingest stage progress for run {}: {err}",
+                            run.id
+                        ),
+                        "db",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
+                }
+            }
+
+            repos_done += 1;
+        }
+
+        let stage_completed_at = Utc::now();
+        if let Err(err) = self
+            .pipeline
+            .set_run_ingest_window(run.id, stage_started_at, stage_completed_at)
+            .await
+        {
+            return retryable_error(
+                format!("failed to set ingest window for run {}: {err}", run.id),
+                "db",
+                &job,
+                started.elapsed().as_millis(),
+                &self.settings,
+            );
+        }
+
+        if let Err(err) = self
+            .pipeline
+            .mark_stage_succeeded(
+                run.id,
+                STAGE_INGEST,
+                serde_json::json!({
+                    "repos_total": repos_total,
+                    "repos_done": repos_done,
+                    "chunks_done": chunks_done,
+                    "commit_count": commit_count,
+                    "rows_written": rows_written,
+                    "parse_errors": parse_errors,
+                    "parse_workers_effective": parse_workers_effective,
+                    "message_artifacts_written": message_artifacts_written,
+                }),
+            )
+            .await
+        {
+            return retryable_error(
+                format!(
+                    "failed to mark ingest stage succeeded for run {}: {err}",
+                    run.id
+                ),
+                "db",
+                &job,
+                started.elapsed().as_millis(),
+                &self.settings,
+            );
+        }
+
+        if let Err(err) = self
+            .enqueue_pipeline_stage_job(run.id, &run.list_key, STAGE_THREADING, 9)
+            .await
+        {
+            return retryable_error(
+                format!(
+                    "failed to enqueue threading stage for run {}: {err}",
+                    run.id
+                ),
+                "db",
+                &job,
+                started.elapsed().as_millis(),
+                &self.settings,
+            );
+        }
+        if let Err(err) = self
+            .pipeline
+            .set_run_current_stage(run.id, STAGE_THREADING)
+            .await
+        {
+            return retryable_error(
+                format!("failed to move run {} to threading stage: {err}", run.id),
+                "db",
+                &job,
+                started.elapsed().as_millis(),
+                &self.settings,
+            );
+        }
+
+        JobExecutionOutcome::Success {
+            result_json: serde_json::json!({
+                "run_id": run.id,
+                "list_key": run.list_key,
+                "stage": STAGE_INGEST,
+                "repos_total": repos_total,
+                "repos_done": repos_done,
+                "chunks_done": chunks_done,
+                "commit_count": commit_count,
+                "rows_written": rows_written,
+                "parse_errors": parse_errors,
+                "parse_workers_effective": parse_workers_effective,
+                "message_artifacts_written": message_artifacts_written,
+                "next_stage": STAGE_THREADING,
+            }),
+            metrics: JobStoreMetrics {
+                duration_ms: started.elapsed().as_millis(),
+                rows_written,
+                bytes_read,
+                commit_count,
+                parse_errors,
+            },
+        }
+    }
+
+    async fn handle_pipeline_stage_threading(
+        &self,
+        job: Job,
+        ctx: ExecutionContext,
+    ) -> JobExecutionOutcome {
+        let started = Instant::now();
+        let payload: PipelineStageThreadingPayload =
+            match serde_json::from_value(job.payload_json.clone()) {
+                Ok(value) => value,
+                Err(err) => {
+                    return JobExecutionOutcome::Terminal {
+                        reason: format!("invalid pipeline_stage_threading payload: {err}"),
+                        kind: "payload".to_string(),
+                        metrics: empty_metrics(started.elapsed().as_millis()),
+                    };
+                }
+            };
+
+        let run = match self.pipeline.get_run(payload.run_id).await {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                return JobExecutionOutcome::Terminal {
+                    reason: format!("pipeline run {} not found", payload.run_id),
+                    kind: "not_found".to_string(),
+                    metrics: empty_metrics(started.elapsed().as_millis()),
+                };
+            }
+            Err(err) => {
+                return retryable_error(
+                    format!("failed to load pipeline run {}: {err}", payload.run_id),
+                    "db",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+        };
+
+        if run.state != "running" {
+            return JobExecutionOutcome::Success {
+                result_json: serde_json::json!({
+                    "run_id": run.id,
+                    "skipped": format!("run is in terminal state {}", run.state),
+                }),
+                metrics: empty_metrics(started.elapsed().as_millis()),
+            };
+        }
+        if run.current_stage != STAGE_THREADING {
+            let Some(current_rank) = stage_rank(&run.current_stage) else {
+                return JobExecutionOutcome::Terminal {
+                    reason: format!(
+                        "run {} has invalid current_stage={}",
+                        run.id, run.current_stage
+                    ),
+                    kind: "pipeline_state".to_string(),
+                    metrics: empty_metrics(started.elapsed().as_millis()),
+                };
+            };
+            let expected_rank = stage_rank(STAGE_THREADING).expect("known threading stage");
+            if current_rank < expected_rank {
+                return retryable_error(
+                    format!(
+                        "stage barrier: run {} is at stage {} and cannot execute threading yet",
+                        run.id, run.current_stage
+                    ),
+                    "stage_barrier",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+            return JobExecutionOutcome::Success {
+                result_json: serde_json::json!({
+                    "run_id": run.id,
+                    "skipped": format!("run stage already advanced to {}", run.current_stage),
+                }),
+                metrics: empty_metrics(started.elapsed().as_millis()),
+            };
+        }
+
+        if let Err(err) = self
+            .pipeline
+            .ensure_stage_running(run.id, STAGE_THREADING)
+            .await
+        {
+            return retryable_error(
+                format!(
+                    "failed to mark threading stage running for run {}: {err}",
+                    run.id
+                ),
+                "db",
+                &job,
+                started.elapsed().as_millis(),
+                &self.settings,
+            );
+        }
+
+        let mut cursor = 0i64;
+        let batch_limit = self.settings.mail.commit_batch_size.max(1) as i64;
+        let mut chunks_done = 0u64;
+        let mut message_count = 0u64;
+        let mut source_messages_read = 0u64;
+        let mut thread_artifacts_written = 0u64;
+        let mut apply_stats = ThreadingApplyStats::default();
+
+        loop {
+            if let Err(err) = ctx.heartbeat().await {
+                warn!(job_id = job.id, error = %err, "heartbeat update failed");
+            }
+            match ctx.is_cancel_requested().await {
+                Ok(true) => {
+                    return JobExecutionOutcome::Cancelled {
+                        reason: "cancel requested".to_string(),
+                        metrics: JobStoreMetrics {
+                            duration_ms: started.elapsed().as_millis(),
+                            rows_written: apply_stats.threads_rebuilt
+                                + apply_stats.nodes_written
+                                + apply_stats.messages_written
+                                + apply_stats.stale_threads_removed,
+                            bytes_read: source_messages_read,
+                            commit_count: message_count,
+                            parse_errors: 0,
+                        },
+                    };
+                }
+                Ok(false) => {}
+                Err(err) => warn!(job_id = job.id, error = %err, "cancel check failed"),
+            }
+
+            let chunk = match self
+                .pipeline
+                .list_artifact_ids_chunk(run.id, "message_pk", cursor, batch_limit)
+                .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    return retryable_error(
+                        format!(
+                            "failed to list message artifacts for threading stage run {}: {err}",
+                            run.id
+                        ),
+                        "db",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
+                }
+            };
+
+            if chunk.is_empty() {
+                break;
+            }
+            cursor = *chunk.last().unwrap_or(&cursor);
+
+            let outcome = match self
+                .apply_threading_for_anchors(
+                    run.mailing_list_id,
+                    &run.list_key,
+                    chunk.clone(),
+                    Some(job.id),
+                    false,
+                )
+                .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    return retryable_error(
+                        format!(
+                            "failed to apply threading stage chunk for run {}: {err}",
+                            run.id
+                        ),
+                        "db",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
+                }
+            };
+
+            chunks_done += 1;
+            message_count += chunk.len() as u64;
+            source_messages_read += outcome.source_messages_read;
+            apply_stats.threads_rebuilt += outcome.apply_stats.threads_rebuilt;
+            apply_stats.nodes_written += outcome.apply_stats.nodes_written;
+            apply_stats.dummy_nodes_written += outcome.apply_stats.dummy_nodes_written;
+            apply_stats.messages_written += outcome.apply_stats.messages_written;
+            apply_stats.stale_threads_removed += outcome.apply_stats.stale_threads_removed;
+
+            let inserted = match self
+                .pipeline
+                .insert_artifacts(run.id, "thread_id", &outcome.impacted_thread_ids)
+                .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    return retryable_error(
+                        format!(
+                            "failed to persist thread artifacts for run {}: {err}",
+                            run.id
+                        ),
+                        "db",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
+                }
+            };
+            thread_artifacts_written += inserted;
+
+            if let Err(err) = self
+                .pipeline
+                .update_stage_progress(
+                    run.id,
+                    STAGE_THREADING,
+                    serde_json::json!({
+                        "chunks_done": chunks_done,
+                        "message_count": message_count,
+                        "source_messages_read": source_messages_read,
+                        "threads_rebuilt": apply_stats.threads_rebuilt,
+                        "nodes_written": apply_stats.nodes_written,
+                        "dummy_nodes_written": apply_stats.dummy_nodes_written,
+                        "messages_written": apply_stats.messages_written,
+                        "stale_threads_removed": apply_stats.stale_threads_removed,
+                        "thread_artifacts_written": thread_artifacts_written,
+                    }),
+                )
+                .await
+            {
+                return retryable_error(
+                    format!(
+                        "failed to update threading stage progress for run {}: {err}",
+                        run.id
+                    ),
+                    "db",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+        }
+
+        if let Err(err) = self
+            .pipeline
+            .mark_stage_succeeded(
+                run.id,
+                STAGE_THREADING,
+                serde_json::json!({
+                    "chunks_done": chunks_done,
+                    "message_count": message_count,
+                    "source_messages_read": source_messages_read,
+                    "threads_rebuilt": apply_stats.threads_rebuilt,
+                    "nodes_written": apply_stats.nodes_written,
+                    "dummy_nodes_written": apply_stats.dummy_nodes_written,
+                    "messages_written": apply_stats.messages_written,
+                    "stale_threads_removed": apply_stats.stale_threads_removed,
+                    "thread_artifacts_written": thread_artifacts_written,
+                }),
+            )
+            .await
+        {
+            return retryable_error(
+                format!(
+                    "failed to mark threading stage succeeded for run {}: {err}",
+                    run.id
+                ),
+                "db",
+                &job,
+                started.elapsed().as_millis(),
+                &self.settings,
+            );
+        }
+        if let Err(err) = self
+            .enqueue_pipeline_stage_job(run.id, &run.list_key, STAGE_LINEAGE_DIFF, 8)
+            .await
+        {
+            return retryable_error(
+                format!(
+                    "failed to enqueue lineage_diff stage for run {}: {err}",
+                    run.id
+                ),
+                "db",
+                &job,
+                started.elapsed().as_millis(),
+                &self.settings,
+            );
+        }
+        if let Err(err) = self
+            .pipeline
+            .set_run_current_stage(run.id, STAGE_LINEAGE_DIFF)
+            .await
+        {
+            return retryable_error(
+                format!("failed to move run {} to lineage_diff stage: {err}", run.id),
+                "db",
+                &job,
+                started.elapsed().as_millis(),
+                &self.settings,
+            );
+        }
+
+        let rows_written = apply_stats.threads_rebuilt
+            + apply_stats.nodes_written
+            + apply_stats.messages_written
+            + apply_stats.stale_threads_removed;
+
+        JobExecutionOutcome::Success {
+            result_json: serde_json::json!({
+                "run_id": run.id,
+                "list_key": run.list_key,
+                "stage": STAGE_THREADING,
+                "chunks_done": chunks_done,
+                "message_count": message_count,
+                "source_messages_read": source_messages_read,
+                "threads_rebuilt": apply_stats.threads_rebuilt,
+                "nodes_written": apply_stats.nodes_written,
+                "dummy_nodes_written": apply_stats.dummy_nodes_written,
+                "messages_written": apply_stats.messages_written,
+                "stale_threads_removed": apply_stats.stale_threads_removed,
+                "thread_artifacts_written": thread_artifacts_written,
+                "next_stage": STAGE_LINEAGE_DIFF,
+            }),
+            metrics: JobStoreMetrics {
+                duration_ms: started.elapsed().as_millis(),
+                rows_written,
+                bytes_read: source_messages_read,
+                commit_count: message_count,
+                parse_errors: 0,
+            },
+        }
+    }
+
+    async fn handle_pipeline_stage_lineage_diff(
+        &self,
+        job: Job,
+        ctx: ExecutionContext,
+    ) -> JobExecutionOutcome {
+        let started = Instant::now();
+        let payload: PipelineStageLineageDiffPayload =
+            match serde_json::from_value(job.payload_json.clone()) {
+                Ok(value) => value,
+                Err(err) => {
+                    return JobExecutionOutcome::Terminal {
+                        reason: format!("invalid pipeline_stage_lineage_diff payload: {err}"),
+                        kind: "payload".to_string(),
+                        metrics: empty_metrics(started.elapsed().as_millis()),
+                    };
+                }
+            };
+
+        let run = match self.pipeline.get_run(payload.run_id).await {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                return JobExecutionOutcome::Terminal {
+                    reason: format!("pipeline run {} not found", payload.run_id),
+                    kind: "not_found".to_string(),
+                    metrics: empty_metrics(started.elapsed().as_millis()),
+                };
+            }
+            Err(err) => {
+                return retryable_error(
+                    format!("failed to load pipeline run {}: {err}", payload.run_id),
+                    "db",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+        };
+
+        if run.state != "running" {
+            return JobExecutionOutcome::Success {
+                result_json: serde_json::json!({
+                    "run_id": run.id,
+                    "skipped": format!("run is in terminal state {}", run.state),
+                }),
+                metrics: empty_metrics(started.elapsed().as_millis()),
+            };
+        }
+        if run.current_stage != STAGE_LINEAGE_DIFF {
+            let Some(current_rank) = stage_rank(&run.current_stage) else {
+                return JobExecutionOutcome::Terminal {
+                    reason: format!(
+                        "run {} has invalid current_stage={}",
+                        run.id, run.current_stage
+                    ),
+                    kind: "pipeline_state".to_string(),
+                    metrics: empty_metrics(started.elapsed().as_millis()),
+                };
+            };
+            let expected_rank = stage_rank(STAGE_LINEAGE_DIFF).expect("known lineage_diff stage");
+            if current_rank < expected_rank {
+                return retryable_error(
+                    format!(
+                        "stage barrier: run {} is at stage {} and cannot execute lineage_diff yet",
+                        run.id, run.current_stage
+                    ),
+                    "stage_barrier",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+            return JobExecutionOutcome::Success {
+                result_json: serde_json::json!({
+                    "run_id": run.id,
+                    "skipped": format!("run stage already advanced to {}", run.current_stage),
+                }),
+                metrics: empty_metrics(started.elapsed().as_millis()),
+            };
+        }
+
+        if let Err(err) = self
+            .pipeline
+            .ensure_stage_running(run.id, STAGE_LINEAGE_DIFF)
+            .await
+        {
+            return retryable_error(
+                format!(
+                    "failed to mark lineage_diff stage running for run {}: {err}",
+                    run.id
+                ),
+                "db",
+                &job,
+                started.elapsed().as_millis(),
+                &self.settings,
+            );
+        }
+
+        let mut cursor = 0i64;
+        let batch_limit = self.settings.mail.commit_batch_size.max(1) as i64;
+        let mut chunks_done = 0u64;
+        let mut message_count = 0u64;
+        let mut series_versions_written = 0u64;
+        let mut patch_items_written = 0u64;
+        let mut patch_items_updated = 0u64;
+        let mut patch_item_files_written = 0u64;
+        let mut patch_item_artifacts_written = 0u64;
+        let mut patch_series_artifacts_written = 0u64;
+
+        loop {
+            if let Err(err) = ctx.heartbeat().await {
+                warn!(job_id = job.id, error = %err, "heartbeat update failed");
+            }
+            match ctx.is_cancel_requested().await {
+                Ok(true) => {
+                    return JobExecutionOutcome::Cancelled {
+                        reason: "cancel requested".to_string(),
+                        metrics: JobStoreMetrics {
+                            duration_ms: started.elapsed().as_millis(),
+                            rows_written: series_versions_written
+                                + patch_items_written
+                                + patch_item_files_written,
+                            bytes_read: 0,
+                            commit_count: message_count,
+                            parse_errors: 0,
+                        },
+                    };
+                }
+                Ok(false) => {}
+                Err(err) => warn!(job_id = job.id, error = %err, "cancel check failed"),
+            }
+
+            let chunk = match self
+                .pipeline
+                .list_artifact_ids_chunk(run.id, "message_pk", cursor, batch_limit)
+                .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    return retryable_error(
+                        format!(
+                            "failed to list message artifacts for lineage_diff stage run {}: {err}",
+                            run.id
+                        ),
+                        "db",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
+                }
+            };
+
+            if chunk.is_empty() {
+                break;
+            }
+            cursor = *chunk.last().unwrap_or(&cursor);
+
+            let extract_outcome = match process_patch_extract_window(
+                &self.lineage,
+                run.mailing_list_id,
+                &chunk,
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    return retryable_error(
+                        format!("patch lineage extraction failed for run {}: {err}", run.id),
+                        "parse",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
+                }
+            };
+
+            let inserted_patch_items = match self
+                .pipeline
+                .insert_artifacts(run.id, "patch_item_id", &extract_outcome.patch_item_ids)
+                .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    return retryable_error(
+                        format!(
+                            "failed to insert patch_item artifacts for run {}: {err}",
+                            run.id
+                        ),
+                        "db",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
+                }
+            };
+            patch_item_artifacts_written += inserted_patch_items;
+
+            let inserted_patch_series = match self
+                .pipeline
+                .insert_artifacts(run.id, "patch_series_id", &extract_outcome.series_ids)
+                .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    return retryable_error(
+                        format!(
+                            "failed to insert patch_series artifacts for run {}: {err}",
+                            run.id
+                        ),
+                        "db",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
+                }
+            };
+            patch_series_artifacts_written += inserted_patch_series;
+
+            let mut patch_id_updates = 0u64;
+            let mut diff_file_updates = 0u64;
+            if !extract_outcome.patch_item_ids.is_empty() {
+                let patch_item_ids = extract_outcome.patch_item_ids.clone();
+                let (patch_id_result, diff_result) = tokio::join!(
+                    process_patch_id_compute_batch(&self.lineage, &patch_item_ids),
+                    process_diff_parse_patch_items(&self.lineage, &patch_item_ids),
+                );
+
+                let patch_id_outcome = match patch_id_result {
+                    Ok(value) => value,
+                    Err(err) => {
+                        return retryable_error(
+                            format!("patch_id compute failed for run {}: {err}", run.id),
+                            "parse",
+                            &job,
+                            started.elapsed().as_millis(),
+                            &self.settings,
+                        );
+                    }
+                };
+                let diff_outcome = match diff_result {
+                    Ok(value) => value,
+                    Err(err) => {
+                        return retryable_error(
+                            format!("diff parse failed for run {}: {err}", run.id),
+                            "parse",
+                            &job,
+                            started.elapsed().as_millis(),
+                            &self.settings,
+                        );
+                    }
+                };
+                patch_id_updates = patch_id_outcome.patch_items_updated;
+                diff_file_updates = diff_outcome.patch_item_files_written;
+            }
+
+            chunks_done += 1;
+            message_count += chunk.len() as u64;
+            series_versions_written += extract_outcome.series_versions_written;
+            patch_items_written += extract_outcome.patch_items_written;
+            patch_items_updated += patch_id_updates;
+            patch_item_files_written += diff_file_updates;
+
+            if let Err(err) = self
+                .pipeline
+                .update_stage_progress(
+                    run.id,
+                    STAGE_LINEAGE_DIFF,
+                    serde_json::json!({
+                        "chunks_done": chunks_done,
+                        "message_count": message_count,
+                        "series_versions_written": series_versions_written,
+                        "patch_items_written": patch_items_written,
+                        "patch_items_updated": patch_items_updated,
+                        "patch_item_files_written": patch_item_files_written,
+                        "patch_item_artifacts_written": patch_item_artifacts_written,
+                        "patch_series_artifacts_written": patch_series_artifacts_written,
+                    }),
+                )
+                .await
+            {
+                return retryable_error(
+                    format!(
+                        "failed to update lineage_diff stage progress for run {}: {err}",
+                        run.id
+                    ),
+                    "db",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+        }
+
+        if let Err(err) = self
+            .pipeline
+            .mark_stage_succeeded(
+                run.id,
+                STAGE_LINEAGE_DIFF,
+                serde_json::json!({
+                    "chunks_done": chunks_done,
+                    "message_count": message_count,
+                    "series_versions_written": series_versions_written,
+                    "patch_items_written": patch_items_written,
+                    "patch_items_updated": patch_items_updated,
+                    "patch_item_files_written": patch_item_files_written,
+                    "patch_item_artifacts_written": patch_item_artifacts_written,
+                    "patch_series_artifacts_written": patch_series_artifacts_written,
+                }),
+            )
+            .await
+        {
+            return retryable_error(
+                format!(
+                    "failed to mark lineage_diff stage succeeded for run {}: {err}",
+                    run.id
+                ),
+                "db",
+                &job,
+                started.elapsed().as_millis(),
+                &self.settings,
+            );
+        }
+        if let Err(err) = self
+            .enqueue_pipeline_stage_job(run.id, &run.list_key, STAGE_SEARCH, 7)
+            .await
+        {
+            return retryable_error(
+                format!("failed to enqueue search stage for run {}: {err}", run.id),
+                "db",
+                &job,
+                started.elapsed().as_millis(),
+                &self.settings,
+            );
+        }
+        if let Err(err) = self
+            .pipeline
+            .set_run_current_stage(run.id, STAGE_SEARCH)
+            .await
+        {
+            return retryable_error(
+                format!("failed to move run {} to search stage: {err}", run.id),
+                "db",
+                &job,
+                started.elapsed().as_millis(),
+                &self.settings,
+            );
+        }
+
+        JobExecutionOutcome::Success {
+            result_json: serde_json::json!({
+                "run_id": run.id,
+                "list_key": run.list_key,
+                "stage": STAGE_LINEAGE_DIFF,
+                "chunks_done": chunks_done,
+                "message_count": message_count,
+                "series_versions_written": series_versions_written,
+                "patch_items_written": patch_items_written,
+                "patch_items_updated": patch_items_updated,
+                "patch_item_files_written": patch_item_files_written,
+                "patch_item_artifacts_written": patch_item_artifacts_written,
+                "patch_series_artifacts_written": patch_series_artifacts_written,
+                "next_stage": STAGE_SEARCH,
+            }),
+            metrics: JobStoreMetrics {
+                duration_ms: started.elapsed().as_millis(),
+                rows_written: series_versions_written
+                    + patch_items_written
+                    + patch_item_files_written,
+                bytes_read: 0,
+                commit_count: message_count,
+                parse_errors: 0,
+            },
+        }
+    }
+
+    async fn handle_pipeline_stage_search(
+        &self,
+        job: Job,
+        ctx: ExecutionContext,
+    ) -> JobExecutionOutcome {
+        let started = Instant::now();
+        let payload: PipelineStageSearchPayload =
+            match serde_json::from_value(job.payload_json.clone()) {
+                Ok(value) => value,
+                Err(err) => {
+                    return JobExecutionOutcome::Terminal {
+                        reason: format!("invalid pipeline_stage_search payload: {err}"),
+                        kind: "payload".to_string(),
+                        metrics: empty_metrics(started.elapsed().as_millis()),
+                    };
+                }
+            };
+
+        let run = match self.pipeline.get_run(payload.run_id).await {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                return JobExecutionOutcome::Terminal {
+                    reason: format!("pipeline run {} not found", payload.run_id),
+                    kind: "not_found".to_string(),
+                    metrics: empty_metrics(started.elapsed().as_millis()),
+                };
+            }
+            Err(err) => {
+                return retryable_error(
+                    format!("failed to load pipeline run {}: {err}", payload.run_id),
+                    "db",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+        };
+
+        if run.state != "running" {
+            return JobExecutionOutcome::Success {
+                result_json: serde_json::json!({
+                    "run_id": run.id,
+                    "skipped": format!("run is in terminal state {}", run.state),
+                }),
+                metrics: empty_metrics(started.elapsed().as_millis()),
+            };
+        }
+        if run.current_stage != STAGE_SEARCH {
+            let Some(current_rank) = stage_rank(&run.current_stage) else {
+                return JobExecutionOutcome::Terminal {
+                    reason: format!(
+                        "run {} has invalid current_stage={}",
+                        run.id, run.current_stage
+                    ),
+                    kind: "pipeline_state".to_string(),
+                    metrics: empty_metrics(started.elapsed().as_millis()),
+                };
+            };
+            let expected_rank = stage_rank(STAGE_SEARCH).expect("known search stage");
+            if current_rank < expected_rank {
+                return retryable_error(
+                    format!(
+                        "stage barrier: run {} is at stage {} and cannot execute search yet",
+                        run.id, run.current_stage
+                    ),
+                    "stage_barrier",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+            return JobExecutionOutcome::Success {
+                result_json: serde_json::json!({
+                    "run_id": run.id,
+                    "skipped": format!("run stage already advanced to {}", run.current_stage),
+                }),
+                metrics: empty_metrics(started.elapsed().as_millis()),
+            };
+        }
+
+        if let Err(err) = self
+            .pipeline
+            .ensure_stage_running(run.id, STAGE_SEARCH)
+            .await
+        {
+            return retryable_error(
+                format!(
+                    "failed to mark search stage running for run {}: {err}",
+                    run.id
+                ),
+                "db",
+                &job,
+                started.elapsed().as_millis(),
+                &self.settings,
+            );
+        }
+
+        let plans = [
+            ("thread_id", MeiliIndexKind::ThreadDocs),
+            ("patch_series_id", MeiliIndexKind::PatchSeriesDocs),
+            ("patch_item_id", MeiliIndexKind::PatchItemDocs),
+        ];
+        let max_inflight = self
+            .settings
+            .worker
+            .stage_search_parallelism
+            .max(1)
+            .min(plans.len());
+        let mut joinset = JoinSet::new();
+        let mut next_plan = 0usize;
+        let mut in_flight = 0usize;
+        let mut family_results: Vec<SearchFamilyOutcome> = Vec::new();
+        let mut total_docs_upserted = 0u64;
+        let mut total_ids_seen = 0u64;
+        let mut total_rows_written = 0u64;
+        let mut total_bytes_read = 0u64;
+
+        while next_plan < plans.len() || in_flight > 0 {
+            while in_flight < max_inflight && next_plan < plans.len() {
+                let (artifact_kind, index) = plans[next_plan];
+                next_plan += 1;
+                in_flight += 1;
+                let handler = self.clone();
+                let ctx_clone = ctx.clone();
+                joinset.spawn(async move {
+                    handler
+                        .process_search_family(run.id, artifact_kind, index, ctx_clone)
+                        .await
+                });
+            }
+
+            let Some(joined) = joinset.join_next().await else {
+                break;
+            };
+            in_flight = in_flight.saturating_sub(1);
+
+            let family = match joined {
+                Ok(Ok(value)) => value,
+                Ok(Err(err)) => {
+                    return retryable_error(
+                        format!("search stage family failed for run {}: {err}", run.id),
+                        "search_stage",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
+                }
+                Err(err) => {
+                    return retryable_error(
+                        format!(
+                            "search stage family task join failed for run {}: {err}",
+                            run.id
+                        ),
+                        "runtime",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
+                }
+            };
+
+            total_docs_upserted += family.docs_upserted;
+            total_ids_seen += family.ids_seen;
+            total_rows_written += family.docs_upserted;
+            total_bytes_read += family.docs_bytes;
+            family_results.push(family);
+
+            if let Err(err) = self
+                .pipeline
+                .update_stage_progress(
+                    run.id,
+                    STAGE_SEARCH,
+                    serde_json::json!({
+                        "families_completed": family_results.len(),
+                        "families_total": plans.len(),
+                        "total_docs_upserted": total_docs_upserted,
+                        "total_ids_seen": total_ids_seen,
+                    }),
+                )
+                .await
+            {
+                return retryable_error(
+                    format!(
+                        "failed to update search stage progress for run {}: {err}",
+                        run.id
+                    ),
+                    "db",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+        }
+
+        family_results.sort_by(|a, b| a.index_uid.cmp(&b.index_uid));
+        if let Err(err) = self
+            .pipeline
+            .mark_stage_succeeded(
+                run.id,
+                STAGE_SEARCH,
+                serde_json::json!({
+                    "families_completed": family_results.len(),
+                    "total_docs_upserted": total_docs_upserted,
+                    "total_ids_seen": total_ids_seen,
+                    "families": family_results,
+                }),
+            )
+            .await
+        {
+            return retryable_error(
+                format!(
+                    "failed to mark search stage succeeded for run {}: {err}",
+                    run.id
+                ),
+                "db",
+                &job,
+                started.elapsed().as_millis(),
+                &self.settings,
+            );
+        }
+        if let Err(err) = self.pipeline.mark_run_succeeded(run.id).await {
+            return retryable_error(
+                format!(
+                    "failed to mark run {} succeeded after search stage: {err}",
+                    run.id
+                ),
+                "db",
+                &job,
+                started.elapsed().as_millis(),
+                &self.settings,
+            );
+        }
+
+        JobExecutionOutcome::Success {
+            result_json: serde_json::json!({
+                "run_id": run.id,
+                "list_key": run.list_key,
+                "stage": STAGE_SEARCH,
+                "families_completed": family_results.len(),
+                "total_docs_upserted": total_docs_upserted,
+                "total_ids_seen": total_ids_seen,
+                "families": family_results,
+                "run_state": "succeeded",
+            }),
+            metrics: JobStoreMetrics {
+                duration_ms: started.elapsed().as_millis(),
+                rows_written: total_rows_written,
+                bytes_read: total_bytes_read,
+                commit_count: total_ids_seen,
+                parse_errors: 0,
+            },
+        }
+    }
+
+    async fn process_search_family(
+        &self,
+        run_id: i64,
+        artifact_kind: &'static str,
+        index: MeiliIndexKind,
+        ctx: ExecutionContext,
+    ) -> Result<SearchFamilyOutcome, String> {
+        let index_spec = index.spec();
+        let settings = index_spec.settings_json();
+        self.ensure_index_settings(index_spec, &settings, &ctx)
+            .await
+            .map_err(|err| format!("failed to prepare index {}: {err}", index.uid()))?;
+
+        let chunk_limit = self.settings.mail.commit_batch_size.max(1) as i64;
+        let mut cursor = 0i64;
+        let mut chunks_done = 0u64;
+        let mut ids_seen = 0u64;
+        let mut docs_upserted = 0u64;
+        let mut docs_bytes = 0u64;
+        let mut tasks_submitted = 0u64;
+
+        loop {
+            let ids = self
+                .pipeline
+                .list_artifact_ids_chunk(run_id, artifact_kind, cursor, chunk_limit)
+                .await
+                .map_err(|err| {
+                    format!(
+                        "failed to list artifact ids for {} in run {}: {err}",
+                        artifact_kind, run_id
+                    )
+                })?;
+            if ids.is_empty() {
+                break;
+            }
+            cursor = *ids.last().unwrap_or(&cursor);
+            ids_seen += ids.len() as u64;
+            chunks_done += 1;
+
+            let docs = self
+                .build_docs_for_index(index, &ids)
+                .await
+                .map_err(|err| format!("failed to build docs for {}: {err}", index.uid()))?;
+            if docs.is_empty() {
+                continue;
+            }
+
+            let task_uid = self
+                .meili
+                .upsert_documents(index_spec.uid, &docs)
+                .await
+                .map_err(|err| format!("failed to upsert docs for {}: {err}", index.uid()))?;
+            self.wait_for_task(task_uid, &ctx).await.map_err(|err| {
+                format!("meili task {} failed for {}: {err}", task_uid, index.uid())
+            })?;
+
+            docs_upserted += docs.len() as u64;
+            docs_bytes += serde_json::to_vec(&docs)
+                .map(|bytes| bytes.len() as u64)
+                .unwrap_or(0);
+            tasks_submitted += 1;
+        }
+
+        Ok(SearchFamilyOutcome {
+            artifact_kind: artifact_kind.to_string(),
+            index_uid: index.uid().to_string(),
+            chunks_done,
+            ids_seen,
+            docs_upserted,
+            docs_bytes,
+            tasks_submitted,
+        })
+    }
+
+    async fn enqueue_pipeline_stage_job(
+        &self,
+        run_id: i64,
+        list_key: &str,
+        stage: &str,
+        priority: i32,
+    ) -> Result<(), sqlx::Error> {
+        let (job_type, payload_json) = match stage {
+            STAGE_THREADING => (
+                "pipeline_stage_threading",
+                serde_json::to_value(PipelineStageThreadingPayload { run_id })
+                    .unwrap_or_else(|_| serde_json::json!({})),
+            ),
+            STAGE_LINEAGE_DIFF => (
+                "pipeline_stage_lineage_diff",
+                serde_json::to_value(PipelineStageLineageDiffPayload { run_id })
+                    .unwrap_or_else(|_| serde_json::json!({})),
+            ),
+            STAGE_SEARCH => (
+                "pipeline_stage_search",
+                serde_json::to_value(PipelineStageSearchPayload { run_id })
+                    .unwrap_or_else(|_| serde_json::json!({})),
+            ),
+            _ => return Ok(()),
+        };
+
+        self.jobs
+            .enqueue(EnqueueJobParams {
+                job_type: job_type.to_string(),
+                payload_json,
+                priority,
+                dedupe_scope: Some(format!("list:{list_key}:pipeline")),
+                dedupe_key: Some(format!("run:{run_id}:stage:{stage}")),
+                run_after: None,
+                max_attempts: Some(8),
+            })
+            .await?;
+        Ok(())
     }
 
     async fn write_ingest_rows(
@@ -824,6 +2479,7 @@ impl Phase0JobHandler {
             return Ok(ThreadingWindowOutcome {
                 affected_threads: impacted_thread_ids.len() as u64,
                 source_messages_read: 0,
+                impacted_thread_ids,
                 ..ThreadingWindowOutcome::default()
             });
         }
@@ -914,6 +2570,7 @@ impl Phase0JobHandler {
             source_messages_read: source_messages.len() as u64,
             apply_stats,
             lineage_enqueued,
+            impacted_thread_ids,
         })
     }
 
@@ -935,6 +2592,43 @@ impl Phase0JobHandler {
                     };
                 }
             };
+
+        if matches!(
+            self.settings.worker.pipeline_execution_mode,
+            PipelineExecutionMode::Staged
+        ) {
+            let ingest_active = match self
+                .pipeline
+                .is_list_ingest_stage_active(&payload.list_key)
+                .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    return retryable_error(
+                        format!(
+                            "failed to evaluate stage barrier for list {}: {err}",
+                            payload.list_key
+                        ),
+                        "db",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
+                }
+            };
+            if ingest_active {
+                return retryable_error(
+                    format!(
+                        "ingest stage is active for list {}, deferring threading_update_window",
+                        payload.list_key
+                    ),
+                    "stage_barrier",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+        }
 
         let list = match self.catalog.get_mailing_list(&payload.list_key).await {
             Ok(Some(v)) => v,
@@ -977,6 +2671,28 @@ impl Phase0JobHandler {
             }
         };
 
+        let thread_search_enqueued = match self
+            .enqueue_meili_upsert_batch(
+                &payload.list_key,
+                MeiliIndexKind::ThreadDocs,
+                &outcome.impacted_thread_ids,
+                Some(job.id),
+                6,
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(err) => {
+                return retryable_error(
+                    format!("failed to enqueue meili thread upsert: {err}"),
+                    "db",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+        };
+
         let rows_written = outcome.apply_stats.threads_rebuilt
             + outcome.apply_stats.nodes_written
             + outcome.apply_stats.messages_written
@@ -992,6 +2708,7 @@ impl Phase0JobHandler {
             messages_written = outcome.apply_stats.messages_written,
             stale_threads_removed = outcome.apply_stats.stale_threads_removed,
             lineage_enqueued = outcome.lineage_enqueued,
+            thread_search_enqueued,
             "threading_update_window applied"
         );
 
@@ -1006,6 +2723,7 @@ impl Phase0JobHandler {
                 "messages_written": outcome.apply_stats.messages_written,
                 "stale_threads_removed": outcome.apply_stats.stale_threads_removed,
                 "lineage_enqueued": outcome.lineage_enqueued,
+                "thread_search_enqueued": thread_search_enqueued,
             }),
             metrics: JobStoreMetrics {
                 duration_ms: started.elapsed().as_millis(),
@@ -1036,6 +2754,43 @@ impl Phase0JobHandler {
                 }
             };
 
+        if matches!(
+            self.settings.worker.pipeline_execution_mode,
+            PipelineExecutionMode::Staged
+        ) {
+            let ingest_active = match self
+                .pipeline
+                .is_list_ingest_stage_active(&payload.list_key)
+                .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    return retryable_error(
+                        format!(
+                            "failed to evaluate stage barrier for list {}: {err}",
+                            payload.list_key
+                        ),
+                        "db",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
+                }
+            };
+            if ingest_active {
+                return retryable_error(
+                    format!(
+                        "ingest stage is active for list {}, deferring threading_rebuild_list",
+                        payload.list_key
+                    ),
+                    "stage_barrier",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+        }
+
         let list = match self.catalog.get_mailing_list(&payload.list_key).await {
             Ok(Some(v)) => v,
             Ok(None) => {
@@ -1060,6 +2815,7 @@ impl Phase0JobHandler {
         let mut processed_chunks = 0u64;
         let mut processed_messages = 0u64;
         let mut affected_threads = 0u64;
+        let mut meili_thread_jobs_enqueued = 0u64;
         let mut apply_stats = ThreadingApplyStats::default();
         let batch_limit = self.settings.mail.commit_batch_size.max(1) as i64;
 
@@ -1145,6 +2901,29 @@ impl Phase0JobHandler {
             apply_stats.dummy_nodes_written += outcome.apply_stats.dummy_nodes_written;
             apply_stats.messages_written += outcome.apply_stats.messages_written;
             apply_stats.stale_threads_removed += outcome.apply_stats.stale_threads_removed;
+
+            match self
+                .enqueue_meili_upsert_batch(
+                    &payload.list_key,
+                    MeiliIndexKind::ThreadDocs,
+                    &outcome.impacted_thread_ids,
+                    Some(job.id),
+                    6,
+                )
+                .await
+            {
+                Ok(true) => meili_thread_jobs_enqueued += 1,
+                Ok(false) => {}
+                Err(err) => {
+                    return retryable_error(
+                        format!("failed to enqueue meili thread upsert: {err}"),
+                        "db",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
+                }
+            }
         }
 
         info!(
@@ -1157,6 +2936,7 @@ impl Phase0JobHandler {
             dummy_nodes_written = apply_stats.dummy_nodes_written,
             messages_written = apply_stats.messages_written,
             stale_threads_removed = apply_stats.stale_threads_removed,
+            meili_thread_jobs_enqueued,
             "threading_rebuild_list applied update chunks"
         );
 
@@ -1176,6 +2956,7 @@ impl Phase0JobHandler {
                 "dummy_nodes_written": apply_stats.dummy_nodes_written,
                 "messages_written": apply_stats.messages_written,
                 "stale_threads_removed": apply_stats.stale_threads_removed,
+                "meili_thread_jobs_enqueued": meili_thread_jobs_enqueued,
                 "from_seen_at": payload.from_seen_at,
                 "to_seen_at": payload.to_seen_at,
             }),
@@ -1207,6 +2988,43 @@ impl Phase0JobHandler {
                     };
                 }
             };
+
+        if matches!(
+            self.settings.worker.pipeline_execution_mode,
+            PipelineExecutionMode::Staged
+        ) {
+            let ingest_active = match self
+                .pipeline
+                .is_list_ingest_stage_active(&payload.list_key)
+                .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    return retryable_error(
+                        format!(
+                            "failed to evaluate stage barrier for list {}: {err}",
+                            payload.list_key
+                        ),
+                        "db",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
+                }
+            };
+            if ingest_active {
+                return retryable_error(
+                    format!(
+                        "ingest stage is active for list {}, deferring lineage_rebuild_list",
+                        payload.list_key
+                    ),
+                    "stage_barrier",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+        }
 
         let list = match self.catalog.get_mailing_list(&payload.list_key).await {
             Ok(Some(v)) => v,
@@ -1340,6 +3158,43 @@ impl Phase0JobHandler {
                 }
             };
 
+        if matches!(
+            self.settings.worker.pipeline_execution_mode,
+            PipelineExecutionMode::Staged
+        ) {
+            let ingest_active = match self
+                .pipeline
+                .is_list_ingest_stage_active(&payload.list_key)
+                .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    return retryable_error(
+                        format!(
+                            "failed to evaluate stage barrier for list {}: {err}",
+                            payload.list_key
+                        ),
+                        "db",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
+                }
+            };
+            if ingest_active {
+                return retryable_error(
+                    format!(
+                        "ingest stage is active for list {}, deferring patch_extract_window",
+                        payload.list_key
+                    ),
+                    "stage_barrier",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+        }
+
         let list = match self.catalog.get_mailing_list(&payload.list_key).await {
             Ok(Some(v)) => v,
             Ok(None) => {
@@ -1381,6 +3236,7 @@ impl Phase0JobHandler {
 
         let mut patch_id_compute_enqueued = false;
         let mut diff_parse_enqueued = false;
+        let mut patch_series_search_enqueued = false;
         if !extract_outcome.patch_item_ids.is_empty() {
             let dedupe_key = hash_i64_list(&extract_outcome.patch_item_ids);
             let patch_id_payload = PatchIdComputeBatchPayload {
@@ -1442,6 +3298,30 @@ impl Phase0JobHandler {
             diff_parse_enqueued = true;
         }
 
+        if !extract_outcome.series_ids.is_empty() {
+            match self
+                .enqueue_meili_upsert_batch(
+                    &payload.list_key,
+                    MeiliIndexKind::PatchSeriesDocs,
+                    &extract_outcome.series_ids,
+                    Some(job.id),
+                    6,
+                )
+                .await
+            {
+                Ok(value) => patch_series_search_enqueued = value,
+                Err(err) => {
+                    return retryable_error(
+                        format!("failed to enqueue patch series meili upsert: {err}"),
+                        "db",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
+                }
+            }
+        }
+
         JobExecutionOutcome::Success {
             result_json: serde_json::json!({
                 "list_key": payload.list_key,
@@ -1452,6 +3332,7 @@ impl Phase0JobHandler {
                 "patch_item_ids_count": extract_outcome.patch_item_ids.len(),
                 "patch_id_compute_enqueued": patch_id_compute_enqueued,
                 "diff_parse_enqueued": diff_parse_enqueued,
+                "patch_series_search_enqueued": patch_series_search_enqueued,
             }),
             metrics: JobStoreMetrics {
                 duration_ms: started.elapsed().as_millis(),
@@ -1554,12 +3435,35 @@ impl Phase0JobHandler {
             }
         };
 
+        let patch_item_search_enqueued = match self
+            .enqueue_meili_upsert_batch(
+                "global",
+                MeiliIndexKind::PatchItemDocs,
+                &patch_item_ids,
+                Some(job.id),
+                6,
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(err) => {
+                return retryable_error(
+                    format!("failed to enqueue patch item meili upsert: {err}"),
+                    "db",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+        };
+
         JobExecutionOutcome::Success {
             result_json: serde_json::json!({
                 "source_job_id": payload.source_job_id,
                 "patch_item_ids_count": patch_item_ids.len(),
                 "patch_items_updated": outcome.patch_items_updated,
                 "patch_item_files_written": outcome.patch_item_files_written,
+                "patch_item_search_enqueued": patch_item_search_enqueued,
             }),
             metrics: JobStoreMetrics {
                 duration_ms: started.elapsed().as_millis(),
@@ -1570,6 +3474,291 @@ impl Phase0JobHandler {
             },
         }
     }
+
+    async fn handle_meili_upsert_batch(
+        &self,
+        job: Job,
+        ctx: ExecutionContext,
+    ) -> JobExecutionOutcome {
+        let started = Instant::now();
+
+        let payload: MeiliUpsertBatchPayload =
+            match serde_json::from_value(job.payload_json.clone()) {
+                Ok(value) => value,
+                Err(err) => {
+                    return JobExecutionOutcome::Terminal {
+                        reason: format!("invalid meili_upsert_batch payload: {err}"),
+                        kind: "payload".to_string(),
+                        metrics: empty_metrics(started.elapsed().as_millis()),
+                    };
+                }
+            };
+
+        let mut ids = payload.ids.clone();
+        ids.sort_unstable();
+        ids.dedup();
+        ids.retain(|value| *value > 0);
+        if ids.is_empty() {
+            return JobExecutionOutcome::Success {
+                result_json: serde_json::json!({
+                    "index": payload.index.uid(),
+                    "ids_count": 0,
+                    "source_job_id": payload.source_job_id,
+                    "skipped": "empty_id_set"
+                }),
+                metrics: empty_metrics(started.elapsed().as_millis()),
+            };
+        }
+
+        let index_spec = payload.index.spec();
+        let settings = index_spec.settings_json();
+
+        if let Err(err) = self
+            .ensure_index_settings(index_spec, &settings, &ctx)
+            .await
+        {
+            if err.is_transient() {
+                return retryable_error(
+                    format!("failed to prepare meili index {}: {err}", index_spec.uid),
+                    "meili",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+            return JobExecutionOutcome::Terminal {
+                reason: format!("failed to prepare meili index {}: {err}", index_spec.uid),
+                kind: "meili".to_string(),
+                metrics: empty_metrics(started.elapsed().as_millis()),
+            };
+        }
+
+        let docs = match self.build_docs_for_index(payload.index, &ids).await {
+            Ok(value) => value,
+            Err(err) => {
+                let first_ids: Vec<i64> = ids.iter().take(5).copied().collect();
+                return retryable_error(
+                    format!(
+                        "failed to build meili documents for {}: ids_count={} first_ids={first_ids:?} error={err}",
+                        payload.index.uid(),
+                        ids.len()
+                    ),
+                    "db",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+        };
+        if docs.is_empty() {
+            return JobExecutionOutcome::Success {
+                result_json: serde_json::json!({
+                    "index": payload.index.uid(),
+                    "ids_count": ids.len(),
+                    "docs_upserted": 0,
+                    "source_job_id": payload.source_job_id,
+                    "skipped": "no_docs_for_ids"
+                }),
+                metrics: JobStoreMetrics {
+                    duration_ms: started.elapsed().as_millis(),
+                    rows_written: 0,
+                    bytes_read: 0,
+                    commit_count: ids.len() as u64,
+                    parse_errors: 0,
+                },
+            };
+        }
+
+        let task_uid = match self.meili.upsert_documents(index_spec.uid, &docs).await {
+            Ok(value) => value,
+            Err(err) => {
+                if err.is_transient() {
+                    return retryable_error(
+                        format!(
+                            "meili upsert request failed for {}: {err}",
+                            payload.index.uid()
+                        ),
+                        "meili",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
+                }
+                return JobExecutionOutcome::Terminal {
+                    reason: format!(
+                        "meili upsert request failed for {}: {err}",
+                        payload.index.uid()
+                    ),
+                    kind: "meili".to_string(),
+                    metrics: empty_metrics(started.elapsed().as_millis()),
+                };
+            }
+        };
+
+        if let Err(err) = self.wait_for_task(task_uid, &ctx).await {
+            if err.is_transient() {
+                return retryable_error(
+                    format!(
+                        "meili task {task_uid} failed for {}: {err}",
+                        payload.index.uid()
+                    ),
+                    "meili",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+            return JobExecutionOutcome::Terminal {
+                reason: format!(
+                    "meili task {task_uid} failed for {}: {err}",
+                    payload.index.uid()
+                ),
+                kind: "meili".to_string(),
+                metrics: empty_metrics(started.elapsed().as_millis()),
+            };
+        }
+
+        let docs_bytes = serde_json::to_vec(&docs)
+            .map(|bytes| bytes.len() as u64)
+            .unwrap_or(0);
+        JobExecutionOutcome::Success {
+            result_json: serde_json::json!({
+                "index": payload.index.uid(),
+                "ids_count": ids.len(),
+                "docs_upserted": docs.len(),
+                "source_job_id": payload.source_job_id,
+                "meili_task_id": task_uid
+            }),
+            metrics: JobStoreMetrics {
+                duration_ms: started.elapsed().as_millis(),
+                rows_written: docs.len() as u64,
+                bytes_read: docs_bytes,
+                commit_count: ids.len() as u64,
+                parse_errors: 0,
+            },
+        }
+    }
+
+    async fn ensure_index_settings(
+        &self,
+        index_spec: &'static nexus_core::search::MeiliIndexSpec,
+        settings: &serde_json::Value,
+        ctx: &ExecutionContext,
+    ) -> Result<(), MeiliClientError> {
+        let mut current_settings = self.meili.get_settings(index_spec.uid).await?;
+        if current_settings.is_none() {
+            if let Some(task_uid) = self.meili.ensure_index_exists(index_spec).await? {
+                match self.wait_for_task(task_uid, ctx).await {
+                    Ok(()) => {}
+                    Err(MeiliClientError::Protocol(message))
+                        if message.contains("code=index_already_exists") => {}
+                    Err(err) => return Err(err),
+                }
+            }
+            current_settings = self.meili.get_settings(index_spec.uid).await?;
+        }
+
+        if settings_differ(current_settings.as_ref(), settings) {
+            let task_uid = self.meili.update_settings(index_spec.uid, settings).await?;
+            self.wait_for_task(task_uid, ctx).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn wait_for_task(
+        &self,
+        task_uid: i64,
+        ctx: &ExecutionContext,
+    ) -> Result<(), MeiliClientError> {
+        loop {
+            let _ = ctx.heartbeat().await;
+            let task = self.meili.get_task(task_uid).await?;
+            match task.status.as_str() {
+                "enqueued" | "processing" => {
+                    sleep(Duration::from_millis(300)).await;
+                }
+                "succeeded" => return Ok(()),
+                "failed" | "canceled" => {
+                    let code = task.error_code.unwrap_or_else(|| "unknown".to_string());
+                    let message = task
+                        .error_message
+                        .unwrap_or_else(|| "unknown meili task failure".to_string());
+                    return Err(MeiliClientError::Protocol(format!(
+                        "task status={} code={} message={}",
+                        task.status, code, message
+                    )));
+                }
+                other => {
+                    return Err(MeiliClientError::Protocol(format!(
+                        "unexpected task status: {other}"
+                    )));
+                }
+            }
+        }
+    }
+
+    async fn build_docs_for_index(
+        &self,
+        index: MeiliIndexKind,
+        ids: &[i64],
+    ) -> nexus_db::Result<Vec<serde_json::Value>> {
+        match index {
+            MeiliIndexKind::PatchItemDocs => self.search.build_patch_item_docs(ids).await,
+            MeiliIndexKind::PatchSeriesDocs => self.search.build_patch_series_docs(ids).await,
+            MeiliIndexKind::ThreadDocs => self.search.build_thread_docs(ids).await,
+        }
+    }
+
+    async fn enqueue_meili_upsert_batch(
+        &self,
+        list_key: &str,
+        index: MeiliIndexKind,
+        ids: &[i64],
+        source_job_id: Option<i64>,
+        priority: i32,
+    ) -> Result<bool, sqlx::Error> {
+        let mut ids = ids.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
+        ids.retain(|value| *value > 0);
+        if ids.is_empty() {
+            return Ok(false);
+        }
+
+        let dedupe_key = format!("{}:{}", index.uid(), hash_i64_list(&ids));
+        let payload = MeiliUpsertBatchPayload {
+            index,
+            ids,
+            source_job_id,
+        };
+
+        self.jobs
+            .enqueue(EnqueueJobParams {
+                job_type: "meili_upsert_batch".to_string(),
+                payload_json: serde_json::to_value(payload)
+                    .unwrap_or_else(|_| serde_json::json!({})),
+                priority,
+                dedupe_scope: Some(format!("list:{list_key}")),
+                dedupe_key: Some(dedupe_key),
+                run_after: None,
+                max_attempts: Some(8),
+            })
+            .await?;
+
+        Ok(true)
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, Default)]
+struct SearchFamilyOutcome {
+    artifact_kind: String,
+    index_uid: String,
+    chunks_done: u64,
+    ids_seen: u64,
+    docs_upserted: u64,
+    docs_bytes: u64,
+    tasks_submitted: u64,
 }
 
 #[derive(Default)]
@@ -1578,6 +3767,7 @@ struct ThreadingWindowOutcome {
     source_messages_read: u64,
     apply_stats: ThreadingApplyStats,
     lineage_enqueued: bool,
+    impacted_thread_ids: Vec<i64>,
 }
 
 struct RawCommitMail {
@@ -1767,6 +3957,97 @@ fn hash_i64_list(values: &[i64]) -> String {
     out
 }
 
+fn stage_rank(stage: &str) -> Option<u8> {
+    match stage {
+        STAGE_INGEST => Some(1),
+        STAGE_THREADING => Some(2),
+        STAGE_LINEAGE_DIFF => Some(3),
+        STAGE_SEARCH => Some(4),
+        _ => None,
+    }
+}
+
+fn effective_parse_worker_count(
+    ratio: f64,
+    min_workers: usize,
+    max_workers: usize,
+    chunk_size: usize,
+) -> usize {
+    let available_cpus = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1);
+    effective_parse_worker_count_with_cpus(
+        available_cpus,
+        ratio,
+        min_workers,
+        max_workers,
+        chunk_size,
+    )
+}
+
+fn effective_parse_worker_count_with_cpus(
+    available_cpus: usize,
+    ratio: f64,
+    min_workers: usize,
+    max_workers: usize,
+    chunk_size: usize,
+) -> usize {
+    let mut min_workers = min_workers.max(1);
+    let max_workers = max_workers.max(1);
+    if min_workers > max_workers {
+        min_workers = max_workers;
+    }
+
+    let target = ((available_cpus.max(1) as f64) * ratio).ceil() as usize;
+    target
+        .max(1)
+        .clamp(min_workers, max_workers)
+        .min(chunk_size.max(1))
+}
+
+fn discover_repo_relpaths(list_root: &Path) -> Result<Vec<String>, std::io::Error> {
+    if !list_root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut repos = BTreeSet::new();
+    let all_git = list_root.join("all.git");
+    if all_git.is_dir() {
+        repos.insert("all.git".to_string());
+    }
+
+    let git_dir = list_root.join("git");
+    if git_dir.is_dir() {
+        for entry in fs::read_dir(&git_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir()
+                && path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("")
+                    .ends_with(".git")
+            {
+                let repo_name = path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("");
+                repos.insert(format!("git/{repo_name}"));
+            }
+        }
+    }
+
+    if repos.is_empty() && looks_like_bare_repo(list_root) {
+        repos.insert(".".to_string());
+    }
+
+    Ok(repos.into_iter().collect())
+}
+
+fn looks_like_bare_repo(path: &Path) -> bool {
+    path.join("objects").exists() && path.join("refs").exists()
+}
+
 fn read_mail_blob(repo: &gix::Repository, commit_oid: &str) -> anyhow::Result<Option<Vec<u8>>> {
     let commit_id = ObjectId::from_hex(commit_oid.as_bytes())?;
     let commit = repo
@@ -1795,4 +4076,30 @@ fn read_mail_blob(repo: &gix::Repository, commit_oid: &str) -> anyhow::Result<Op
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
     Ok(Some(blob.data.to_vec()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::effective_parse_worker_count_with_cpus;
+
+    #[test]
+    fn cpu_ratio_worker_count_matches_expected_rounding() {
+        let workers = effective_parse_worker_count_with_cpus(16, 0.6, 2, 32, 10_000);
+        assert_eq!(workers, 10);
+    }
+
+    #[test]
+    fn cpu_ratio_worker_count_honors_chunk_size_cap() {
+        let workers = effective_parse_worker_count_with_cpus(16, 0.6, 2, 32, 3);
+        assert_eq!(workers, 3);
+    }
+
+    #[test]
+    fn cpu_ratio_worker_count_honors_min_max_bounds() {
+        let workers = effective_parse_worker_count_with_cpus(2, 0.1, 4, 8, 10_000);
+        assert_eq!(workers, 4);
+
+        let workers = effective_parse_worker_count_with_cpus(128, 0.9, 2, 32, 10_000);
+        assert_eq!(workers, 32);
+    }
 }

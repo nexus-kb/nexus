@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use nexus_core::search::MeiliIndexKind;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,6 +25,26 @@ pub struct RepoIngestRunPayload {
     pub repo_key: String,
     pub mirror_path: String,
     pub since_commit_oid: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineStageIngestPayload {
+    pub run_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineStageThreadingPayload {
+    pub run_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineStageLineageDiffPayload {
+    pub run_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineStageSearchPayload {
+    pub run_id: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,4 +85,28 @@ pub struct PatchIdComputeBatchPayload {
 pub struct DiffParsePatchItemsPayload {
     pub patch_item_ids: Vec<i64>,
     pub source_job_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeiliUpsertBatchPayload {
+    pub index: MeiliIndexKind,
+    pub ids: Vec<i64>,
+    pub source_job_id: Option<i64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MeiliUpsertBatchPayload;
+    use nexus_core::search::MeiliIndexKind;
+
+    #[test]
+    fn meili_payload_serializes_index_kind_as_snake_case() {
+        let payload = MeiliUpsertBatchPayload {
+            index: MeiliIndexKind::ThreadDocs,
+            ids: vec![1, 2, 3],
+            source_job_id: Some(77),
+        };
+        let encoded = serde_json::to_string(&payload).expect("serialize payload");
+        assert!(encoded.contains("\"thread_docs\""));
+    }
 }

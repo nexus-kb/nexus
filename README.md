@@ -149,6 +149,7 @@ cargo run -p nexus-cli -- seed-pilot
 - `GET /api/v1/series/{series_id}`
 - `GET /api/v1/series/{series_id}/versions/{series_version_id}?assembled=true|false`
 - `GET /api/v1/series/{series_id}/compare?v1=&v2=&mode=summary|per_patch|per_file`
+- `GET /api/v1/search?q=&scope=thread|series|patch_item&list_key=&author=&from=&to=&has_diff=&sort=&limit=&cursor=`
 - `GET /api/v1/patch-items/{patch_item_id}`
 - `GET /api/v1/patch-items/{patch_item_id}/files`
 - `GET /api/v1/patch-items/{patch_item_id}/files/{path}/diff`

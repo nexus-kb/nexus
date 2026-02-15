@@ -6,6 +6,8 @@ mod ingest;
 mod jobs;
 mod lineage;
 mod models;
+mod pipeline;
+mod search;
 mod threading;
 
 pub use crate::catalog::{
@@ -30,7 +32,9 @@ pub use crate::lineage::{
     ThreadRefRecord, ThreadSummaryRecord, UpsertPatchItemFileInput, UpsertPatchItemInput,
     UpsertPatchSeriesInput, UpsertPatchSeriesVersionInput,
 };
-pub use crate::models::{Job, JobState};
+pub use crate::models::{Job, JobState, PipelineRun, PipelineStageRun};
+pub use crate::pipeline::{ListPipelineRunsParams, PipelineArtifactCount, PipelineStore};
+pub use crate::search::SearchStore;
 pub use crate::threading::{
     ThreadComponentWrite, ThreadMessageWrite, ThreadNodeWrite, ThreadSourceMessage,
     ThreadSummaryWrite, ThreadingApplyStats, ThreadingStore,

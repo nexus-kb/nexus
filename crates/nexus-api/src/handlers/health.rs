@@ -46,7 +46,7 @@ pub async fn readyz(State(state): State<ApiState>) -> Json<ReadyResponse> {
             "{}/health",
             state.settings.meili.url.trim_end_matches('/')
         ))
-        .header("X-Meili-API-Key", &state.settings.meili.master_key)
+        .bearer_auth(&state.settings.meili.master_key)
         .send()
         .await
     {

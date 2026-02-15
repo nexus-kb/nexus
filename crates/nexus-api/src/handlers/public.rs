@@ -5,17 +5,19 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
 use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
+use nexus_core::search::SearchScope;
 use nexus_db::{
     ListThreadsParams, PatchItemDetailRecord, SeriesExportMessageRecord, SeriesLogicalCompareRow,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::state::ApiState;
 
 const CACHE_THREAD: &str = "public, max-age=300, stale-while-revalidate=86400";
 const CACHE_LONG: &str = "public, max-age=86400, stale-while-revalidate=604800";
+const CACHE_SEARCH: &str = "public, max-age=30, stale-while-revalidate=300";
 
 #[derive(Debug, Serialize, Clone)]
 pub struct PaginationResponse {
@@ -478,6 +480,59 @@ pub struct SeriesCompareResponse {
     pub files: Option<Vec<SeriesCompareFileRow>>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SearchQuery {
+    pub q: String,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub list_key: Option<String>,
+    #[serde(default)]
+    pub author: Option<String>,
+    #[serde(default)]
+    pub from: Option<String>,
+    #[serde(default)]
+    pub to: Option<String>,
+    #[serde(default)]
+    pub has_diff: Option<bool>,
+    #[serde(default)]
+    pub sort: Option<String>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub hybrid: Option<bool>,
+    #[serde(default)]
+    pub semantic_ratio: Option<f32>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SearchItemResponse {
+    pub scope: String,
+    pub id: i64,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
+    pub route: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub date_utc: Option<String>,
+    pub list_keys: Vec<String>,
+    pub has_diff: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author_email: Option<String>,
+    pub metadata: Value,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SearchResponse {
+    pub items: Vec<SearchItemResponse>,
+    pub facets: Value,
+    pub highlights: BTreeMap<String, Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
 pub async fn list_catalog(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -547,7 +602,6 @@ pub async fn list_detail(
                 "thread".to_string(),
                 "series".to_string(),
                 "patch_item".to_string(),
-                "email".to_string(),
             ],
         },
     };
@@ -1484,6 +1538,250 @@ pub async fn series_version_export_mbox(
     )
 }
 
+pub async fn search(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<SearchQuery>,
+) -> Result<Response, StatusCode> {
+    let q = query.q.trim();
+    if q.is_empty() {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    if hybrid_requested(query.hybrid, query.semantic_ratio) {
+        return json_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            json!({ "error": "hybrid is phase 2" }),
+        );
+    }
+
+    let scope = match query.scope.as_deref() {
+        Some(raw) => SearchScope::parse(raw).ok_or(StatusCode::UNPROCESSABLE_ENTITY)?,
+        None => SearchScope::Thread,
+    };
+    let spec = scope.index_kind().spec();
+
+    let sort = query.sort.as_deref().unwrap_or("relevance");
+    if sort != "relevance" && sort != "date_desc" {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    let from_ts = match query.from.as_deref() {
+        Some(raw) => Some(parse_timestamp(raw).ok_or(StatusCode::UNPROCESSABLE_ENTITY)?),
+        None => None,
+    };
+    let to_ts = match query.to.as_deref() {
+        Some(raw) => Some(parse_timestamp(raw).ok_or(StatusCode::UNPROCESSABLE_ENTITY)?),
+        None => None,
+    };
+
+    let limit = query.limit.unwrap_or(20).clamp(1, 100) as usize;
+    let request_hash = search_request_hash(
+        q,
+        scope,
+        query.list_key.as_deref(),
+        query.author.as_deref(),
+        from_ts.clone(),
+        to_ts.clone(),
+        query.has_diff,
+        sort,
+        limit,
+    );
+    let offset = if let Some(cursor) = query.cursor.as_deref() {
+        let (offset, cursor_hash) =
+            parse_search_cursor(cursor).ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+        if cursor_hash != request_hash {
+            return Err(StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        offset
+    } else {
+        0
+    };
+
+    let mut filters: Vec<String> = Vec::new();
+    if let Some(list_key) = query.list_key.as_deref() {
+        filters.push(format!("list_keys = \"{}\"", escape_filter_value(list_key)));
+    }
+    if let Some(author) = query.author.as_deref() {
+        filters.push(format!(
+            "{} = \"{}\"",
+            spec.author_filter_field,
+            escape_filter_value(author)
+        ));
+    }
+    if let Some(has_diff) = query.has_diff {
+        filters.push(format!("has_diff = {has_diff}"));
+    }
+    if let Some(from_ts) = from_ts {
+        filters.push(format!("date_ts >= {}", from_ts.timestamp()));
+    }
+    if let Some(to_ts) = to_ts {
+        filters.push(format!("date_ts < {}", to_ts.timestamp()));
+    }
+
+    let mut request_body = json!({
+        "q": q,
+        "offset": offset,
+        "limit": limit,
+        "facets": spec.default_facets,
+        "attributesToHighlight": spec.highlight_attributes,
+        "attributesToCrop": spec.crop_attributes,
+        "cropLength": spec.crop_length
+    });
+    if !filters.is_empty() {
+        if filters.len() == 1 {
+            request_body["filter"] = Value::String(filters[0].clone());
+        } else {
+            request_body["filter"] = json!(filters);
+        }
+    }
+    if sort == "date_desc" {
+        request_body["sort"] = json!(["date_ts:desc"]);
+    }
+
+    let search_response = reqwest::Client::new()
+        .post(format!(
+            "{}/indexes/{}/search",
+            state.settings.meili.url.trim_end_matches('/'),
+            spec.uid
+        ))
+        .bearer_auth(&state.settings.meili.master_key)
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+
+    if !search_response.status().is_success() {
+        return match search_response.status().as_u16() {
+            400 | 401 | 403 | 404 | 422 => Err(StatusCode::UNPROCESSABLE_ENTITY),
+            _ => Err(StatusCode::BAD_GATEWAY),
+        };
+    }
+
+    let payload: Value = search_response
+        .json()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let total_hits = payload
+        .get("estimatedTotalHits")
+        .and_then(Value::as_u64)
+        .or_else(|| payload.get("totalHits").and_then(Value::as_u64))
+        .unwrap_or(0) as usize;
+
+    let hits = payload
+        .get("hits")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut items = Vec::with_capacity(hits.len());
+    let mut highlights = BTreeMap::new();
+    for hit in hits {
+        let Some(id) = hit.get("id").and_then(Value::as_i64) else {
+            continue;
+        };
+        let route = hit
+            .get("route")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| default_route_for_scope(scope, id));
+        let title = hit
+            .get("title")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("Result {id}"));
+        let list_keys = hit
+            .get("list_keys")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let snippet = extract_snippet(&hit, spec.crop_attributes);
+        let author_email = hit
+            .get("author_email")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .or_else(|| {
+                hit.get("author_emails")
+                    .and_then(Value::as_array)
+                    .and_then(|values| values.first())
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            });
+
+        let mut metadata = serde_json::Map::new();
+        for key in [
+            "message_id_primary",
+            "patch_series_id",
+            "series_version_id",
+            "version_num",
+            "ordinal",
+            "is_rfc",
+            "latest_version_num",
+            "latest_version_id",
+            "list_key",
+            "participants",
+        ] {
+            if let Some(value) = hit.get(key) {
+                metadata.insert(key.to_string(), value.clone());
+            }
+        }
+
+        if let Some(formatted) = hit.get("_formatted") {
+            highlights.insert(id.to_string(), formatted.clone());
+        }
+
+        items.push(SearchItemResponse {
+            scope: scope.as_str().to_string(),
+            id,
+            title,
+            snippet,
+            route,
+            date_utc: hit
+                .get("date_utc")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            list_keys,
+            has_diff: hit
+                .get("has_diff")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            author_email,
+            metadata: Value::Object(metadata),
+        });
+    }
+
+    let facets = normalize_search_facets(
+        payload
+            .get("facetDistribution")
+            .cloned()
+            .unwrap_or_else(|| json!({})),
+        spec.author_filter_field,
+    );
+    let next_cursor = if !items.is_empty() && offset + items.len() < total_hits {
+        Some(encode_search_cursor(offset + items.len(), &request_hash))
+    } else {
+        None
+    };
+
+    json_response_with_cache(
+        &headers,
+        &SearchResponse {
+            items,
+            facets,
+            highlights,
+            next_cursor,
+        },
+        CACHE_SEARCH,
+        None,
+    )
+}
+
 pub async fn openapi_json(headers: HeaderMap) -> Result<Response, StatusCode> {
     let doc = json!({
         "openapi": "3.1.0",
@@ -1511,6 +1809,7 @@ pub async fn openapi_json(headers: HeaderMap) -> Result<Response, StatusCode> {
             "/api/v1/series/{series_id}/versions/{series_version_id}": { "get": { "summary": "Series version detail" } },
             "/api/v1/series/{series_id}/compare": { "get": { "summary": "Compare series versions" } },
             "/api/v1/series/{series_id}/versions/{series_version_id}/export/mbox": { "get": { "summary": "Export version mbox" } },
+            "/api/v1/search": { "get": { "summary": "Search across threads/series/patches" } },
             "/api/v1/patch-items/{patch_item_id}": { "get": { "summary": "Patch item metadata" } },
             "/api/v1/patch-items/{patch_item_id}/files": { "get": { "summary": "Patch item files metadata" } },
             "/api/v1/patch-items/{patch_item_id}/files/{path}/diff": { "get": { "summary": "Patch file diff slice" } },
@@ -1572,6 +1871,118 @@ fn to_patch_compare_rows(rows: Vec<SeriesLogicalCompareRow>) -> Vec<SeriesCompar
             })
         })
         .collect()
+}
+
+fn search_request_hash(
+    q: &str,
+    scope: SearchScope,
+    list_key: Option<&str>,
+    author: Option<&str>,
+    from_ts: Option<DateTime<Utc>>,
+    to_ts: Option<DateTime<Utc>>,
+    has_diff: Option<bool>,
+    sort: &str,
+    limit: usize,
+) -> String {
+    let normalized = json!({
+        "q": q,
+        "scope": scope.as_str(),
+        "list_key": list_key.unwrap_or(""),
+        "author": author.unwrap_or(""),
+        "from_ts": from_ts.map(|value| value.timestamp()),
+        "to_ts": to_ts.map(|value| value.timestamp()),
+        "has_diff": has_diff,
+        "sort": sort,
+        "limit": limit
+    });
+    let mut hasher = Sha256::new();
+    hasher.update(serde_json::to_vec(&normalized).unwrap_or_default());
+    let digest = hasher.finalize();
+    hex_encode(&digest[..16])
+}
+
+fn encode_search_cursor(offset: usize, request_hash: &str) -> String {
+    format!("o{offset}-h{request_hash}")
+}
+
+fn parse_search_cursor(raw: &str) -> Option<(usize, String)> {
+    let mut parts = raw.split("-h");
+    let offset_part = parts.next()?;
+    let hash_part = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let offset = offset_part.strip_prefix('o')?.parse::<usize>().ok()?;
+    if hash_part.is_empty() {
+        return None;
+    }
+    Some((offset, hash_part.to_string()))
+}
+
+fn escape_filter_value(raw: &str) -> String {
+    raw.replace('\\', "\\\\").replace('\"', "\\\"")
+}
+
+fn default_route_for_scope(scope: SearchScope, id: i64) -> String {
+    match scope {
+        SearchScope::Thread => "/search".to_string(),
+        SearchScope::Series => format!("/series/{id}"),
+        SearchScope::PatchItem => format!("/diff/{id}"),
+    }
+}
+
+fn extract_snippet(hit: &Value, crop_attributes: &[&str]) -> Option<String> {
+    if let Some(formatted) = hit.get("_formatted") {
+        if let Some(snippet) = formatted.get("snippet").and_then(Value::as_str) {
+            return Some(snippet.to_string());
+        }
+        for field in crop_attributes {
+            if let Some(value) = formatted.get(*field).and_then(Value::as_str) {
+                return Some(value.to_string());
+            }
+        }
+    }
+
+    if let Some(snippet) = hit.get("snippet").and_then(Value::as_str) {
+        return Some(snippet.to_string());
+    }
+
+    for field in crop_attributes {
+        if let Some(value) = hit.get(*field).and_then(Value::as_str) {
+            return build_snippet(Some(value));
+        }
+    }
+
+    hit.get("subject")
+        .and_then(Value::as_str)
+        .and_then(|value| build_snippet(Some(value)))
+}
+
+fn normalize_search_facets(raw: Value, author_field: &str) -> Value {
+    let mut out = serde_json::Map::new();
+    if let Some(list_keys) = raw.get("list_keys") {
+        out.insert("list_keys".to_string(), list_keys.clone());
+    }
+    if let Some(authors) = raw.get(author_field) {
+        out.insert("author".to_string(), authors.clone());
+    }
+    if let Some(has_diff) = raw.get("has_diff") {
+        out.insert("has_diff".to_string(), has_diff.clone());
+    }
+    Value::Object(out)
+}
+
+fn hybrid_requested(hybrid: Option<bool>, semantic_ratio: Option<f32>) -> bool {
+    hybrid.unwrap_or(false) || semantic_ratio.is_some()
+}
+
+fn json_error_response(status: StatusCode, payload: Value) -> Result<Response, StatusCode> {
+    let body = serde_json::to_vec(&payload).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 fn json_response_with_cache<T: Serialize>(
@@ -1836,13 +2247,17 @@ mod tests {
     use std::path::Path;
     use std::process::Command;
 
+    use axum::body::to_bytes;
+    use axum::http::StatusCode;
     use axum::http::{HeaderMap, header};
     use chrono::Utc;
     use nexus_db::{SeriesExportMessageRecord, SeriesLogicalCompareRow};
+    use serde_json::Value;
 
     use super::{
-        build_pagination, if_none_match_matches, normalize_page, parse_timestamp,
-        parse_window_days, render_mbox, slice_by_offsets, strip_quoted_lines,
+        build_pagination, encode_search_cursor, hybrid_requested, if_none_match_matches,
+        json_error_response, normalize_page, parse_search_cursor, parse_timestamp,
+        parse_window_days, render_mbox, search_request_hash, slice_by_offsets, strip_quoted_lines,
         to_patch_compare_rows,
     };
 
@@ -1942,6 +2357,67 @@ mod tests {
         assert_eq!(mapped.len(), 1);
         assert_eq!(mapped[0].slot, 2);
         assert_eq!(mapped[0].status, "changed");
+    }
+
+    #[test]
+    fn search_cursor_round_trip() {
+        let encoded = encode_search_cursor(40, "abcd1234");
+        let decoded = parse_search_cursor(&encoded).expect("decode");
+        assert_eq!(decoded.0, 40);
+        assert_eq!(decoded.1, "abcd1234");
+    }
+
+    #[test]
+    fn search_request_hash_changes_with_query_shape() {
+        let first = search_request_hash(
+            "mm reclaim",
+            nexus_core::search::SearchScope::Thread,
+            Some("lkml"),
+            None,
+            None,
+            None,
+            Some(true),
+            "relevance",
+            20,
+        );
+        let second = search_request_hash(
+            "mm reclaim",
+            nexus_core::search::SearchScope::Series,
+            Some("lkml"),
+            None,
+            None,
+            None,
+            Some(true),
+            "relevance",
+            20,
+        );
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn hybrid_flag_detection_matches_phase1_contract() {
+        assert!(!hybrid_requested(None, None));
+        assert!(hybrid_requested(Some(true), None));
+        assert!(hybrid_requested(None, Some(0.4)));
+    }
+
+    #[tokio::test]
+    async fn hybrid_error_response_matches_contract() {
+        let response = json_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            serde_json::json!({ "error": "hybrid is phase 2" }),
+        )
+        .expect("response");
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let payload: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(
+            payload.get("error").and_then(Value::as_str),
+            Some("hybrid is phase 2")
+        );
     }
 
     #[test]
