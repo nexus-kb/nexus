@@ -1,0 +1,80 @@
+name: API CI
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test-build-scan-push:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run cargo tests
+        run: cargo test --locked
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute image reference
+        id: prep
+        run: |
+          owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          repo_name="${GITHUB_REPOSITORY##*/}"
+          echo "image_ref=ghcr.io/${owner}/${repo_name}" >> "${GITHUB_OUTPUT}"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.prep.outputs.image_ref }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=main
+            type=sha,format=short,prefix=sha-
+
+      - name: Build image for scan
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: local/nexus-api-server:scan
+          cache-from: type=gha,scope=nexus-api-server
+          cache-to: type=gha,mode=max,scope=nexus-api-server
+
+      - name: Scan image for critical vulnerabilities
+        uses: aquasecurity/trivy-action@0.32.0
+        with:
+          image-ref: local/nexus-api-server:scan
+          format: table
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: CRITICAL
+          exit-code: "1"
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=nexus-api-server
+          cache-to: type=gha,mode=max,scope=nexus-api-server
