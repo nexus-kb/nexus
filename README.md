@@ -77,10 +77,10 @@ cargo run -p nexus-jobs --bin worker
 
 ## Docker (standalone, not compose)
 
-Build:
+Build production image:
 
 ```bash
-docker build -t nexus-api-server:debug -f Dockerfile .
+docker build -t nexus-api-server:prod -f Dockerfile .
 ```
 
 Build dev image (compose-compatible tooling image):
@@ -89,25 +89,38 @@ Build dev image (compose-compatible tooling image):
 docker build -t nexus-api-server:dev -f Dockerfile.dev .
 ```
 
-Run API long-lived:
+Run API long-lived (default command):
 
 ```bash
 docker run --name nexus-api --rm -p 3000:3000 \
   -e NEXUS__DATABASE__URL=postgresql://nexus:nexus@host.docker.internal:5432/nexus_kb \
   -e NEXUS__MAIL__MIRROR_ROOT=/opt/nexus/mailing-lists \
-  nexus-api-server:debug
+  nexus-api-server:prod
 ```
 
-For Podman, replace `host.docker.internal` with `host.containers.internal`.
+Run API with explicit user mapping:
 
-Run worker using the same image:
+```bash
+docker run --name nexus-api --rm -p 3000:3000 \
+  --user 1000:1000 \
+  -e NEXUS__DATABASE__URL=postgresql://nexus:nexus@host.docker.internal:5432/nexus_kb \
+  -e NEXUS__MAIL__MIRROR_ROOT=/opt/nexus/mailing-lists \
+  nexus-api-server:prod
+```
+
+For rootless Podman/Quadlet production, prefer `--userns=keep-id` with explicit `--user <host_uid>:<host_gid>` (or the equivalent Quadlet settings). This repository does not support `PUID`/`PGID` environment variable remapping.
+
+For Podman host networking to services, replace `host.docker.internal` with `host.containers.internal`.
+
+Run worker using the same production image:
 
 ```bash
 docker run --name nexus-worker --rm \
+  --user 1000:1000 \
   -e NEXUS__DATABASE__URL=postgresql://nexus:nexus@host.docker.internal:5432/nexus_kb \
   -e NEXUS__MAIL__MIRROR_ROOT=/opt/nexus/mailing-lists \
-  --entrypoint /srv/nexus-api-server/target/release/worker \
-  nexus-api-server:debug
+  -v /opt/nexus/mailing-lists:/opt/nexus/mailing-lists:ro \
+  nexus-api-server:prod /usr/local/bin/worker
 ```
 
 Backfill-oriented worker profile example:

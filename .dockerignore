@@ -1,6 +1,8 @@
 .git
+.gitignore
 target
 **/target
+ai-archive
 .DS_Store
 *.log
 *.tmp

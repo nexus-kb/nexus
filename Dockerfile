@@ -1,38 +1,44 @@
-FROM ubuntu:24.04
-
-ENV DEBIAN_FRONTEND=noninteractive
-ENV CARGO_HOME=/opt/cargo
-ENV RUSTUP_HOME=/opt/rustup
-ENV PATH=/opt/cargo/bin:${PATH}
+FROM docker.io/library/rust:bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    bash \
     build-essential \
-    ca-certificates \
     clang \
-    curl \
-    git \
-    libpq-dev \
-    libssl-dev \
     pkg-config \
-    procps \
-    tini \
+    libssl-dev \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable \
-    && rustup component add rustfmt clippy
-
-WORKDIR /srv/nexus-api-server
+WORKDIR /build
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-RUN cargo build --release -p nexus-api -p nexus-jobs
+RUN cargo build --release --locked -p nexus-api -p nexus-jobs
+
+FROM docker.io/library/debian:bookworm-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    git \
+    tini \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd --gid 10001 nexus \
+    && useradd --uid 10001 --gid nexus --create-home --home-dir /home/nexus --shell /usr/sbin/nologin nexus \
+    && mkdir -p /srv/nexus \
+    && chown nexus:nexus /srv/nexus
+
+WORKDIR /srv/nexus
+
+COPY --from=builder /build/target/release/nexus-api /usr/local/bin/nexus-api
+COPY --from=builder /build/target/release/worker /usr/local/bin/worker
 
 ENV NEXUS__APP__HOST=0.0.0.0
 ENV NEXUS__APP__PORT=3000
 
 EXPOSE 3000
 
+USER 10001:10001
+
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["/srv/nexus-api-server/target/release/nexus-api"]
+CMD ["/usr/local/bin/nexus-api"]
