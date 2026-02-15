@@ -6,7 +6,7 @@ mod state;
 
 use std::net::SocketAddr;
 
-use axum::http::{HeaderValue, Method, header::CONTENT_TYPE};
+use axum::http::{HeaderValue, Method, header::CONTENT_TYPE, header::HeaderName};
 use axum::middleware;
 use nexus_core::config;
 use nexus_db::Db;
@@ -19,7 +19,7 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 use crate::router::build_router;
 use crate::state::ApiState;
 
-const DEFAULT_ALLOWED_ORIGINS: &str = "http://127.0.0.1:3001,http://localhost:3001,http://host.containers.internal:3001,http://host.docker.internal:3001";
+const DEFAULT_ALLOWED_ORIGINS: &str = "http://127.0.0.1:3001,http://localhost:3001,http://host.containers.internal:3001,http://host.docker.internal:3001,http://127.0.0.1:3002,http://localhost:3002,http://host.containers.internal:3002,http://host.docker.internal:3002";
 
 fn build_cors() -> CorsLayer {
     let raw_origins = std::env::var("NEXUS_CORS_ALLOWED_ORIGINS")
@@ -42,8 +42,8 @@ fn build_cors() -> CorsLayer {
 
     CorsLayer::new()
         .allow_origin(allowed_origins)
-        .allow_methods([Method::GET, Method::HEAD, Method::OPTIONS])
-        .allow_headers([CONTENT_TYPE])
+        .allow_methods([Method::GET, Method::HEAD, Method::OPTIONS, Method::POST])
+        .allow_headers([CONTENT_TYPE, HeaderName::from_static("x-nexus-admin-token")])
 }
 
 #[tokio::main]

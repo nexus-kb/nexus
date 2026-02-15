@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -6,12 +6,17 @@ use axum::Json;
 use axum::extract::{Path as AxumPath, Query, State};
 use chrono::{DateTime, Utc};
 use nexus_core::config::PipelineExecutionMode;
-use nexus_db::{EnqueueJobParams, Job, JobState, ListJobsParams, ListPipelineRunsParams};
+use nexus_core::search::MeiliIndexKind;
+use nexus_db::{
+    DbListStorageRecord, DbStorageTotalsRecord, EnqueueJobParams, Job, JobState, JobStateCount,
+    JobTypeStateCount, ListJobsParams, ListPipelineRunsParams, RunningJobSnapshot,
+};
 use nexus_jobs::payloads::{
     EmbeddingBackfillRunPayload, EmbeddingScope, LineageRebuildListPayload,
     PipelineStageIngestPayload, RepoScanPayload, ThreadingRebuildListPayload,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use crate::state::ApiState;
 
@@ -106,6 +111,44 @@ pub async fn get_job(
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct JobAttemptsQuery {
+    #[serde(default = "default_attempts_limit")]
+    pub limit: i64,
+}
+
+fn default_attempts_limit() -> i64 {
+    50
+}
+
+#[derive(Debug, Serialize)]
+pub struct JobAttemptsResponse {
+    pub items: Vec<nexus_db::JobAttempt>,
+}
+
+pub async fn list_job_attempts(
+    State(state): State<ApiState>,
+    AxumPath(job_id): AxumPath<i64>,
+    Query(query): Query<JobAttemptsQuery>,
+) -> Result<Json<JobAttemptsResponse>, axum::http::StatusCode> {
+    let exists = state
+        .jobs
+        .get(job_id)
+        .await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?
+        .is_some();
+    if !exists {
+        return Err(axum::http::StatusCode::NOT_FOUND);
+    }
+
+    let attempts = state
+        .jobs
+        .list_attempts(job_id, query.limit)
+        .await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(JobAttemptsResponse { items: attempts }))
+}
+
 #[derive(Debug, Serialize)]
 pub struct ActionResponse {
     pub ok: bool,
@@ -145,6 +188,179 @@ pub async fn retry_job(
     }
 
     Ok(Json(ActionResponse { ok: true }))
+}
+
+#[derive(Debug, Serialize, Default)]
+pub struct QueueStateCountsResponse {
+    pub scheduled: i64,
+    pub queued: i64,
+    pub running: i64,
+    pub succeeded: i64,
+    pub failed_retryable: i64,
+    pub failed_terminal: i64,
+    pub cancelled: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct QueueDiagnosticsResponse {
+    pub generated_at: DateTime<Utc>,
+    pub counts_by_state: QueueStateCountsResponse,
+    pub counts_by_job_type: Vec<JobTypeStateCount>,
+    pub running_jobs: Vec<RunningJobSnapshot>,
+}
+
+pub async fn diagnostics_queue(
+    State(state): State<ApiState>,
+) -> Result<Json<QueueDiagnosticsResponse>, axum::http::StatusCode> {
+    let state_counts = state
+        .jobs
+        .list_state_counts()
+        .await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    let job_type_counts = state
+        .jobs
+        .list_job_type_state_counts(500)
+        .await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    let running_jobs = state
+        .jobs
+        .list_running_jobs(200)
+        .await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(QueueDiagnosticsResponse {
+        generated_at: Utc::now(),
+        counts_by_state: to_queue_state_counts(state_counts),
+        counts_by_job_type: job_type_counts,
+        running_jobs,
+    }))
+}
+
+#[derive(Debug, Serialize)]
+pub struct StorageDbTotalsResponse {
+    pub mailing_lists: i64,
+    pub messages: i64,
+    pub threads: i64,
+    pub patch_series: i64,
+    pub patch_items: i64,
+    pub jobs: i64,
+    pub job_attempts: i64,
+    pub embedding_vectors: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StorageDbListRepoCountsResponse {
+    pub active: i64,
+    pub total: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StorageDbListCountsResponse {
+    pub messages: i64,
+    pub threads: i64,
+    pub patch_series: i64,
+    pub patch_items: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StorageDbListResponse {
+    pub list_key: String,
+    pub repos: StorageDbListRepoCountsResponse,
+    pub counts: StorageDbListCountsResponse,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StorageDbResponse {
+    pub totals: StorageDbTotalsResponse,
+    pub lists: Vec<StorageDbListResponse>,
+}
+
+#[derive(Debug, Serialize, Clone, Default)]
+pub struct StorageMeiliIndexResponse {
+    pub documents: i64,
+    pub is_indexing: bool,
+    pub embedded_documents: i64,
+}
+
+#[derive(Debug, Serialize, Clone, Default)]
+pub struct StorageMeiliIndexesResponse {
+    pub thread_docs: StorageMeiliIndexResponse,
+    pub patch_series_docs: StorageMeiliIndexResponse,
+    pub patch_item_docs: StorageMeiliIndexResponse,
+}
+
+#[derive(Debug, Serialize, Clone, Default)]
+pub struct StorageMeiliTotalsResponse {
+    pub database_size_bytes: Option<u64>,
+    pub used_database_size_bytes: Option<u64>,
+    pub last_update: Option<String>,
+    pub indexes: StorageMeiliIndexesResponse,
+}
+
+#[derive(Debug, Serialize, Clone, Default)]
+pub struct StorageMeiliListResponse {
+    pub list_key: String,
+    pub thread_docs: i64,
+    pub patch_series_docs: i64,
+    pub patch_item_docs: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StorageMeiliResponse {
+    pub ok: bool,
+    pub error: Option<String>,
+    pub totals: StorageMeiliTotalsResponse,
+    pub lists: Vec<StorageMeiliListResponse>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StorageDriftResponse {
+    pub list_key: String,
+    pub threads_db: i64,
+    pub threads_meili: i64,
+    pub threads_delta: i64,
+    pub patch_series_db: i64,
+    pub patch_series_meili: i64,
+    pub patch_series_delta: i64,
+    pub patch_items_db: i64,
+    pub patch_items_meili: i64,
+    pub patch_items_delta: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StorageDiagnosticsResponse {
+    pub generated_at: DateTime<Utc>,
+    pub db: StorageDbResponse,
+    pub meili: StorageMeiliResponse,
+    pub drift: Vec<StorageDriftResponse>,
+}
+
+pub async fn diagnostics_storage(
+    State(state): State<ApiState>,
+) -> Result<Json<StorageDiagnosticsResponse>, axum::http::StatusCode> {
+    let db_totals = state
+        .catalog
+        .get_db_storage_totals()
+        .await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    let db_lists = state
+        .catalog
+        .list_db_storage_by_list()
+        .await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let meili_payload = fetch_meili_storage(&state).await;
+    let drift = build_storage_drift(&db_lists, &meili_payload.list_counts);
+
+    Ok(Json(StorageDiagnosticsResponse {
+        generated_at: Utc::now(),
+        db: StorageDbResponse {
+            totals: map_db_totals(db_totals),
+            lists: db_lists.into_iter().map(map_db_list).collect(),
+        },
+        meili: meili_payload.response,
+        drift,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -646,6 +862,290 @@ pub async fn get_search_embeddings_backfill(
     Ok(Json(run))
 }
 
+#[derive(Debug)]
+struct MeiliStoragePayload {
+    response: StorageMeiliResponse,
+    list_counts: BTreeMap<String, StorageMeiliListResponse>,
+}
+
+fn to_queue_state_counts(rows: Vec<JobStateCount>) -> QueueStateCountsResponse {
+    let mut counts = QueueStateCountsResponse::default();
+    for row in rows {
+        match row.state {
+            JobState::Scheduled => counts.scheduled = row.count,
+            JobState::Queued => counts.queued = row.count,
+            JobState::Running => counts.running = row.count,
+            JobState::Succeeded => counts.succeeded = row.count,
+            JobState::FailedRetryable => counts.failed_retryable = row.count,
+            JobState::FailedTerminal => counts.failed_terminal = row.count,
+            JobState::Cancelled => counts.cancelled = row.count,
+        }
+    }
+    counts
+}
+
+fn map_db_totals(raw: DbStorageTotalsRecord) -> StorageDbTotalsResponse {
+    StorageDbTotalsResponse {
+        mailing_lists: raw.mailing_lists,
+        messages: raw.messages,
+        threads: raw.threads,
+        patch_series: raw.patch_series,
+        patch_items: raw.patch_items,
+        jobs: raw.jobs,
+        job_attempts: raw.job_attempts,
+        embedding_vectors: raw.embedding_vectors,
+    }
+}
+
+fn map_db_list(raw: DbListStorageRecord) -> StorageDbListResponse {
+    StorageDbListResponse {
+        list_key: raw.list_key,
+        repos: StorageDbListRepoCountsResponse {
+            active: raw.active_repo_count,
+            total: raw.total_repo_count,
+        },
+        counts: StorageDbListCountsResponse {
+            messages: raw.message_count,
+            threads: raw.thread_count,
+            patch_series: raw.patch_series_count,
+            patch_items: raw.patch_item_count,
+        },
+    }
+}
+
+fn build_storage_drift(
+    db_lists: &[DbListStorageRecord],
+    meili_lists: &BTreeMap<String, StorageMeiliListResponse>,
+) -> Vec<StorageDriftResponse> {
+    db_lists
+        .iter()
+        .map(|row| {
+            let meili = meili_lists.get(&row.list_key).cloned().unwrap_or_else(|| {
+                StorageMeiliListResponse {
+                    list_key: row.list_key.clone(),
+                    ..StorageMeiliListResponse::default()
+                }
+            });
+            StorageDriftResponse {
+                list_key: row.list_key.clone(),
+                threads_db: row.thread_count,
+                threads_meili: meili.thread_docs,
+                threads_delta: meili.thread_docs - row.thread_count,
+                patch_series_db: row.patch_series_count,
+                patch_series_meili: meili.patch_series_docs,
+                patch_series_delta: meili.patch_series_docs - row.patch_series_count,
+                patch_items_db: row.patch_item_count,
+                patch_items_meili: meili.patch_item_docs,
+                patch_items_delta: meili.patch_item_docs - row.patch_item_count,
+            }
+        })
+        .collect()
+}
+
+async fn fetch_meili_storage(state: &ApiState) -> MeiliStoragePayload {
+    let mut response = StorageMeiliResponse {
+        ok: true,
+        error: None,
+        totals: StorageMeiliTotalsResponse::default(),
+        lists: Vec::new(),
+    };
+    let mut list_counts: BTreeMap<String, StorageMeiliListResponse> = BTreeMap::new();
+
+    let client = reqwest::Client::new();
+    let base_url = state.settings.meili.url.trim_end_matches('/');
+    let stats_result = client
+        .get(format!("{base_url}/stats"))
+        .bearer_auth(&state.settings.meili.master_key)
+        .send()
+        .await;
+
+    let stats_value = match stats_result {
+        Ok(resp) => {
+            if !resp.status().is_success() {
+                response.ok = false;
+                response.error = Some(format!("meili /stats returned http {}", resp.status()));
+                return MeiliStoragePayload {
+                    response,
+                    list_counts,
+                };
+            }
+            match resp.json::<Value>().await {
+                Ok(value) => value,
+                Err(err) => {
+                    response.ok = false;
+                    response.error = Some(format!("failed to parse meili /stats response: {err}"));
+                    return MeiliStoragePayload {
+                        response,
+                        list_counts,
+                    };
+                }
+            }
+        }
+        Err(err) => {
+            response.ok = false;
+            response.error = Some(format!("meili /stats request failed: {err}"));
+            return MeiliStoragePayload {
+                response,
+                list_counts,
+            };
+        }
+    };
+
+    response.totals = parse_meili_totals(&stats_value);
+
+    for index_kind in [
+        MeiliIndexKind::ThreadDocs,
+        MeiliIndexKind::PatchSeriesDocs,
+        MeiliIndexKind::PatchItemDocs,
+    ] {
+        match fetch_meili_list_counts(&client, state, index_kind).await {
+            Ok(counts) => merge_meili_list_counts(index_kind, counts, &mut list_counts),
+            Err(err) => {
+                response.ok = false;
+                if response.error.is_none() {
+                    response.error = Some(err);
+                }
+            }
+        }
+    }
+
+    response.lists = list_counts.values().cloned().collect();
+    MeiliStoragePayload {
+        response,
+        list_counts,
+    }
+}
+
+fn parse_meili_totals(raw: &Value) -> StorageMeiliTotalsResponse {
+    let indexes = raw.get("indexes").and_then(Value::as_object);
+    StorageMeiliTotalsResponse {
+        database_size_bytes: raw.get("databaseSize").and_then(Value::as_u64),
+        used_database_size_bytes: raw.get("usedDatabaseSize").and_then(Value::as_u64),
+        last_update: raw
+            .get("lastUpdate")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        indexes: StorageMeiliIndexesResponse {
+            thread_docs: parse_meili_index(indexes.and_then(|m| m.get("thread_docs"))),
+            patch_series_docs: parse_meili_index(indexes.and_then(|m| m.get("patch_series_docs"))),
+            patch_item_docs: parse_meili_index(indexes.and_then(|m| m.get("patch_item_docs"))),
+        },
+    }
+}
+
+fn parse_meili_index(raw: Option<&Value>) -> StorageMeiliIndexResponse {
+    let raw = match raw {
+        Some(value) => value,
+        None => return StorageMeiliIndexResponse::default(),
+    };
+    StorageMeiliIndexResponse {
+        documents: raw
+            .get("numberOfDocuments")
+            .and_then(Value::as_i64)
+            .or_else(|| {
+                raw.get("numberOfDocuments")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as i64)
+            })
+            .unwrap_or(0),
+        is_indexing: raw
+            .get("isIndexing")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        embedded_documents: raw
+            .get("numberOfEmbeddedDocuments")
+            .and_then(Value::as_i64)
+            .or_else(|| {
+                raw.get("numberOfEmbeddedDocuments")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as i64)
+            })
+            .or_else(|| {
+                raw.get("numberOfEmbeddings")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as i64)
+            })
+            .unwrap_or(0),
+    }
+}
+
+async fn fetch_meili_list_counts(
+    client: &reqwest::Client,
+    state: &ApiState,
+    index_kind: MeiliIndexKind,
+) -> Result<BTreeMap<String, i64>, String> {
+    let base_url = state.settings.meili.url.trim_end_matches('/');
+    let index_uid = index_kind.uid();
+    let response = client
+        .post(format!("{base_url}/indexes/{index_uid}/search"))
+        .bearer_auth(&state.settings.meili.master_key)
+        .json(&json!({
+            "q": "",
+            "limit": 0,
+            "facets": ["list_keys"]
+        }))
+        .send()
+        .await
+        .map_err(|err| format!("meili facet query failed for {index_uid}: {err}"))?;
+
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(BTreeMap::new());
+    }
+    if !response.status().is_success() {
+        return Err(format!(
+            "meili facet query for {index_uid} returned http {}",
+            response.status()
+        ));
+    }
+    let payload = response
+        .json::<Value>()
+        .await
+        .map_err(|err| format!("failed to parse meili facet response for {index_uid}: {err}"))?;
+    Ok(parse_meili_facet_counts(&payload))
+}
+
+fn parse_meili_facet_counts(payload: &Value) -> BTreeMap<String, i64> {
+    let mut out = BTreeMap::new();
+    let Some(by_list) = payload
+        .get("facetDistribution")
+        .and_then(|facets| facets.get("list_keys"))
+        .and_then(Value::as_object)
+    else {
+        return out;
+    };
+
+    for (list_key, count_value) in by_list {
+        if let Some(count) = count_value
+            .as_i64()
+            .or_else(|| count_value.as_u64().map(|value| value as i64))
+        {
+            out.insert(list_key.clone(), count);
+        }
+    }
+    out
+}
+
+fn merge_meili_list_counts(
+    index_kind: MeiliIndexKind,
+    counts: BTreeMap<String, i64>,
+    by_list: &mut BTreeMap<String, StorageMeiliListResponse>,
+) {
+    for (list_key, count) in counts {
+        let entry = by_list
+            .entry(list_key.clone())
+            .or_insert_with(|| StorageMeiliListResponse {
+                list_key,
+                ..StorageMeiliListResponse::default()
+            });
+
+        match index_kind {
+            MeiliIndexKind::ThreadDocs => entry.thread_docs = count,
+            MeiliIndexKind::PatchSeriesDocs => entry.patch_series_docs = count,
+            MeiliIndexKind::PatchItemDocs => entry.patch_item_docs = count,
+        }
+    }
+}
+
 fn discover_repo_relpaths(list_root: &Path) -> Result<Vec<String>, std::io::Error> {
     if !list_root.exists() {
         return Ok(Vec::new());
@@ -855,7 +1355,13 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use std::{env, fs};
 
-    use super::{discover_mirror_lists, discover_repo_relpaths};
+    use nexus_core::search::MeiliIndexKind;
+    use serde_json::json;
+
+    use super::{
+        StorageMeiliListResponse, discover_mirror_lists, discover_repo_relpaths,
+        merge_meili_list_counts, parse_meili_facet_counts, parse_meili_totals,
+    };
 
     struct TempDir {
         path: PathBuf,
@@ -935,5 +1441,84 @@ mod tests {
         assert_eq!(discovered[0].repos, vec!["git/1.git".to_string()]);
         assert_eq!(discovered[1].repos, vec![".".to_string()]);
         assert_eq!(discovered[2].repos, vec!["all.git".to_string()]);
+    }
+
+    #[test]
+    fn parse_meili_totals_extracts_expected_fields() {
+        let payload = json!({
+            "databaseSize": 10,
+            "usedDatabaseSize": 8,
+            "lastUpdate": "2026-02-15T18:22:01.592981161Z",
+            "indexes": {
+                "thread_docs": {
+                    "numberOfDocuments": 11,
+                    "isIndexing": false,
+                    "numberOfEmbeddedDocuments": 9
+                },
+                "patch_series_docs": {
+                    "numberOfDocuments": 22,
+                    "isIndexing": true,
+                    "numberOfEmbeddings": 7
+                }
+            }
+        });
+
+        let parsed = parse_meili_totals(&payload);
+        assert_eq!(parsed.database_size_bytes, Some(10));
+        assert_eq!(parsed.used_database_size_bytes, Some(8));
+        assert_eq!(
+            parsed.last_update.as_deref(),
+            Some("2026-02-15T18:22:01.592981161Z")
+        );
+        assert_eq!(parsed.indexes.thread_docs.documents, 11);
+        assert_eq!(parsed.indexes.thread_docs.embedded_documents, 9);
+        assert_eq!(parsed.indexes.patch_series_docs.documents, 22);
+        assert_eq!(parsed.indexes.patch_series_docs.embedded_documents, 7);
+        assert_eq!(parsed.indexes.patch_item_docs.documents, 0);
+    }
+
+    #[test]
+    fn parse_meili_facet_counts_reads_list_key_distribution() {
+        let payload = json!({
+            "facetDistribution": {
+                "list_keys": {
+                    "bpf": 10244,
+                    "lkml": 77
+                }
+            }
+        });
+        let parsed = parse_meili_facet_counts(&payload);
+        assert_eq!(parsed.get("bpf"), Some(&10244));
+        assert_eq!(parsed.get("lkml"), Some(&77));
+    }
+
+    #[test]
+    fn merge_meili_list_counts_tracks_index_families_per_list() {
+        let mut out = std::collections::BTreeMap::<String, StorageMeiliListResponse>::new();
+        merge_meili_list_counts(
+            MeiliIndexKind::ThreadDocs,
+            std::collections::BTreeMap::from([("bpf".to_string(), 10), ("lkml".to_string(), 4)]),
+            &mut out,
+        );
+        merge_meili_list_counts(
+            MeiliIndexKind::PatchSeriesDocs,
+            std::collections::BTreeMap::from([("bpf".to_string(), 3)]),
+            &mut out,
+        );
+        merge_meili_list_counts(
+            MeiliIndexKind::PatchItemDocs,
+            std::collections::BTreeMap::from([("bpf".to_string(), 20)]),
+            &mut out,
+        );
+
+        let bpf = out.get("bpf").expect("bpf");
+        assert_eq!(bpf.thread_docs, 10);
+        assert_eq!(bpf.patch_series_docs, 3);
+        assert_eq!(bpf.patch_item_docs, 20);
+
+        let lkml = out.get("lkml").expect("lkml");
+        assert_eq!(lkml.thread_docs, 4);
+        assert_eq!(lkml.patch_series_docs, 0);
+        assert_eq!(lkml.patch_item_docs, 0);
     }
 }

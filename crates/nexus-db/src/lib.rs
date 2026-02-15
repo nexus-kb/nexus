@@ -12,8 +12,9 @@ mod search;
 mod threading;
 
 pub use crate::catalog::{
-    CatalogStore, ListActivityByDayRecord, ListCatalogItemRecord, ListDetailRecord,
-    ListStatsTotalsRecord, ListTopAuthorRecord, MailingList, MailingListRepo,
+    CatalogStore, DbListStorageRecord, DbStorageTotalsRecord, ListActivityByDayRecord,
+    ListCatalogItemRecord, ListDetailRecord, ListStatsTotalsRecord, ListTopAuthorRecord,
+    MailingList, MailingListRepo,
 };
 pub use crate::db::Db;
 pub use crate::embeddings::{EmbeddingInputRow, EmbeddingVectorUpsert, EmbeddingsStore};
@@ -22,7 +23,8 @@ pub use crate::ingest::{
     WriteOutcome,
 };
 pub use crate::jobs::{
-    EnqueueJobParams, JobAttempt, JobStore, JobStoreMetrics, ListJobsParams, RetryDecision,
+    EnqueueJobParams, JobAttempt, JobStateCount, JobStore, JobStoreMetrics, JobTypeStateCount,
+    ListJobsParams, RetryDecision, RunningJobSnapshot,
 };
 pub use crate::lineage::{
     AssembledItemRecord, LineageSourceMessage, LineageStore, ListThreadsParams, MessageBodyRecord,

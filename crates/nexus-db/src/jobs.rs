@@ -35,6 +35,36 @@ pub struct JobAttempt {
     pub metrics_json: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct JobStateCount {
+    pub state: JobState,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct JobTypeStateCount {
+    pub job_type: String,
+    pub total: i64,
+    pub scheduled: i64,
+    pub queued: i64,
+    pub running: i64,
+    pub succeeded: i64,
+    pub failed_retryable: i64,
+    pub failed_terminal: i64,
+    pub cancelled: i64,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct RunningJobSnapshot {
+    pub id: i64,
+    pub job_type: String,
+    pub claimed_by: Option<String>,
+    pub lease_until: Option<DateTime<Utc>>,
+    pub attempt: i32,
+    pub max_attempts: i32,
+    pub is_stuck: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct JobStoreMetrics {
     pub duration_ms: u128,
@@ -140,6 +170,76 @@ impl JobStore {
             .bind(job_id)
             .fetch_optional(&self.pool)
             .await
+    }
+
+    pub async fn list_attempts(&self, job_id: i64, limit: i64) -> Result<Vec<JobAttempt>> {
+        sqlx::query_as::<_, JobAttempt>(
+            r#"SELECT id, job_id, attempt, started_at, finished_at, status, error, metrics_json
+            FROM job_attempts
+            WHERE job_id = $1
+            ORDER BY attempt DESC, id DESC
+            LIMIT $2"#,
+        )
+        .bind(job_id)
+        .bind(clamp_attempt_limit(limit))
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn list_state_counts(&self) -> Result<Vec<JobStateCount>> {
+        sqlx::query_as::<_, JobStateCount>(
+            r#"SELECT state, COUNT(*)::bigint AS count
+            FROM jobs
+            GROUP BY state"#,
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn list_job_type_state_counts(&self, limit: i64) -> Result<Vec<JobTypeStateCount>> {
+        sqlx::query_as::<_, JobTypeStateCount>(
+            r#"SELECT
+                job_type,
+                COUNT(*)::bigint AS total,
+                COUNT(*) FILTER (WHERE state = 'scheduled')::bigint AS scheduled,
+                COUNT(*) FILTER (WHERE state = 'queued')::bigint AS queued,
+                COUNT(*) FILTER (WHERE state = 'running')::bigint AS running,
+                COUNT(*) FILTER (WHERE state = 'succeeded')::bigint AS succeeded,
+                COUNT(*) FILTER (WHERE state = 'failed_retryable')::bigint AS failed_retryable,
+                COUNT(*) FILTER (WHERE state = 'failed_terminal')::bigint AS failed_terminal,
+                COUNT(*) FILTER (WHERE state = 'cancelled')::bigint AS cancelled
+            FROM jobs
+            GROUP BY job_type
+            ORDER BY total DESC, job_type ASC
+            LIMIT $1"#,
+        )
+        .bind(clamp_job_type_limit(limit))
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn list_running_jobs(&self, limit: i64) -> Result<Vec<RunningJobSnapshot>> {
+        sqlx::query_as::<_, RunningJobSnapshot>(
+            r#"SELECT
+                id,
+                job_type,
+                claimed_by,
+                lease_until,
+                attempt,
+                max_attempts,
+                CASE
+                    WHEN lease_until IS NULL THEN false
+                    WHEN lease_until < now() THEN true
+                    ELSE false
+                END AS is_stuck
+            FROM jobs
+            WHERE state = 'running'
+            ORDER BY priority DESC, id ASC
+            LIMIT $1"#,
+        )
+        .bind(clamp_running_limit(limit))
+        .fetch_all(&self.pool)
+        .await
     }
 
     pub async fn request_cancel(&self, job_id: i64) -> Result<Option<Job>> {
@@ -398,5 +498,44 @@ impl JobStore {
         let exponent = (attempt.max(1) as u32).saturating_sub(1);
         let raw = base_ms.saturating_mul(2u64.saturating_pow(exponent));
         Duration::milliseconds(raw.min(max_ms) as i64)
+    }
+}
+
+fn clamp_attempt_limit(limit: i64) -> i64 {
+    limit.clamp(1, 200)
+}
+
+fn clamp_job_type_limit(limit: i64) -> i64 {
+    limit.clamp(1, 500)
+}
+
+fn clamp_running_limit(limit: i64) -> i64 {
+    limit.clamp(1, 200)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{clamp_attempt_limit, clamp_job_type_limit, clamp_running_limit};
+
+    #[test]
+    fn attempt_limit_is_clamped() {
+        assert_eq!(clamp_attempt_limit(0), 1);
+        assert_eq!(clamp_attempt_limit(1), 1);
+        assert_eq!(clamp_attempt_limit(50), 50);
+        assert_eq!(clamp_attempt_limit(500), 200);
+    }
+
+    #[test]
+    fn job_type_limit_is_clamped() {
+        assert_eq!(clamp_job_type_limit(0), 1);
+        assert_eq!(clamp_job_type_limit(500), 500);
+        assert_eq!(clamp_job_type_limit(501), 500);
+    }
+
+    #[test]
+    fn running_limit_is_clamped() {
+        assert_eq!(clamp_running_limit(0), 1);
+        assert_eq!(clamp_running_limit(25), 25);
+        assert_eq!(clamp_running_limit(1000), 200);
     }
 }

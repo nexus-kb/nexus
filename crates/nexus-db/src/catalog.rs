@@ -68,6 +68,29 @@ pub struct ListActivityByDayRecord {
     pub threads: i64,
 }
 
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct DbStorageTotalsRecord {
+    pub mailing_lists: i64,
+    pub messages: i64,
+    pub threads: i64,
+    pub patch_series: i64,
+    pub patch_items: i64,
+    pub jobs: i64,
+    pub job_attempts: i64,
+    pub embedding_vectors: i64,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct DbListStorageRecord {
+    pub list_key: String,
+    pub active_repo_count: i64,
+    pub total_repo_count: i64,
+    pub message_count: i64,
+    pub thread_count: i64,
+    pub patch_series_count: i64,
+    pub patch_item_count: i64,
+}
+
 #[derive(Clone)]
 pub struct CatalogStore {
     pool: PgPool,
@@ -123,6 +146,69 @@ impl CatalogStore {
             "SELECT COUNT(*)::bigint FROM mailing_lists WHERE active = true",
         )
         .fetch_one(&self.pool)
+        .await
+    }
+
+    pub async fn get_db_storage_totals(&self) -> Result<DbStorageTotalsRecord> {
+        sqlx::query_as::<_, DbStorageTotalsRecord>(
+            r#"SELECT
+                (SELECT COUNT(*)::bigint FROM mailing_lists WHERE active = true) AS mailing_lists,
+                (SELECT COUNT(*)::bigint FROM messages) AS messages,
+                (SELECT COUNT(*)::bigint FROM threads) AS threads,
+                (SELECT COUNT(*)::bigint FROM patch_series) AS patch_series,
+                (SELECT COUNT(*)::bigint FROM patch_items) AS patch_items,
+                (SELECT COUNT(*)::bigint FROM jobs) AS jobs,
+                (SELECT COUNT(*)::bigint FROM job_attempts) AS job_attempts,
+                (SELECT COUNT(*)::bigint FROM search_doc_embeddings) AS embedding_vectors"#,
+        )
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    pub async fn list_db_storage_by_list(&self) -> Result<Vec<DbListStorageRecord>> {
+        sqlx::query_as::<_, DbListStorageRecord>(
+            r#"SELECT
+                ml.list_key,
+                COALESCE(repo.active_repo_count, 0)::bigint AS active_repo_count,
+                COALESCE(repo.total_repo_count, 0)::bigint AS total_repo_count,
+                COALESCE(msg.message_count, 0)::bigint AS message_count,
+                COALESCE(threads.thread_count, 0)::bigint AS thread_count,
+                COALESCE(series.patch_series_count, 0)::bigint AS patch_series_count,
+                COALESCE(items.patch_item_count, 0)::bigint AS patch_item_count
+            FROM mailing_lists ml
+            LEFT JOIN LATERAL (
+                SELECT
+                    COUNT(*) FILTER (WHERE r.active)::bigint AS active_repo_count,
+                    COUNT(*)::bigint AS total_repo_count
+                FROM mailing_list_repos r
+                WHERE r.mailing_list_id = ml.id
+            ) repo ON true
+            LEFT JOIN LATERAL (
+                SELECT COUNT(DISTINCT lmi.message_pk)::bigint AS message_count
+                FROM list_message_instances lmi
+                WHERE lmi.mailing_list_id = ml.id
+            ) msg ON true
+            LEFT JOIN LATERAL (
+                SELECT COUNT(*)::bigint AS thread_count
+                FROM threads t
+                WHERE t.mailing_list_id = ml.id
+            ) threads ON true
+            LEFT JOIN LATERAL (
+                SELECT COUNT(DISTINCT psl.patch_series_id)::bigint AS patch_series_count
+                FROM patch_series_lists psl
+                WHERE psl.mailing_list_id = ml.id
+            ) series ON true
+            LEFT JOIN LATERAL (
+                SELECT COUNT(DISTINCT pi.id)::bigint AS patch_item_count
+                FROM patch_series_lists psl
+                JOIN patch_series_versions psv ON psv.patch_series_id = psl.patch_series_id
+                JOIN patch_items pi ON pi.patch_series_version_id = psv.id
+                WHERE psl.mailing_list_id = ml.id
+            ) items ON true
+            WHERE ml.active = true
+            ORDER BY ml.list_key ASC"#,
+        )
+        .fetch_all(&self.pool)
         .await
     }
 
