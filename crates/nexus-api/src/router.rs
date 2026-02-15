@@ -62,6 +62,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/jobs/{job_id}/cancel", post(admin::cancel_job))
         .route("/jobs/{job_id}/retry", post(admin::retry_job))
         .route("/ingest/sync", post(admin::ingest_sync))
+        .route("/ingest/grokmirror", post(admin::ingest_grokmirror))
         .route("/ingest/reset-watermark", post(admin::reset_watermark))
         .route("/pipeline/runs", get(admin::list_pipeline_runs))
         .route("/pipeline/runs/{run_id}", get(admin::get_pipeline_run))

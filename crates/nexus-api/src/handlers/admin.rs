@@ -161,16 +161,52 @@ pub struct IngestSyncResponse {
     pub current_stage: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct IngestGrokmirrorResponse {
+    pub mirror_root: String,
+    pub mode: String,
+    pub discovered_lists: usize,
+    pub queued_lists: usize,
+    pub queued_jobs: usize,
+    pub results: Vec<IngestGrokmirrorListResult>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IngestGrokmirrorListResult {
+    pub list_key: String,
+    pub status: String,
+    pub queued: usize,
+    pub repos: Vec<String>,
+    pub pipeline_run_id: Option<i64>,
+    pub current_stage: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug)]
+struct IngestQueueError {
+    status: axum::http::StatusCode,
+    message: String,
+}
+
+impl IngestQueueError {
+    fn internal(message: impl Into<String>) -> Self {
+        Self {
+            status: axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct MirrorListCandidate {
+    list_key: String,
+    repos: Vec<String>,
+}
+
 pub async fn ingest_sync(
     State(state): State<ApiState>,
     Query(query): Query<IngestSyncQuery>,
 ) -> Result<Json<IngestSyncResponse>, axum::http::StatusCode> {
-    let list = state
-        .catalog
-        .ensure_mailing_list(&query.list_key)
-        .await
-        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-
     let list_root = Path::new(&state.settings.mail.mirror_root).join(&query.list_key);
     let repos =
         discover_repo_relpaths(&list_root).map_err(|_| axum::http::StatusCode::BAD_REQUEST)?;
@@ -179,82 +215,71 @@ pub async fn ingest_sync(
         return Err(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    for repo_relpath in &repos {
-        state
-            .catalog
-            .ensure_repo(list.id, repo_relpath, repo_relpath)
-            .await
-            .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    queue_list_ingest(&state, &query.list_key, repos, "admin_ingest_sync")
+        .await
+        .map(Json)
+        .map_err(|err| err.status)
+}
+
+pub async fn ingest_grokmirror(
+    State(state): State<ApiState>,
+) -> Result<Json<IngestGrokmirrorResponse>, axum::http::StatusCode> {
+    let mirror_root = Path::new(&state.settings.mail.mirror_root);
+    let candidates = discover_mirror_lists(mirror_root)
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mode = match state.settings.worker.pipeline_execution_mode {
+        PipelineExecutionMode::Staged => "staged".to_string(),
+        _ => "legacy".to_string(),
+    };
+    let discovered_lists = candidates.len();
+    let mut queued_lists = 0usize;
+    let mut queued_jobs = 0usize;
+    let mut results = Vec::with_capacity(discovered_lists);
+
+    for candidate in candidates {
+        match queue_list_ingest(
+            &state,
+            &candidate.list_key,
+            candidate.repos.clone(),
+            "admin_ingest_grokmirror",
+        )
+        .await
+        {
+            Ok(response) => {
+                queued_lists += 1;
+                queued_jobs += response.queued;
+                results.push(IngestGrokmirrorListResult {
+                    list_key: candidate.list_key,
+                    status: "queued".to_string(),
+                    queued: response.queued,
+                    repos: response.repos,
+                    pipeline_run_id: response.pipeline_run_id,
+                    current_stage: response.current_stage,
+                    error: None,
+                });
+            }
+            Err(err) => {
+                results.push(IngestGrokmirrorListResult {
+                    list_key: candidate.list_key,
+                    status: "error".to_string(),
+                    queued: 0,
+                    repos: candidate.repos,
+                    pipeline_run_id: None,
+                    current_stage: None,
+                    error: Some(err.message),
+                });
+            }
+        }
     }
 
-    if matches!(
-        state.settings.worker.pipeline_execution_mode,
-        PipelineExecutionMode::Staged
-    ) {
-        let run = state
-            .pipeline
-            .create_or_get_active_run(list.id, &query.list_key, "admin_ingest_sync")
-            .await
-            .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-
-        let payload = PipelineStageIngestPayload { run_id: run.id };
-        state
-            .jobs
-            .enqueue(EnqueueJobParams {
-                job_type: "pipeline_stage_ingest".to_string(),
-                payload_json: serde_json::to_value(payload)
-                    .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?,
-                priority: 20,
-                dedupe_scope: Some(format!("list:{}:pipeline", query.list_key)),
-                dedupe_key: Some(format!("run:{}:stage:ingest", run.id)),
-                run_after: None,
-                max_attempts: Some(8),
-            })
-            .await
-            .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-
-        return Ok(Json(IngestSyncResponse {
-            queued: 1,
-            repos,
-            mode: "staged".to_string(),
-            pipeline_run_id: Some(run.id),
-            current_stage: Some(run.current_stage),
-        }));
-    }
-
-    let mut queued = 0usize;
-    for repo_relpath in &repos {
-        let payload = RepoScanPayload {
-            list_key: query.list_key.clone(),
-            repo_key: repo_relpath.clone(),
-            mirror_path: list_root.join(repo_relpath).display().to_string(),
-            since_commit_oid: None,
-        };
-
-        state
-            .jobs
-            .enqueue(EnqueueJobParams {
-                job_type: "repo_scan".to_string(),
-                payload_json: serde_json::to_value(payload)
-                    .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?,
-                priority: 20,
-                dedupe_scope: Some(format!("list:{}", query.list_key)),
-                dedupe_key: None,
-                run_after: None,
-                max_attempts: Some(8),
-            })
-            .await
-            .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-
-        queued += 1;
-    }
-
-    Ok(Json(IngestSyncResponse {
-        queued,
-        repos,
-        mode: "legacy".to_string(),
-        pipeline_run_id: None,
-        current_stage: None,
+    Ok(Json(IngestGrokmirrorResponse {
+        mirror_root: state.settings.mail.mirror_root.clone(),
+        mode,
+        discovered_lists,
+        queued_lists,
+        queued_jobs,
+        results,
     }))
 }
 
@@ -661,6 +686,148 @@ fn discover_repo_relpaths(list_root: &Path) -> Result<Vec<String>, std::io::Erro
     Ok(repos.into_iter().collect())
 }
 
+fn discover_mirror_lists(mirror_root: &Path) -> Result<Vec<MirrorListCandidate>, std::io::Error> {
+    let mut out = Vec::new();
+
+    for entry in fs::read_dir(mirror_root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(list_key) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let repos = discover_repo_relpaths(&path)?;
+        if repos.is_empty() {
+            continue;
+        }
+        out.push(MirrorListCandidate {
+            list_key: list_key.to_string(),
+            repos,
+        });
+    }
+
+    out.sort_by(|a, b| a.list_key.cmp(&b.list_key));
+    Ok(out)
+}
+
+async fn queue_list_ingest(
+    state: &ApiState,
+    list_key: &str,
+    repos: Vec<String>,
+    source: &str,
+) -> Result<IngestSyncResponse, IngestQueueError> {
+    let list = state
+        .catalog
+        .ensure_mailing_list(list_key)
+        .await
+        .map_err(|err| {
+            IngestQueueError::internal(format!("failed to ensure mailing list {list_key}: {err}"))
+        })?;
+
+    for repo_relpath in &repos {
+        state
+            .catalog
+            .ensure_repo(list.id, repo_relpath, repo_relpath)
+            .await
+            .map_err(|err| {
+                IngestQueueError::internal(format!(
+                    "failed to ensure repo metadata for list {list_key} repo {repo_relpath}: {err}"
+                ))
+            })?;
+    }
+
+    if matches!(
+        state.settings.worker.pipeline_execution_mode,
+        PipelineExecutionMode::Staged
+    ) {
+        let run = state
+            .pipeline
+            .create_or_get_active_run(list.id, list_key, source)
+            .await
+            .map_err(|err| {
+                IngestQueueError::internal(format!(
+                    "failed to create/get active pipeline run for list {list_key}: {err}"
+                ))
+            })?;
+
+        let payload = PipelineStageIngestPayload { run_id: run.id };
+        state
+            .jobs
+            .enqueue(EnqueueJobParams {
+                job_type: "pipeline_stage_ingest".to_string(),
+                payload_json: serde_json::to_value(payload).map_err(|err| {
+                    IngestQueueError::internal(format!(
+                        "failed to serialize pipeline payload for list {list_key}: {err}"
+                    ))
+                })?,
+                priority: 20,
+                dedupe_scope: Some(format!("list:{list_key}:pipeline")),
+                dedupe_key: Some(format!("run:{}:stage:ingest", run.id)),
+                run_after: None,
+                max_attempts: Some(8),
+            })
+            .await
+            .map_err(|err| {
+                IngestQueueError::internal(format!(
+                    "failed to enqueue ingest stage for list {list_key}: {err}"
+                ))
+            })?;
+
+        return Ok(IngestSyncResponse {
+            queued: 1,
+            repos,
+            mode: "staged".to_string(),
+            pipeline_run_id: Some(run.id),
+            current_stage: Some(run.current_stage),
+        });
+    }
+
+    let list_root = Path::new(&state.settings.mail.mirror_root).join(list_key);
+    let mut queued = 0usize;
+    for repo_relpath in &repos {
+        let payload = RepoScanPayload {
+            list_key: list_key.to_string(),
+            repo_key: repo_relpath.clone(),
+            mirror_path: list_root.join(repo_relpath).display().to_string(),
+            since_commit_oid: None,
+        };
+
+        state
+            .jobs
+            .enqueue(EnqueueJobParams {
+                job_type: "repo_scan".to_string(),
+                payload_json: serde_json::to_value(payload).map_err(|err| {
+                    IngestQueueError::internal(format!(
+                        "failed to serialize repo scan payload for list {list_key} repo {repo_relpath}: {err}"
+                    ))
+                })?,
+                priority: 20,
+                dedupe_scope: Some(format!("list:{list_key}")),
+                dedupe_key: None,
+                run_after: None,
+                max_attempts: Some(8),
+            })
+            .await
+            .map_err(|err| {
+                IngestQueueError::internal(format!(
+                    "failed to enqueue repo scan for list {list_key} repo {repo_relpath}: {err}"
+                ))
+            })?;
+
+        queued += 1;
+    }
+
+    Ok(IngestSyncResponse {
+        queued,
+        repos,
+        mode: "legacy".to_string(),
+        pipeline_run_id: None,
+        current_stage: None,
+    })
+}
+
 fn looks_like_bare_repo(path: &Path) -> bool {
     path.join("objects").exists() && path.join("refs").exists()
 }
@@ -680,4 +847,93 @@ fn parse_backfill_timestamp(raw: &str) -> Option<DateTime<Utc>> {
     let date = chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d").ok()?;
     let naive = date.and_hms_opt(0, 0, 0)?;
     Some(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{env, fs};
+
+    use super::{discover_mirror_lists, discover_repo_relpaths};
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(prefix: &str) -> Self {
+            let now_nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos();
+            let path = env::temp_dir().join(format!(
+                "nexus-api-admin-{prefix}-{}-{now_nanos}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).expect("temp dir");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn discover_repo_relpaths_covers_supported_layouts() {
+        let temp = TempDir::new("repo-layouts");
+
+        let all_git = temp.path().join("all-layout");
+        fs::create_dir_all(all_git.join("all.git")).expect("all.git");
+        assert_eq!(
+            discover_repo_relpaths(&all_git).expect("discover all.git"),
+            vec!["all.git".to_string()]
+        );
+
+        let git_epoch = temp.path().join("git-layout");
+        fs::create_dir_all(git_epoch.join("git/0.git")).expect("git epoch");
+        assert_eq!(
+            discover_repo_relpaths(&git_epoch).expect("discover git epoch"),
+            vec!["git/0.git".to_string()]
+        );
+
+        let bare = temp.path().join("bare-layout");
+        fs::create_dir_all(bare.join("objects")).expect("objects");
+        fs::create_dir_all(bare.join("refs")).expect("refs");
+        assert_eq!(
+            discover_repo_relpaths(&bare).expect("discover bare"),
+            vec![".".to_string()]
+        );
+    }
+
+    #[test]
+    fn discover_mirror_lists_uses_immediate_repo_dirs_only() {
+        let temp = TempDir::new("mirror-lists");
+
+        fs::create_dir_all(temp.path().join("zzz/all.git")).expect("zzz");
+        fs::create_dir_all(temp.path().join("alpha/git/1.git")).expect("alpha");
+        fs::create_dir_all(temp.path().join("beta/objects")).expect("beta objects");
+        fs::create_dir_all(temp.path().join("beta/refs")).expect("beta refs");
+        fs::create_dir_all(temp.path().join("no-repo/subdir")).expect("no repo");
+        fs::create_dir_all(temp.path().join("nested/child/all.git")).expect("nested");
+        fs::write(temp.path().join("manifest.js.gz"), b"placeholder").expect("manifest");
+
+        let discovered = discover_mirror_lists(temp.path()).expect("discover mirror lists");
+        let keys: Vec<&str> = discovered
+            .iter()
+            .map(|item| item.list_key.as_str())
+            .collect();
+
+        assert_eq!(keys, vec!["alpha", "beta", "zzz"]);
+        assert_eq!(discovered[0].repos, vec!["git/1.git".to_string()]);
+        assert_eq!(discovered[1].repos, vec![".".to_string()]);
+        assert_eq!(discovered[2].repos, vec!["all.git".to_string()]);
+    }
 }
