@@ -159,26 +159,10 @@ fn default_embeddings_min_request_interval_ms() -> u64 {
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum BackfillMode {
-    #[default]
-    FullPipeline,
-    IngestOnly,
-}
-
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
 pub enum IngestWriteMode {
     #[default]
     Copy,
     BatchedSql,
-}
-
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum PipelineExecutionMode {
-    Legacy,
-    #[default]
-    Staged,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -197,8 +181,6 @@ pub struct WorkerConfig {
     pub base_backoff_ms: u64,
     #[serde(default = "default_worker_max_backoff_ms")]
     pub max_backoff_ms: u64,
-    #[serde(default = "default_worker_backfill_mode")]
-    pub backfill_mode: BackfillMode,
     #[serde(default = "default_worker_ingest_parse_concurrency")]
     pub ingest_parse_concurrency: usize,
     #[serde(default = "default_worker_ingest_parse_cpu_ratio")]
@@ -209,16 +191,10 @@ pub struct WorkerConfig {
     pub ingest_parse_workers_max: usize,
     #[serde(default = "default_worker_max_inflight_jobs")]
     pub max_inflight_jobs: usize,
-    #[serde(default = "default_worker_max_inflight_ingest_jobs")]
-    pub max_inflight_ingest_jobs: usize,
-    #[serde(default = "default_worker_backfill_batch_size")]
-    pub backfill_batch_size: usize,
     #[serde(default = "default_worker_ingest_write_mode")]
     pub ingest_write_mode: IngestWriteMode,
-    #[serde(default = "default_worker_pipeline_execution_mode")]
-    pub pipeline_execution_mode: PipelineExecutionMode,
-    #[serde(default = "default_worker_stage_search_parallelism")]
-    pub stage_search_parallelism: usize,
+    #[serde(default = "default_worker_progress_checkpoint_interval")]
+    pub progress_checkpoint_interval: usize,
     #[serde(default)]
     pub db_relaxed_durability: bool,
 }
@@ -251,10 +227,6 @@ fn default_worker_max_backoff_ms() -> u64 {
     3_600_000
 }
 
-fn default_worker_backfill_mode() -> BackfillMode {
-    BackfillMode::FullPipeline
-}
-
 fn default_worker_ingest_parse_concurrency() -> usize {
     8
 }
@@ -275,24 +247,12 @@ fn default_worker_max_inflight_jobs() -> usize {
     1
 }
 
-fn default_worker_max_inflight_ingest_jobs() -> usize {
-    1
-}
-
-fn default_worker_backfill_batch_size() -> usize {
-    10_000
-}
-
 fn default_worker_ingest_write_mode() -> IngestWriteMode {
     IngestWriteMode::Copy
 }
 
-fn default_worker_pipeline_execution_mode() -> PipelineExecutionMode {
-    PipelineExecutionMode::Staged
-}
-
-fn default_worker_stage_search_parallelism() -> usize {
-    2
+fn default_worker_progress_checkpoint_interval() -> usize {
+    10_000
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -429,17 +389,9 @@ pub fn load() -> Result<Settings, crate::Error> {
     if settings.worker.max_inflight_jobs == 0 {
         settings.worker.max_inflight_jobs = default_worker_max_inflight_jobs();
     }
-    if settings.worker.max_inflight_ingest_jobs == 0 {
-        settings.worker.max_inflight_ingest_jobs = default_worker_max_inflight_ingest_jobs();
-    }
-    if settings.worker.max_inflight_ingest_jobs > settings.worker.max_inflight_jobs {
-        settings.worker.max_inflight_ingest_jobs = settings.worker.max_inflight_jobs;
-    }
-    if settings.worker.backfill_batch_size == 0 {
-        settings.worker.backfill_batch_size = default_worker_backfill_batch_size();
-    }
-    if settings.worker.stage_search_parallelism == 0 {
-        settings.worker.stage_search_parallelism = default_worker_stage_search_parallelism();
+    if settings.worker.progress_checkpoint_interval == 0 {
+        settings.worker.progress_checkpoint_interval =
+            default_worker_progress_checkpoint_interval();
     }
 
     Ok(settings)

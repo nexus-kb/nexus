@@ -5,15 +5,14 @@ use std::path::{Path, PathBuf};
 use axum::Json;
 use axum::extract::{Path as AxumPath, Query, State};
 use chrono::{DateTime, Utc};
-use nexus_core::config::PipelineExecutionMode;
 use nexus_core::search::MeiliIndexKind;
 use nexus_db::{
     DbListStorageRecord, DbStorageTotalsRecord, EnqueueJobParams, Job, JobState, JobStateCount,
     JobTypeStateCount, ListJobsParams, ListPipelineRunsParams, RunningJobSnapshot,
 };
 use nexus_jobs::payloads::{
-    EmbeddingBackfillRunPayload, EmbeddingScope, LineageRebuildListPayload,
-    PipelineStageIngestPayload, RepoScanPayload, ThreadingRebuildListPayload,
+    EmbeddingBackfillRunPayload, EmbeddingScope, LineageRebuildListPayload, PipelineIngestPayload,
+    ThreadingRebuildListPayload,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -411,6 +410,13 @@ impl IngestQueueError {
             message: message.into(),
         }
     }
+
+    fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: axum::http::StatusCode::CONFLICT,
+            message: message.into(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -444,43 +450,61 @@ pub async fn ingest_grokmirror(
     let candidates = discover_mirror_lists(mirror_root)
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let mode = match state.settings.worker.pipeline_execution_mode {
-        PipelineExecutionMode::Staged => "staged".to_string(),
-        _ => "legacy".to_string(),
-    };
     let discovered_lists = candidates.len();
     let mut queued_lists = 0usize;
     let mut queued_jobs = 0usize;
     let mut results = Vec::with_capacity(discovered_lists);
 
-    for candidate in candidates {
-        match queue_list_ingest(
-            &state,
-            &candidate.list_key,
-            candidate.repos.clone(),
-            "admin_ingest_grokmirror",
-        )
+    // Get a batch ID for ordering all lists in this grokmirror run
+    let batch_id = state
+        .pipeline
+        .next_batch_id()
         .await
-        {
-            Ok(response) => {
-                queued_lists += 1;
-                queued_jobs += response.queued;
-                results.push(IngestGrokmirrorListResult {
-                    list_key: candidate.list_key,
-                    status: "queued".to_string(),
-                    queued: response.queued,
-                    repos: response.repos,
-                    pipeline_run_id: response.pipeline_run_id,
-                    current_stage: response.current_stage,
-                    error: None,
-                });
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Phase 1: ensure catalog entries and create pending runs for all lists
+    let mut pending_runs: Vec<(String, Vec<String>, i64)> = Vec::new(); // (list_key, repos, run_id)
+
+    for (position, candidate) in candidates.iter().enumerate() {
+        match ensure_catalog_entries(&state, &candidate.list_key, &candidate.repos).await {
+            Ok(list_id) => {
+                match state
+                    .pipeline
+                    .create_pending_run(
+                        list_id,
+                        &candidate.list_key,
+                        "admin_ingest_grokmirror",
+                        batch_id,
+                        position as i32,
+                    )
+                    .await
+                {
+                    Ok(run) => {
+                        pending_runs.push((
+                            candidate.list_key.clone(),
+                            candidate.repos.clone(),
+                            run.id,
+                        ));
+                    }
+                    Err(err) => {
+                        results.push(IngestGrokmirrorListResult {
+                            list_key: candidate.list_key.clone(),
+                            status: "error".to_string(),
+                            queued: 0,
+                            repos: candidate.repos.clone(),
+                            pipeline_run_id: None,
+                            current_stage: None,
+                            error: Some(format!("failed to create pipeline run: {err}")),
+                        });
+                    }
+                }
             }
             Err(err) => {
                 results.push(IngestGrokmirrorListResult {
-                    list_key: candidate.list_key,
+                    list_key: candidate.list_key.clone(),
                     status: "error".to_string(),
                     queued: 0,
-                    repos: candidate.repos,
+                    repos: candidate.repos.clone(),
                     pipeline_run_id: None,
                     current_stage: None,
                     error: Some(err.message),
@@ -489,9 +513,109 @@ pub async fn ingest_grokmirror(
         }
     }
 
+    // Phase 2: activate the first pending run and enqueue its ingest job.
+    // If enqueue fails after activation, mark that run failed and try the next pending run.
+    let mut started_run_id: Option<i64> = None;
+    let mut launch_errors: BTreeMap<i64, String> = BTreeMap::new();
+    if !pending_runs.is_empty() {
+        loop {
+            let activated = match state.pipeline.activate_next_pending_run(batch_id).await {
+                Ok(Some(run)) => run,
+                Ok(None) => break,
+                Err(err) => {
+                    tracing::error!(batch_id, "failed to activate pending run: {err}");
+                    break;
+                }
+            };
+
+            let payload = PipelineIngestPayload {
+                run_id: activated.id,
+            };
+            match state
+                .jobs
+                .enqueue(EnqueueJobParams {
+                    job_type: "pipeline_ingest".to_string(),
+                    payload_json: serde_json::to_value(payload).unwrap_or_default(),
+                    priority: 20,
+                    dedupe_scope: Some(format!("pipeline:run:{}", activated.id)),
+                    dedupe_key: Some("ingest".to_string()),
+                    run_after: None,
+                    max_attempts: Some(8),
+                })
+                .await
+            {
+                Ok(_) => {
+                    queued_jobs += 1;
+                    started_run_id = Some(activated.id);
+                    break;
+                }
+                Err(err) => {
+                    let reason =
+                        format!("failed to enqueue pipeline_ingest after activation: {err}");
+                    launch_errors.insert(activated.id, reason.clone());
+                    tracing::error!(
+                        batch_id,
+                        run_id = activated.id,
+                        "failed to enqueue pipeline_ingest for activated run: {err}"
+                    );
+
+                    if let Err(mark_err) =
+                        state.pipeline.mark_run_failed(activated.id, &reason).await
+                    {
+                        tracing::error!(
+                            batch_id,
+                            run_id = activated.id,
+                            "failed to mark run failed after enqueue error: {mark_err}"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Build result entries for all successfully created pending runs.
+        for (list_key, repos, run_id) in &pending_runs {
+            if let Some(error) = launch_errors.get(run_id) {
+                results.push(IngestGrokmirrorListResult {
+                    list_key: list_key.clone(),
+                    status: "error".to_string(),
+                    queued: 0,
+                    repos: repos.clone(),
+                    pipeline_run_id: Some(*run_id),
+                    current_stage: Some("ingest".to_string()),
+                    error: Some(error.clone()),
+                });
+                continue;
+            }
+
+            queued_lists += 1;
+            if Some(*run_id) == started_run_id {
+                results.push(IngestGrokmirrorListResult {
+                    list_key: list_key.clone(),
+                    status: "queued".to_string(),
+                    queued: 1,
+                    repos: repos.clone(),
+                    pipeline_run_id: Some(*run_id),
+                    current_stage: Some("ingest".to_string()),
+                    error: None,
+                });
+            } else {
+                results.push(IngestGrokmirrorListResult {
+                    list_key: list_key.clone(),
+                    status: "pending".to_string(),
+                    queued: 0,
+                    repos: repos.clone(),
+                    pipeline_run_id: Some(*run_id),
+                    current_stage: Some("ingest".to_string()),
+                    error: None,
+                });
+            }
+        }
+    }
+
     Ok(Json(IngestGrokmirrorResponse {
         mirror_root: state.settings.mail.mirror_root.clone(),
-        mode,
+        mode: "pipeline".to_string(),
         discovered_lists,
         queued_lists,
         queued_jobs,
@@ -535,18 +659,14 @@ pub async fn threading_rebuild(
     State(state): State<ApiState>,
     Query(query): Query<ThreadingRebuildQuery>,
 ) -> Result<Json<EnqueueResponse>, axum::http::StatusCode> {
-    if matches!(
-        state.settings.worker.pipeline_execution_mode,
-        PipelineExecutionMode::Staged
-    ) {
-        let ingest_active = state
-            .pipeline
-            .is_list_ingest_stage_active(&query.list_key)
-            .await
-            .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-        if ingest_active {
-            return Err(axum::http::StatusCode::CONFLICT);
-        }
+    // Reject if there's an active pipeline run for this list
+    let active_run = state
+        .pipeline
+        .get_active_run_for_list(&query.list_key)
+        .await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    if active_run.is_some() {
+        return Err(axum::http::StatusCode::CONFLICT);
     }
 
     let exists = state
@@ -611,18 +731,14 @@ pub async fn lineage_rebuild(
     State(state): State<ApiState>,
     Query(query): Query<LineageRebuildQuery>,
 ) -> Result<Json<EnqueueResponse>, axum::http::StatusCode> {
-    if matches!(
-        state.settings.worker.pipeline_execution_mode,
-        PipelineExecutionMode::Staged
-    ) {
-        let ingest_active = state
-            .pipeline
-            .is_list_ingest_stage_active(&query.list_key)
-            .await
-            .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-        if ingest_active {
-            return Err(axum::http::StatusCode::CONFLICT);
-        }
+    // Reject if there's an active pipeline run for this list
+    let active_run = state
+        .pipeline
+        .get_active_run_for_list(&query.list_key)
+        .await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    if active_run.is_some() {
+        return Err(axum::http::StatusCode::CONFLICT);
     }
 
     let exists = state
@@ -719,17 +835,10 @@ pub async fn list_pipeline_runs(
     }))
 }
 
-#[derive(Debug, Serialize)]
-pub struct PipelineRunDetailResponse {
-    pub run: nexus_db::PipelineRun,
-    pub stages: Vec<nexus_db::PipelineStageRun>,
-    pub artifacts: Vec<nexus_db::PipelineArtifactCount>,
-}
-
 pub async fn get_pipeline_run(
     State(state): State<ApiState>,
     AxumPath(run_id): AxumPath<i64>,
-) -> Result<Json<PipelineRunDetailResponse>, axum::http::StatusCode> {
+) -> Result<Json<nexus_db::PipelineRun>, axum::http::StatusCode> {
     let Some(run) = state
         .pipeline
         .get_run(run_id)
@@ -739,22 +848,7 @@ pub async fn get_pipeline_run(
         return Err(axum::http::StatusCode::NOT_FOUND);
     };
 
-    let stages = state
-        .pipeline
-        .list_stage_runs(run_id)
-        .await
-        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-    let artifacts = state
-        .pipeline
-        .list_artifact_counts(run_id)
-        .await
-        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    Ok(Json(PipelineRunDetailResponse {
-        run,
-        stages,
-        artifacts,
-    }))
+    Ok(Json(run))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1212,12 +1306,12 @@ fn discover_mirror_lists(mirror_root: &Path) -> Result<Vec<MirrorListCandidate>,
     Ok(out)
 }
 
-async fn queue_list_ingest(
+/// Ensure mailing list and repo catalog entries exist, returning the mailing list ID.
+async fn ensure_catalog_entries(
     state: &ApiState,
     list_key: &str,
-    repos: Vec<String>,
-    source: &str,
-) -> Result<IngestSyncResponse, IngestQueueError> {
+    repos: &[String],
+) -> Result<i64, IngestQueueError> {
     let list = state
         .catalog
         .ensure_mailing_list(list_key)
@@ -1226,7 +1320,7 @@ async fn queue_list_ingest(
             IngestQueueError::internal(format!("failed to ensure mailing list {list_key}: {err}"))
         })?;
 
-    for repo_relpath in &repos {
+    for repo_relpath in repos {
         state
             .catalog
             .ensure_repo(list.id, repo_relpath, repo_relpath)
@@ -1238,93 +1332,84 @@ async fn queue_list_ingest(
             })?;
     }
 
-    if matches!(
-        state.settings.worker.pipeline_execution_mode,
-        PipelineExecutionMode::Staged
-    ) {
-        let run = state
-            .pipeline
-            .create_or_get_active_run(list.id, list_key, source)
-            .await
-            .map_err(|err| {
-                IngestQueueError::internal(format!(
-                    "failed to create/get active pipeline run for list {list_key}: {err}"
-                ))
-            })?;
+    Ok(list.id)
+}
 
-        let payload = PipelineStageIngestPayload { run_id: run.id };
-        state
-            .jobs
-            .enqueue(EnqueueJobParams {
-                job_type: "pipeline_stage_ingest".to_string(),
-                payload_json: serde_json::to_value(payload).map_err(|err| {
-                    IngestQueueError::internal(format!(
-                        "failed to serialize pipeline payload for list {list_key}: {err}"
-                    ))
-                })?,
-                priority: 20,
-                dedupe_scope: Some(format!("list:{list_key}:pipeline")),
-                dedupe_key: Some(format!("run:{}:stage:ingest", run.id)),
-                run_after: None,
-                max_attempts: Some(8),
-            })
-            .await
-            .map_err(|err| {
-                IngestQueueError::internal(format!(
-                    "failed to enqueue ingest stage for list {list_key}: {err}"
-                ))
-            })?;
-
-        return Ok(IngestSyncResponse {
-            queued: 1,
-            repos,
-            mode: "staged".to_string(),
-            pipeline_run_id: Some(run.id),
-            current_stage: Some(run.current_stage),
-        });
+/// Create a pipeline run for a single list and enqueue its ingest job.
+async fn queue_list_ingest(
+    state: &ApiState,
+    list_key: &str,
+    repos: Vec<String>,
+    source: &str,
+) -> Result<IngestSyncResponse, IngestQueueError> {
+    if let Some(active) = state
+        .pipeline
+        .get_active_run_for_list(list_key)
+        .await
+        .map_err(|err| {
+            IngestQueueError::internal(format!(
+                "failed to check active pipeline run for list {list_key}: {err}"
+            ))
+        })?
+    {
+        return Err(IngestQueueError::conflict(format!(
+            "pipeline run {} is already running for list {list_key}",
+            active.id
+        )));
     }
 
-    let list_root = Path::new(&state.settings.mail.mirror_root).join(list_key);
-    let mut queued = 0usize;
-    for repo_relpath in &repos {
-        let payload = RepoScanPayload {
-            list_key: list_key.to_string(),
-            repo_key: repo_relpath.clone(),
-            mirror_path: list_root.join(repo_relpath).display().to_string(),
-            since_commit_oid: None,
-        };
+    let list_id = ensure_catalog_entries(state, list_key, &repos).await?;
 
-        state
-            .jobs
-            .enqueue(EnqueueJobParams {
-                job_type: "repo_scan".to_string(),
-                payload_json: serde_json::to_value(payload).map_err(|err| {
-                    IngestQueueError::internal(format!(
-                        "failed to serialize repo scan payload for list {list_key} repo {repo_relpath}: {err}"
-                    ))
-                })?,
-                priority: 20,
-                dedupe_scope: Some(format!("list:{list_key}")),
-                dedupe_key: None,
-                run_after: None,
-                max_attempts: Some(8),
-            })
-            .await
-            .map_err(|err| {
+    let run = state
+        .pipeline
+        .create_running_run(list_id, list_key, source)
+        .await
+        .map_err(|err| {
+            IngestQueueError::internal(format!(
+                "failed to create pipeline run for list {list_key}: {err}"
+            ))
+        })?;
+
+    let payload = PipelineIngestPayload { run_id: run.id };
+    let enqueue_result = state
+        .jobs
+        .enqueue(EnqueueJobParams {
+            job_type: "pipeline_ingest".to_string(),
+            payload_json: serde_json::to_value(payload).map_err(|err| {
                 IngestQueueError::internal(format!(
-                    "failed to enqueue repo scan for list {list_key} repo {repo_relpath}: {err}"
+                    "failed to serialize pipeline payload for list {list_key}: {err}"
                 ))
-            })?;
+            })?,
+            priority: 20,
+            dedupe_scope: Some(format!("pipeline:run:{}", run.id)),
+            dedupe_key: Some("ingest".to_string()),
+            run_after: None,
+            max_attempts: Some(8),
+        })
+        .await;
 
-        queued += 1;
+    if let Err(err) = enqueue_result {
+        let reason = format!("failed to enqueue pipeline_ingest for list {list_key}: {err}");
+        if let Err(mark_err) = state
+            .pipeline
+            .mark_run_failed(run.id, &format!("initial enqueue error: {err}"))
+            .await
+        {
+            tracing::error!(
+                run_id = run.id,
+                list_key,
+                "failed to mark run failed after enqueue error: {mark_err}"
+            );
+        }
+        return Err(IngestQueueError::internal(reason));
     }
 
     Ok(IngestSyncResponse {
-        queued,
+        queued: 1,
         repos,
-        mode: "legacy".to_string(),
-        pipeline_run_id: None,
-        current_stage: None,
+        mode: "pipeline".to_string(),
+        pipeline_run_id: Some(run.id),
+        current_stage: Some(run.current_stage),
     })
 }
 

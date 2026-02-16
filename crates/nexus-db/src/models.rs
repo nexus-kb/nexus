@@ -51,20 +51,9 @@ pub struct PipelineRun {
     pub last_error: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
-pub struct PipelineStageRun {
-    pub run_id: i64,
-    pub stage: String,
-    pub state: String,
-    pub started_at: DateTime<Utc>,
-    pub completed_at: Option<DateTime<Utc>>,
     pub progress_json: serde_json::Value,
-    pub result_json: Option<serde_json::Value>,
-    pub last_error: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub batch_id: Option<i64>,
+    pub batch_position: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]

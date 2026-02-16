@@ -36,8 +36,8 @@ pub use crate::lineage::{
     ThreadRefRecord, ThreadSummaryRecord, UpsertPatchItemFileInput, UpsertPatchItemInput,
     UpsertPatchSeriesInput, UpsertPatchSeriesVersionInput,
 };
-pub use crate::models::{EmbeddingBackfillRun, Job, JobState, PipelineRun, PipelineStageRun};
-pub use crate::pipeline::{ListPipelineRunsParams, PipelineArtifactCount, PipelineStore};
+pub use crate::models::{EmbeddingBackfillRun, Job, JobState, PipelineRun};
+pub use crate::pipeline::{ListPipelineRunsParams, PipelineStore};
 pub use crate::search::SearchStore;
 pub use crate::threading::{
     ThreadComponentWrite, ThreadMessageWrite, ThreadNodeWrite, ThreadSourceMessage,

@@ -1,20 +1,18 @@
-use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
 use nexus_core::config::Settings;
 use nexus_db::{
-    CatalogStore, Db, EmbeddingsStore, IngestStore, Job, JobState, JobStore, JobStoreMetrics,
-    LineageStore, PipelineStore, RetryDecision, SearchStore, ThreadingStore,
+    CatalogStore, Db, EmbeddingsStore, EnqueueJobParams, IngestStore, Job, JobState, JobStore,
+    JobStoreMetrics, LineageStore, PipelineStore, RetryDecision, SearchStore, ThreadingStore,
 };
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, oneshot};
+use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 use tokio::time::{MissedTickBehavior, interval};
 use tracing::{error, info, warn};
 
 use crate::JobExecutionOutcome;
-use crate::payloads::{IngestCommitBatchPayload, RepoIngestRunPayload};
+use crate::payloads::PipelineIngestPayload;
 use crate::pipeline::Phase0JobHandler;
 
 const MAX_LOG_REASON_CHARS: usize = 180;
@@ -27,20 +25,17 @@ pub struct WorkerConfig {
     pub heartbeat_ms: u64,
     pub sweep_ms: u64,
     pub max_inflight_jobs: usize,
-    pub max_inflight_ingest_jobs: usize,
 }
 
 impl From<&nexus_core::config::WorkerConfig> for WorkerConfig {
     fn from(value: &nexus_core::config::WorkerConfig) -> Self {
-        let max_inflight_jobs = value.max_inflight_jobs.max(1);
         Self {
             poll_ms: value.poll_ms,
             claim_batch: value.claim_batch,
             lease_ms: value.lease_ms,
             heartbeat_ms: value.heartbeat_ms,
             sweep_ms: value.sweep_ms,
-            max_inflight_jobs,
-            max_inflight_ingest_jobs: value.max_inflight_ingest_jobs.max(1).min(max_inflight_jobs),
+            max_inflight_jobs: value.max_inflight_jobs.max(1),
         }
     }
 }
@@ -70,11 +65,10 @@ pub struct Phase0Worker {
     settings: Settings,
     db: Db,
     jobs: JobStore,
+    pipeline: PipelineStore,
     handler: Phase0JobHandler,
     cfg: WorkerConfig,
     worker_id: String,
-    ingest_job_semaphore: Arc<Semaphore>,
-    repo_ingest_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -111,23 +105,21 @@ impl Phase0Worker {
             ingest,
             threading,
             lineage,
-            pipeline,
+            pipeline.clone(),
             search,
             embeddings,
             jobs.clone(),
         );
         let cfg = WorkerConfig::from(&settings.worker);
-        let ingest_limit = cfg.max_inflight_ingest_jobs;
 
         Self {
             settings,
             db,
             jobs,
+            pipeline,
             handler,
             cfg,
             worker_id: format!("phase0-worker-{}", std::process::id()),
-            ingest_job_semaphore: Arc::new(Semaphore::new(ingest_limit)),
-            repo_ingest_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -216,9 +208,6 @@ impl Phase0Worker {
     }
 
     async fn process_job(&self, job: Job) {
-        let _ingest_permit = self.acquire_ingest_permit(&job).await;
-        let _repo_guard = self.acquire_repo_ingest_lock(&job).await;
-
         let attempt = match self.jobs.start_attempt(job.id, job.attempt).await {
             Ok(v) => v,
             Err(err) => {
@@ -255,6 +244,13 @@ impl Phase0Worker {
                 reason: "cancel requested before execution".to_string(),
                 metrics: cancel_metrics,
             };
+            if let Err(err) = self.finalize_pipeline_run_if_needed(&job, &outcome).await {
+                error!(
+                    job_id = job.id,
+                    error = %err,
+                    "failed to finalize pipeline run after pre-execution cancellation"
+                );
+            }
             log_job_attempt_completion(&job, &outcome);
             return;
         }
@@ -292,7 +288,7 @@ impl Phase0Worker {
         let _ = stop_tx.send(());
         let _ = heartbeat_task.await;
 
-        match finalize_job(
+        let finalize_result = finalize_job(
             &self.jobs,
             &self.settings,
             &job,
@@ -301,9 +297,17 @@ impl Phase0Worker {
             job.attempt,
             job.max_attempts,
         )
-        .await
-        {
-            Ok(()) => {}
+        .await;
+        match finalize_result {
+            Ok(()) => {
+                if let Err(err) = self.finalize_pipeline_run_if_needed(&job, &outcome).await {
+                    error!(
+                        job_id = job.id,
+                        error = %err,
+                        "failed to finalize pipeline run after job finalization"
+                    );
+                }
+            }
             Err(err) => {
                 error!(job_id = job.id, error = %err, "failed to finalize job result");
             }
@@ -312,77 +316,134 @@ impl Phase0Worker {
         log_job_attempt_completion(&job, &outcome);
     }
 
-    async fn acquire_ingest_permit(&self, job: &Job) -> Option<OwnedSemaphorePermit> {
-        if !is_ingest_job_type(&job.job_type) {
-            return None;
-        }
-
-        match self.ingest_job_semaphore.clone().acquire_owned().await {
-            Ok(permit) => Some(permit),
-            Err(err) => {
-                warn!(job_id = job.id, error = %err, "ingest concurrency limiter unavailable");
-                None
-            }
-        }
-    }
-
-    async fn acquire_repo_ingest_lock(
+    async fn finalize_pipeline_run_if_needed(
         &self,
         job: &Job,
-    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
-        if !is_ingest_job_type(&job.job_type) {
-            return None;
+        outcome: &JobExecutionOutcome,
+    ) -> Result<(), sqlx::Error> {
+        if !is_pipeline_job_type(&job.job_type) {
+            return Ok(());
+        }
+        let Some(run_id) = job
+            .payload_json
+            .get("run_id")
+            .and_then(serde_json::Value::as_i64)
+        else {
+            return Ok(());
+        };
+
+        let run = match self.pipeline.get_run(run_id).await? {
+            Some(run) => run,
+            None => return Ok(()),
+        };
+        if run.state != "running" {
+            return Ok(());
         }
 
-        let repo_key = match job.job_type.as_str() {
-            "ingest_commit_batch" => {
-                let payload: IngestCommitBatchPayload =
-                    match serde_json::from_value(job.payload_json.clone()) {
-                        Ok(v) => v,
-                        Err(err) => {
-                            warn!(
-                                job_id = job.id,
-                                error = %err,
-                                "failed to parse ingest payload for repo lock"
-                            );
-                            return None;
-                        }
-                    };
-                format!("{}:{}", payload.list_key, payload.repo_key)
+        match outcome {
+            JobExecutionOutcome::Terminal { reason, .. } => {
+                self.mark_pipeline_run_failed_and_continue(&run, &job.job_type, reason)
+                    .await?;
             }
-            "repo_ingest_run" => {
-                let payload: RepoIngestRunPayload =
-                    match serde_json::from_value(job.payload_json.clone()) {
-                        Ok(v) => v,
-                        Err(err) => {
-                            warn!(
-                                job_id = job.id,
-                                error = %err,
-                                "failed to parse repo_ingest_run payload for repo lock"
-                            );
-                            return None;
-                        }
-                    };
-                format!("{}:{}", payload.list_key, payload.repo_key)
+            JobExecutionOutcome::Retryable { reason, .. } if job.attempt >= job.max_attempts => {
+                self.mark_pipeline_run_failed_and_continue(&run, &job.job_type, reason)
+                    .await?;
             }
-            _ => return None,
-        };
-        let lock = {
-            let mut locks = self.repo_ingest_locks.lock().await;
-            locks
-                .entry(repo_key)
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
+            JobExecutionOutcome::Cancelled { reason, .. } => {
+                self.mark_pipeline_run_cancelled_and_continue(&run, &job.job_type, reason)
+                    .await?;
+            }
+            _ => {}
+        }
 
-        Some(lock.lock_owned().await)
+        Ok(())
+    }
+
+    async fn mark_pipeline_run_failed_and_continue(
+        &self,
+        run: &nexus_db::PipelineRun,
+        job_type: &str,
+        reason: &str,
+    ) -> Result<(), sqlx::Error> {
+        let failure_reason = format!("stage {job_type} failed: {reason}");
+        self.pipeline
+            .mark_run_failed(run.id, &failure_reason)
+            .await?;
+        if let Some(batch_id) = run.batch_id {
+            self.activate_and_enqueue_next_list(batch_id).await?;
+        }
+        Ok(())
+    }
+
+    async fn mark_pipeline_run_cancelled_and_continue(
+        &self,
+        run: &nexus_db::PipelineRun,
+        job_type: &str,
+        reason: &str,
+    ) -> Result<(), sqlx::Error> {
+        let cancel_reason = format!("stage {job_type} cancelled: {reason}");
+        self.pipeline
+            .mark_run_cancelled(run.id, &cancel_reason)
+            .await?;
+        if let Some(batch_id) = run.batch_id {
+            self.activate_and_enqueue_next_list(batch_id).await?;
+        }
+        Ok(())
+    }
+
+    async fn activate_and_enqueue_next_list(&self, batch_id: i64) -> Result<(), sqlx::Error> {
+        loop {
+            let Some(next_run) = self.pipeline.activate_next_pending_run(batch_id).await? else {
+                return Ok(());
+            };
+
+            let payload = PipelineIngestPayload {
+                run_id: next_run.id,
+            };
+            match self
+                .jobs
+                .enqueue(EnqueueJobParams {
+                    job_type: "pipeline_ingest".to_string(),
+                    payload_json: serde_json::to_value(payload)
+                        .unwrap_or_else(|_| serde_json::json!({})),
+                    priority: 20,
+                    dedupe_scope: Some(format!("pipeline:run:{}", next_run.id)),
+                    dedupe_key: Some("ingest".to_string()),
+                    run_after: None,
+                    max_attempts: Some(8),
+                })
+                .await
+            {
+                Ok(_) => {
+                    info!(
+                        run_id = next_run.id,
+                        list_key = %next_run.list_key,
+                        batch_id,
+                        "activated next pending list in batch"
+                    );
+                    return Ok(());
+                }
+                Err(err) => {
+                    let reason =
+                        format!("failed to enqueue pipeline_ingest after activation: {err}");
+                    warn!(
+                        run_id = next_run.id,
+                        list_key = %next_run.list_key,
+                        batch_id,
+                        error = %err,
+                        "marking activated run failed and trying next pending run"
+                    );
+                    self.pipeline.mark_run_failed(next_run.id, &reason).await?;
+                }
+            }
+        }
     }
 }
 
-fn is_ingest_job_type(job_type: &str) -> bool {
+fn is_pipeline_job_type(job_type: &str) -> bool {
     matches!(
         job_type,
-        "ingest_commit_batch" | "repo_ingest_run" | "pipeline_stage_ingest"
+        "pipeline_ingest" | "pipeline_threading" | "pipeline_lineage" | "pipeline_search"
     )
 }
 
