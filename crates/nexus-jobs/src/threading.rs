@@ -93,10 +93,21 @@ pub fn build_threads(messages: Vec<ThreadingInputMessage>) -> BuildOutcome {
         )
     });
 
-    let mut nodes: HashMap<String, Node> = HashMap::new();
-    let mut message_pk_to_node_key: HashMap<i64, String> = HashMap::new();
-    let mut message_order: Vec<i64> = Vec::new();
-    let mut canonical_key_to_node_key: HashMap<String, String> = HashMap::new();
+    let mut nodes: HashMap<String, Node> = HashMap::with_capacity(ordered_messages.len() * 2);
+    let mut message_pk_to_node_key: HashMap<i64, String> =
+        HashMap::with_capacity(ordered_messages.len());
+    let mut message_order: Vec<i64> = Vec::with_capacity(ordered_messages.len());
+    let mut canonical_key_to_node_key: HashMap<String, String> =
+        HashMap::with_capacity(ordered_messages.len());
+    let mut message_pk_to_index: HashMap<i64, usize> =
+        HashMap::with_capacity(ordered_messages.len());
+    let mut message_pk_to_subject_norm: HashMap<i64, String> =
+        HashMap::with_capacity(ordered_messages.len());
+
+    for (idx, msg) in ordered_messages.iter().enumerate() {
+        message_pk_to_index.insert(msg.message_pk, idx);
+        message_pk_to_subject_norm.insert(msg.message_pk, msg.subject_norm.clone());
+    }
 
     for msg in &ordered_messages {
         let canonical_key = canonical_message_key(msg);
@@ -136,15 +147,13 @@ pub fn build_threads(messages: Vec<ThreadingInputMessage>) -> BuildOutcome {
         let Some(node_key) = message_pk_to_node_key.get(message_pk).cloned() else {
             continue;
         };
-        let Some(message) = ordered_messages
-            .iter()
-            .find(|msg| msg.message_pk == *message_pk)
-        else {
+        let Some(message_idx) = message_pk_to_index.get(message_pk).copied() else {
             continue;
         };
+        let message = &ordered_messages[message_idx];
 
         let reference_chain = build_reference_chain(message);
-        let mut chain_node_keys = Vec::new();
+        let mut chain_node_keys = Vec::with_capacity(reference_chain.len());
 
         for reference_id in reference_chain {
             let resolved_key = if let Some(existing) = canonical_key_to_node_key.get(&reference_id)
@@ -203,10 +212,10 @@ pub fn build_threads(messages: Vec<ThreadingInputMessage>) -> BuildOutcome {
             continue;
         }
 
-        let mut thread_nodes = Vec::new();
-        let mut thread_messages = Vec::new();
-        let mut dates = Vec::new();
-        let mut membership_tokens = Vec::new();
+        let mut thread_nodes = Vec::with_capacity(ordered_nodes.len());
+        let mut thread_messages = Vec::with_capacity(ordered_nodes.len());
+        let mut dates = Vec::with_capacity(ordered_nodes.len());
+        let mut membership_tokens = Vec::with_capacity(ordered_nodes.len());
 
         for entry in &ordered_nodes {
             let Some(node) = nodes.get(&entry.node_key) else {
@@ -258,12 +267,7 @@ pub fn build_threads(messages: Vec<ThreadingInputMessage>) -> BuildOutcome {
         });
 
         let subject_norm = root_real_message_pk
-            .and_then(|pk| {
-                nodes
-                    .values()
-                    .find(|node| node.message_pk == Some(pk))
-                    .map(|node| node.subject_norm.clone())
-            })
+            .and_then(|pk| message_pk_to_subject_norm.get(&pk).cloned())
             .unwrap_or_default();
 
         let created_at = dates.iter().min().copied().unwrap_or_else(epoch_utc);

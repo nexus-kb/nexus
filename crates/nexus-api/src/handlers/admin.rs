@@ -1245,13 +1245,7 @@ fn discover_repo_relpaths(list_root: &Path) -> Result<Vec<String>, std::io::Erro
         return Ok(Vec::new());
     }
 
-    let mut repos = BTreeSet::new();
-
-    let all_git = list_root.join("all.git");
-    if all_git.is_dir() {
-        repos.insert("all.git".to_string());
-    }
-
+    let mut epoch_repos = BTreeSet::new();
     let git_dir = list_root.join("git");
     if git_dir.is_dir() {
         for entry in fs::read_dir(&git_dir)? {
@@ -1268,16 +1262,25 @@ fn discover_repo_relpaths(list_root: &Path) -> Result<Vec<String>, std::io::Erro
                     .join(path.file_name().unwrap_or_default())
                     .display()
                     .to_string();
-                repos.insert(relpath);
+                epoch_repos.insert(relpath);
             }
         }
     }
 
-    if repos.is_empty() && looks_like_bare_repo(list_root) {
-        repos.insert(".".to_string());
+    if !epoch_repos.is_empty() {
+        return Ok(epoch_repos.into_iter().collect());
     }
 
-    Ok(repos.into_iter().collect())
+    let all_git = list_root.join("all.git");
+    if all_git.is_dir() {
+        return Ok(vec!["all.git".to_string()]);
+    }
+
+    if looks_like_bare_repo(list_root) {
+        return Ok(vec![".".to_string()]);
+    }
+
+    Ok(Vec::new())
 }
 
 fn discover_mirror_lists(mirror_root: &Path) -> Result<Vec<MirrorListCandidate>, std::io::Error> {

@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Duration, TimeZone, Utc};
 use mailparse::{MailAddr, MailHeaderMap, ParsedMail, addrparse, dateparse, parse_mail};
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -10,6 +10,7 @@ use crate::patch_detect::{extract_diff_text, has_diff_markers, normalize_line_en
 
 static MESSAGE_ID_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"<([^<>\s]+)>").expect("valid message-id regex"));
+const MAX_FUTURE_DATE_SKEW_HOURS: i64 = 24;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ParseEmailError {
@@ -19,6 +20,12 @@ pub enum ParseEmailError {
     MissingMessageId,
     #[error("missing author email")]
     MissingAuthorEmail,
+    #[error("missing date for message {message_id}")]
+    MissingDate { message_id: String },
+    #[error("invalid date `{raw}` for message {message_id}")]
+    InvalidDate { message_id: String, raw: String },
+    #[error("future date `{raw}` for message {message_id}")]
+    FutureDate { message_id: String, raw: String },
     #[error("sanitization invariant violation: {0}")]
     SanitizationInvariantViolation(&'static str),
 }
@@ -73,7 +80,6 @@ pub fn parse_email(raw_rfc822: &[u8]) -> Result<ParseOutcome, ParseEmailError> {
         .get_first_value("Date")
         .map(|v| sanitize_text(&v))
         .unwrap_or_default();
-    let date_utc = parse_date(&date_raw);
 
     let to_raw = parsed
         .headers
@@ -96,6 +102,7 @@ pub fn parse_email(raw_rfc822: &[u8]) -> Result<ParseOutcome, ParseEmailError> {
         .first()
         .cloned()
         .ok_or(ParseEmailError::MissingMessageId)?;
+    let date_utc = parse_date(&date_raw, &message_id_primary)?;
 
     let mut in_reply_to_ids = Vec::new();
     for header_value in parsed.headers.get_all_values("In-Reply-To") {
@@ -109,7 +116,6 @@ pub fn parse_email(raw_rfc822: &[u8]) -> Result<ParseOutcome, ParseEmailError> {
     }
     references_ids = dedupe_preserve_order(references_ids);
 
-    let mut body_text: Option<String> = None;
     let mut diff_parts: Vec<String> = Vec::new();
     let mut has_attachments = false;
 
@@ -133,10 +139,6 @@ pub fn parse_email(raw_rfc822: &[u8]) -> Result<ParseOutcome, ParseEmailError> {
             return;
         }
 
-        if mime.starts_with("text/plain") && body_text.is_none() {
-            body_text = Some(sanitize_text(&body));
-        }
-
         let looks_like_patch_mime = mime.contains("x-patch") || mime.contains("x-diff");
         let looks_like_patch_name = filename
             .as_deref()
@@ -151,13 +153,11 @@ pub fn parse_email(raw_rfc822: &[u8]) -> Result<ParseOutcome, ParseEmailError> {
         } else if let Some(extracted) = extract_diff_text(&normalized_body) {
             diff_parts.push(extracted);
         }
-
-        if body_text.is_none() && mime.starts_with("text/") {
-            body_text = Some(sanitize_text(&body));
-        }
     });
 
-    let body_text = body_text.filter(|v| !v.is_empty());
+    let body_text = extract_preferred_body(&parsed)
+        .map(|value| sanitize_text(&value))
+        .filter(|v| !v.is_empty());
     let diff_text = if diff_parts.is_empty() {
         None
     } else {
@@ -203,7 +203,7 @@ pub fn parse_email(raw_rfc822: &[u8]) -> Result<ParseOutcome, ParseEmailError> {
         subject_norm,
         from_name,
         from_email,
-        date_utc,
+        date_utc: Some(date_utc),
         to_raw,
         cc_raw,
         message_ids,
@@ -259,6 +259,10 @@ fn extract_part_body(part: &ParsedMail<'_>) -> String {
     }
 }
 
+fn extract_preferred_body(parsed: &ParsedMail<'_>) -> Option<String> {
+    crate::b4_compat::extract_preferred_body(parsed)
+}
+
 fn parse_primary_author(from_header: &str) -> (Option<String>, String) {
     if let Ok(addrs) = addrparse(from_header)
         && let Some(MailAddr::Single(first)) = addrs.iter().next()
@@ -281,9 +285,42 @@ fn parse_primary_author(from_header: &str) -> (Option<String>, String) {
     (None, String::new())
 }
 
-fn parse_date(raw: &str) -> Option<DateTime<Utc>> {
-    let timestamp = dateparse(&sanitize_text(raw)).ok()?;
-    Utc.timestamp_opt(timestamp, 0).single()
+fn parse_date(raw: &str, message_id: &str) -> Result<DateTime<Utc>, ParseEmailError> {
+    let sanitized = sanitize_text(raw);
+    if sanitized.is_empty() {
+        return Err(ParseEmailError::MissingDate {
+            message_id: message_id.to_string(),
+        });
+    }
+    if !sanitized.chars().any(|ch| ch.is_ascii_digit()) {
+        return Err(ParseEmailError::InvalidDate {
+            message_id: message_id.to_string(),
+            raw: sanitized,
+        });
+    }
+
+    let timestamp = dateparse(&sanitized).map_err(|_| ParseEmailError::InvalidDate {
+        message_id: message_id.to_string(),
+        raw: sanitized.clone(),
+    })?;
+
+    let parsed =
+        Utc.timestamp_opt(timestamp, 0)
+            .single()
+            .ok_or_else(|| ParseEmailError::InvalidDate {
+                message_id: message_id.to_string(),
+                raw: sanitized.clone(),
+            })?;
+
+    let now = Utc::now();
+    if parsed > now + Duration::hours(MAX_FUTURE_DATE_SKEW_HOURS) {
+        return Err(ParseEmailError::FutureDate {
+            message_id: message_id.to_string(),
+            raw: sanitized,
+        });
+    }
+
+    Ok(parsed)
 }
 
 fn sanitize_text(value: &str) -> String {
@@ -508,9 +545,10 @@ fn dedupe_preserve_order(ids: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContentHashInput, compute_content_hash, limit_for_search, normalize_message_id_token,
-        parse_email, sanitize_text,
+        ContentHashInput, ParseEmailError, compute_content_hash, limit_for_search,
+        normalize_message_id_token, parse_email, sanitize_text,
     };
+    use chrono::{Duration, Utc};
 
     #[test]
     fn hash_normalizes_line_endings_and_trailing_whitespace() {
@@ -688,5 +726,57 @@ mod tests {
         assert!(!super::is_disallowed_char('\n'));
         assert!(!super::is_disallowed_char('\t'));
         assert!(!super::is_disallowed_char('é'));
+    }
+
+    #[test]
+    fn parser_rejects_missing_date() {
+        let raw = concat!(
+            "From: Alice <alice@example.com>\r\n",
+            "Message-ID: <missing-date@example.com>\r\n",
+            "Subject: [PATCH] missing date\r\n",
+            "Content-Type: text/plain; charset=utf-8\r\n",
+            "\r\n",
+            "body\r\n"
+        )
+        .as_bytes()
+        .to_vec();
+
+        let err = parse_email(&raw).expect_err("missing date should fail");
+        assert!(matches!(err, ParseEmailError::MissingDate { .. }));
+    }
+
+    #[test]
+    fn parser_rejects_invalid_date() {
+        let raw = concat!(
+            "From: Alice <alice@example.com>\r\n",
+            "Message-ID: <invalid-date@example.com>\r\n",
+            "Date: definitely not a date\r\n",
+            "Subject: [PATCH] invalid date\r\n",
+            "Content-Type: text/plain; charset=utf-8\r\n",
+            "\r\n",
+            "body\r\n"
+        )
+        .as_bytes()
+        .to_vec();
+
+        let err = parse_email(&raw).expect_err("invalid date should fail");
+        assert!(matches!(err, ParseEmailError::InvalidDate { .. }));
+    }
+
+    #[test]
+    fn parser_rejects_far_future_date() {
+        let future_date = (Utc::now() + Duration::hours(72)).to_rfc2822();
+        let raw = format!(
+            "From: Alice <alice@example.com>\r\n\
+             Message-ID: <future-date@example.com>\r\n\
+             Date: {future_date}\r\n\
+             Subject: [PATCH] future date\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             \r\n\
+             body\r\n"
+        );
+
+        let err = parse_email(raw.as_bytes()).expect_err("future date should fail");
+        assert!(matches!(err, ParseEmailError::FutureDate { .. }));
     }
 }

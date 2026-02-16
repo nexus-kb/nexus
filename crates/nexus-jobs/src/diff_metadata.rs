@@ -304,18 +304,51 @@ fn parse_marker_path(value: &str) -> Option<String> {
     }
 
     let token = if trimmed.starts_with('"') {
-        let without_quote = trimmed.strip_prefix('"').unwrap_or(trimmed);
-        let end = without_quote.find('"').unwrap_or(without_quote.len());
-        &without_quote[..end]
+        parse_quoted_marker_token(trimmed)
     } else {
-        trimmed.split_whitespace().next().unwrap_or_default()
+        trimmed
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_string()
     };
 
     if token.is_empty() || token == "/dev/null" {
         return None;
     }
 
-    Some(token.to_string())
+    Some(token)
+}
+
+fn parse_quoted_marker_token(value: &str) -> String {
+    let mut out = String::new();
+    let mut escaped = false;
+    let mut iter = value.chars();
+    if iter.next() != Some('"') {
+        return value
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+    }
+
+    for ch in iter {
+        if escaped {
+            out.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            break;
+        }
+        out.push(ch);
+    }
+
+    out
 }
 
 fn normalize_path_value(path: String) -> String {
@@ -443,5 +476,22 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].new_path, "legacy.txt");
         assert_eq!(files[0].hunk_count, 1);
+    }
+
+    #[test]
+    fn parses_quoted_paths_with_spaces() {
+        let diff = concat!(
+            "diff --git \"a/path with spaces.txt\" \"b/path with spaces.txt\"\n",
+            "index 1111111..2222222 100644\n",
+            "--- \"a/path with spaces.txt\"\n",
+            "+++ \"b/path with spaces.txt\"\n",
+            "@@ -1 +1 @@\n",
+            "-before\n",
+            "+after\n",
+        );
+
+        let files = parse_diff_metadata(diff);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].new_path, "path with spaces.txt");
     }
 }

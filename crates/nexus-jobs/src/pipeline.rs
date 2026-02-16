@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use chrono::Utc;
@@ -11,9 +11,9 @@ use nexus_core::embeddings::{EmbeddingsClientError, OpenAiEmbeddingsClient};
 use nexus_core::search::MeiliIndexKind;
 use nexus_db::{
     CatalogStore, EmbeddingVectorUpsert, EmbeddingsStore, EnqueueJobParams, IngestCommitRow,
-    IngestStore, Job, JobStore, JobStoreMetrics, LineageStore, ParsedBodyInput, ParsedMessageInput,
-    PipelineStore, SearchStore, ThreadComponentWrite, ThreadMessageWrite, ThreadNodeWrite,
-    ThreadSummaryWrite, ThreadingApplyStats, ThreadingStore,
+    IngestStore, Job, JobStore, JobStoreMetrics, LineageStore, MailingListRepo, ParsedBodyInput,
+    ParsedMessageInput, PipelineStore, SearchStore, ThreadComponentWrite, ThreadMessageWrite,
+    ThreadNodeWrite, ThreadSummaryWrite, ThreadingApplyStats, ThreadingRunContext, ThreadingStore,
 };
 use sha2::{Digest, Sha256};
 use tokio::task::JoinSet;
@@ -148,8 +148,43 @@ impl Phase0JobHandler {
         }
 
         let list_root = Path::new(&self.settings.mail.mirror_root).join(&run.list_key);
-        let mut repos = match self.catalog.list_repos_for_list(&run.list_key).await {
+        let relpaths = match discover_repo_relpaths(&list_root) {
             Ok(value) => value,
+            Err(err) => {
+                return retryable_error(
+                    format!(
+                        "failed to discover repos under {}: {err}",
+                        list_root.display()
+                    ),
+                    "io",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+        };
+
+        for relpath in &relpaths {
+            if let Err(err) = self
+                .catalog
+                .ensure_repo(run.mailing_list_id, relpath, relpath)
+                .await
+            {
+                return retryable_error(
+                    format!(
+                        "failed to ensure repo {} exists for list {}: {err}",
+                        relpath, run.list_key
+                    ),
+                    "db",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+        }
+
+        let repos = match self.catalog.list_repos_for_list(&run.list_key).await {
+            Ok(value) => order_repos_for_ingest(value),
             Err(err) => {
                 return retryable_error(
                     format!("failed to list repos for list {}: {err}", run.list_key),
@@ -161,57 +196,6 @@ impl Phase0JobHandler {
             }
         };
 
-        if repos.is_empty() {
-            let relpaths = match discover_repo_relpaths(&list_root) {
-                Ok(value) => value,
-                Err(err) => {
-                    return retryable_error(
-                        format!(
-                            "failed to discover repos under {}: {err}",
-                            list_root.display()
-                        ),
-                        "io",
-                        &job,
-                        started.elapsed().as_millis(),
-                        &self.settings,
-                    );
-                }
-            };
-            for relpath in &relpaths {
-                if let Err(err) = self
-                    .catalog
-                    .ensure_repo(run.mailing_list_id, relpath, relpath)
-                    .await
-                {
-                    return retryable_error(
-                        format!(
-                            "failed to ensure repo {} exists for list {}: {err}",
-                            relpath, run.list_key
-                        ),
-                        "db",
-                        &job,
-                        started.elapsed().as_millis(),
-                        &self.settings,
-                    );
-                }
-            }
-            repos = match self.catalog.list_repos_for_list(&run.list_key).await {
-                Ok(value) => value,
-                Err(err) => {
-                    return retryable_error(
-                        format!(
-                            "failed to list repos for list {} after discovery: {err}",
-                            run.list_key
-                        ),
-                        "db",
-                        &job,
-                        started.elapsed().as_millis(),
-                        &self.settings,
-                    );
-                }
-            };
-        }
-
         let repos_total = repos.len() as u64;
         let stage_started_at = Utc::now();
         let batch_size = self.settings.mail.commit_batch_size.max(1);
@@ -222,6 +206,11 @@ impl Phase0JobHandler {
         let mut rows_written = 0u64;
         let mut bytes_read = 0u64;
         let mut parse_errors = 0u64;
+        let mut non_mail_commits = 0u64;
+        let mut header_rejections = 0u64;
+        let mut date_rejections = 0u64;
+        let mut sanitization_rejections = 0u64;
+        let mut other_rejections = 0u64;
         let mut items_since_checkpoint = 0u64;
 
         for repo in repos {
@@ -276,20 +265,6 @@ impl Phase0JobHandler {
                 }
             };
 
-            let mut gix_repo = match gix::open(&repo_path) {
-                Ok(value) => value,
-                Err(err) => {
-                    return retryable_error(
-                        format!("failed to open repo {:?}: {err}", repo_path),
-                        "io",
-                        &job,
-                        started.elapsed().as_millis(),
-                        &self.settings,
-                    );
-                }
-            };
-            gix_repo.object_cache_size_if_unset(64 * 1024 * 1024);
-
             loop {
                 if let Err(err) = ctx.heartbeat().await {
                     warn!(job_id = job.id, error = %err, "heartbeat update failed");
@@ -326,17 +301,18 @@ impl Phase0JobHandler {
                 };
 
                 commit_count += chunk.len() as u64;
-                let mut raw_commits = Vec::with_capacity(chunk.len());
-                for (idx, commit_oid) in chunk.iter().enumerate() {
-                    let raw_mail = match read_mail_blob(&gix_repo, commit_oid) {
-                        Ok(Some(value)) => value,
-                        Ok(None) => {
-                            parse_errors += 1;
-                            continue;
-                        }
+                let chunk_len = chunk.len() as u64;
+                let last_commit = chunk.last().cloned();
+                let workers = configured_parse_worker_count(chunk.len(), &self.settings);
+                let parsed_outcome =
+                    match parse_commit_rows(repo_path.clone(), chunk, workers).await {
+                        Ok(value) => value,
                         Err(err) => {
                             return retryable_error(
-                                format!("failed to read commit blob {}: {err}", commit_oid),
+                                format!(
+                                    "failed to parse ingest batch for repo {}: {err}",
+                                    repo.repo_key
+                                ),
                                 "io",
                                 &job,
                                 started.elapsed().as_millis(),
@@ -344,23 +320,13 @@ impl Phase0JobHandler {
                             );
                         }
                     };
-
-                    bytes_read += raw_mail.len() as u64;
-                    raw_commits.push(RawCommitMail {
-                        index: idx,
-                        commit_oid: commit_oid.clone(),
-                        raw_rfc822: raw_mail,
-                    });
-                }
-
-                let workers = effective_parse_worker_count(
-                    self.settings.worker.ingest_parse_cpu_ratio,
-                    self.settings.worker.ingest_parse_workers_min,
-                    self.settings.worker.ingest_parse_workers_max,
-                    raw_commits.len(),
-                );
-                let parsed_outcome = parse_commit_rows(raw_commits, workers).await;
                 parse_errors += parsed_outcome.parse_errors;
+                non_mail_commits += parsed_outcome.non_mail_commits;
+                bytes_read += parsed_outcome.bytes_read;
+                header_rejections += parsed_outcome.header_rejections;
+                date_rejections += parsed_outcome.date_rejections;
+                sanitization_rejections += parsed_outcome.sanitization_rejections;
+                other_rejections += parsed_outcome.other_rejections;
 
                 let batch_outcome = match self
                     .write_ingest_rows(
@@ -387,10 +353,10 @@ impl Phase0JobHandler {
 
                 rows_written += batch_outcome.inserted_instances;
 
-                if let Some(last_commit) = chunk.last()
+                if let Some(last_commit) = last_commit
                     && let Err(err) = self
                         .catalog
-                        .update_watermark(repo.id, Some(last_commit))
+                        .update_watermark(repo.id, Some(&last_commit))
                         .await
                 {
                     return retryable_error(
@@ -405,7 +371,7 @@ impl Phase0JobHandler {
                     );
                 }
 
-                items_since_checkpoint += chunk.len() as u64;
+                items_since_checkpoint += chunk_len;
                 if items_since_checkpoint >= checkpoint_interval {
                     items_since_checkpoint = 0;
                     let progress = serde_json::json!({
@@ -415,6 +381,11 @@ impl Phase0JobHandler {
                         "commits_processed": commit_count,
                         "rows_written": rows_written,
                         "parse_errors": parse_errors,
+                        "non_mail_commits": non_mail_commits,
+                        "header_rejections": header_rejections,
+                        "date_rejections": date_rejections,
+                        "sanitization_rejections": sanitization_rejections,
+                        "other_rejections": other_rejections,
                         "bytes_read": bytes_read,
                     });
                     if let Err(err) = self.pipeline.update_run_progress(run.id, progress).await {
@@ -491,6 +462,11 @@ impl Phase0JobHandler {
                 "commits_processed": commit_count,
                 "rows_written": rows_written,
                 "parse_errors": parse_errors,
+                "non_mail_commits": non_mail_commits,
+                "header_rejections": header_rejections,
+                "date_rejections": date_rejections,
+                "sanitization_rejections": sanitization_rejections,
+                "other_rejections": other_rejections,
                 "next_stage": STAGE_THREADING,
             }),
             metrics: JobStoreMetrics {
@@ -565,11 +541,15 @@ impl Phase0JobHandler {
         let batch_limit = self.settings.mail.commit_batch_size.max(1) as i64;
         let checkpoint_interval = self.settings.worker.progress_checkpoint_interval.max(1) as u64;
         let mut cursor = 0i64;
-        let mut messages_total = 0u64;
+        let mut anchors = Vec::new();
+        let mut anchors_scanned = 0u64;
         let mut messages_processed = 0u64;
         let mut threads_created = 0u64;
         let mut threads_updated = 0u64;
         let mut apply_stats = ThreadingApplyStats::default();
+        let mut source_messages_read = 0u64;
+        let mut anchors_deduped = 0u64;
+        let mut items_since_checkpoint = 0u64;
 
         loop {
             if let Err(err) = ctx.heartbeat().await {
@@ -623,44 +603,27 @@ impl Phase0JobHandler {
             if chunk.is_empty() {
                 break;
             }
+            let chunk_len = chunk.len() as u64;
             cursor = *chunk.last().unwrap_or(&cursor);
-            messages_total += chunk.len() as u64;
+            anchors_scanned += chunk_len;
+            anchors.extend(chunk);
+            messages_processed = anchors_scanned;
 
-            let outcome = match self
-                .apply_threading_for_anchors(run.mailing_list_id, &run.list_key, chunk.clone())
-                .await
-            {
-                Ok(value) => value,
-                Err(err) => {
-                    return retryable_error(
-                        format!(
-                            "failed to apply threading stage chunk for run {}: {err}",
-                            run.id
-                        ),
-                        "db",
-                        &job,
-                        started.elapsed().as_millis(),
-                        &self.settings,
-                    );
-                }
-            };
-
-            messages_processed += chunk.len() as u64;
-            threads_created += outcome.apply_stats.threads_rebuilt;
-            threads_updated += outcome.affected_threads;
-            apply_stats.threads_rebuilt += outcome.apply_stats.threads_rebuilt;
-            apply_stats.nodes_written += outcome.apply_stats.nodes_written;
-            apply_stats.dummy_nodes_written += outcome.apply_stats.dummy_nodes_written;
-            apply_stats.messages_written += outcome.apply_stats.messages_written;
-            apply_stats.stale_threads_removed += outcome.apply_stats.stale_threads_removed;
-
-            if messages_processed % checkpoint_interval < chunk.len() as u64 {
+            items_since_checkpoint += chunk_len;
+            if items_since_checkpoint >= checkpoint_interval {
+                items_since_checkpoint = 0;
                 let progress = serde_json::json!({
                     "stage": STAGE_THREADING,
-                    "messages_total": messages_total,
+                    "messages_total": anchors_scanned,
                     "messages_processed": messages_processed,
                     "threads_created": threads_created,
                     "threads_updated": threads_updated,
+                    "anchors_scanned": anchors_scanned,
+                    "anchors_deduped": anchors_deduped,
+                    "source_messages_read": source_messages_read,
+                    "threads_rewritten": apply_stats.threads_rebuilt,
+                    "threads_unchanged_skipped": apply_stats.threads_unchanged_skipped,
+                    "stale_threads_removed": apply_stats.stale_threads_removed,
                 });
                 if let Err(err) = self.pipeline.update_run_progress(run.id, progress).await {
                     warn!(run_id = run.id, error = %err, "progress checkpoint failed");
@@ -676,6 +639,82 @@ impl Phase0JobHandler {
                 );
             }
         }
+
+        if let Err(err) = ctx.heartbeat().await {
+            warn!(job_id = job.id, error = %err, "heartbeat update failed");
+        }
+        match ctx.is_cancel_requested().await {
+            Ok(true) => {
+                return JobExecutionOutcome::Cancelled {
+                    reason: "cancel requested".to_string(),
+                    metrics: JobStoreMetrics {
+                        duration_ms: started.elapsed().as_millis(),
+                        rows_written: apply_stats.threads_rebuilt
+                            + apply_stats.nodes_written
+                            + apply_stats.messages_written,
+                        bytes_read: 0,
+                        commit_count: messages_processed,
+                        parse_errors: 0,
+                    },
+                };
+            }
+            Ok(false) => {}
+            Err(err) => warn!(job_id = job.id, error = %err, "cancel check failed"),
+        }
+
+        let outcome = match self
+            .apply_threading_for_anchors(run.mailing_list_id, &run.list_key, anchors)
+            .await
+        {
+            Ok(value) => value,
+            Err(err) => {
+                return retryable_error(
+                    format!("failed to apply threading stage for run {}: {err}", run.id),
+                    "db",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+        };
+
+        anchors_scanned = outcome.anchors_scanned;
+        messages_processed = anchors_scanned;
+        anchors_deduped = outcome.anchors_deduped;
+        source_messages_read = outcome.source_messages_read;
+        threads_created = outcome.apply_stats.threads_rebuilt;
+        threads_updated = outcome.affected_threads;
+        apply_stats = outcome.apply_stats;
+
+        let final_progress = serde_json::json!({
+            "stage": STAGE_THREADING,
+            "messages_total": anchors_scanned,
+            "messages_processed": messages_processed,
+            "threads_created": threads_created,
+            "threads_updated": threads_updated,
+            "anchors_scanned": anchors_scanned,
+            "anchors_deduped": anchors_deduped,
+            "source_messages_read": source_messages_read,
+            "threads_rewritten": apply_stats.threads_rebuilt,
+            "threads_unchanged_skipped": apply_stats.threads_unchanged_skipped,
+            "stale_threads_removed": apply_stats.stale_threads_removed,
+        });
+        if let Err(err) = self
+            .pipeline
+            .update_run_progress(run.id, final_progress)
+            .await
+        {
+            warn!(run_id = run.id, error = %err, "progress checkpoint failed");
+        }
+        info!(
+            target: "worker_job",
+            run_id = run.id,
+            list_key = %run.list_key,
+            stage = STAGE_THREADING,
+            items_processed = messages_processed,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "pipeline checkpoint"
+        );
 
         if let Err(err) = self
             .enqueue_next_stage(run.id, &run.list_key, STAGE_LINEAGE)
@@ -713,10 +752,16 @@ impl Phase0JobHandler {
                 "run_id": run.id,
                 "list_key": run.list_key,
                 "stage": STAGE_THREADING,
-                "messages_total": messages_total,
+                "messages_total": anchors_scanned,
                 "messages_processed": messages_processed,
                 "threads_created": threads_created,
                 "threads_updated": threads_updated,
+                "anchors_scanned": anchors_scanned,
+                "anchors_deduped": anchors_deduped,
+                "source_messages_read": source_messages_read,
+                "threads_rewritten": apply_stats.threads_rebuilt,
+                "threads_unchanged_skipped": apply_stats.threads_unchanged_skipped,
+                "stale_threads_removed": apply_stats.stale_threads_removed,
                 "next_stage": STAGE_LINEAGE,
             }),
             metrics: JobStoreMetrics {
@@ -1379,17 +1424,24 @@ impl Phase0JobHandler {
         anchors: Vec<i64>,
     ) -> nexus_db::Result<ThreadingWindowOutcome> {
         let mut anchors = anchors;
+        let anchors_scanned = anchors.len() as u64;
         anchors.sort_unstable();
         anchors.dedup();
         anchors.retain(|v| *v > 0);
+        let anchors_deduped = anchors.len() as u64;
 
         if anchors.is_empty() {
-            return Ok(ThreadingWindowOutcome::default());
+            return Ok(ThreadingWindowOutcome {
+                anchors_scanned,
+                anchors_deduped,
+                ..ThreadingWindowOutcome::default()
+            });
         }
 
+        let mut threading_context = ThreadingRunContext::default();
         let mut message_set: BTreeSet<i64> = self
             .threading
-            .expand_ancestor_closure(list_id, &anchors)
+            .expand_ancestor_closure_cached(list_id, &anchors, &mut threading_context)
             .await?
             .into_iter()
             .collect();
@@ -1412,17 +1464,19 @@ impl Phase0JobHandler {
         let message_seed: Vec<i64> = message_set.iter().copied().collect();
         let expanded_message_set = self
             .threading
-            .expand_ancestor_closure(list_id, &message_seed)
+            .expand_ancestor_closure_cached(list_id, &message_seed, &mut threading_context)
             .await?;
 
         let source_messages = self
             .threading
-            .load_source_messages(list_id, &expanded_message_set)
+            .load_source_messages_cached(list_id, &expanded_message_set, &mut threading_context)
             .await?;
         if source_messages.is_empty() {
             return Ok(ThreadingWindowOutcome {
                 affected_threads: impacted_thread_ids.len() as u64,
                 source_messages_read: 0,
+                anchors_scanned,
+                anchors_deduped,
                 impacted_thread_ids,
                 ..ThreadingWindowOutcome::default()
             });
@@ -1490,6 +1544,8 @@ impl Phase0JobHandler {
         Ok(ThreadingWindowOutcome {
             affected_threads: impacted_thread_ids.len() as u64,
             source_messages_read: source_messages.len() as u64,
+            anchors_scanned,
+            anchors_deduped,
             apply_stats,
             impacted_thread_ids,
         })
@@ -1663,6 +1719,7 @@ impl Phase0JobHandler {
             processed_messages += chunk.len() as u64;
             affected_threads += outcome.affected_threads;
             apply_stats.threads_rebuilt += outcome.apply_stats.threads_rebuilt;
+            apply_stats.threads_unchanged_skipped += outcome.apply_stats.threads_unchanged_skipped;
             apply_stats.nodes_written += outcome.apply_stats.nodes_written;
             apply_stats.dummy_nodes_written += outcome.apply_stats.dummy_nodes_written;
             apply_stats.messages_written += outcome.apply_stats.messages_written;
@@ -1694,6 +1751,7 @@ impl Phase0JobHandler {
             processed_messages,
             affected_threads,
             threads_rebuilt = apply_stats.threads_rebuilt,
+            threads_unchanged_skipped = apply_stats.threads_unchanged_skipped,
             nodes_written = apply_stats.nodes_written,
             dummy_nodes_written = apply_stats.dummy_nodes_written,
             messages_written = apply_stats.messages_written,
@@ -1714,6 +1772,7 @@ impl Phase0JobHandler {
                 "processed_messages": processed_messages,
                 "affected_threads": affected_threads,
                 "threads_rebuilt": apply_stats.threads_rebuilt,
+                "threads_unchanged_skipped": apply_stats.threads_unchanged_skipped,
                 "nodes_written": apply_stats.nodes_written,
                 "dummy_nodes_written": apply_stats.dummy_nodes_written,
                 "messages_written": apply_stats.messages_written,
@@ -2749,6 +2808,8 @@ struct SearchFamilyOutcome {
 struct ThreadingWindowOutcome {
     affected_threads: u64,
     source_messages_read: u64,
+    anchors_scanned: u64,
+    anchors_deduped: u64,
     apply_stats: ThreadingApplyStats,
     impacted_thread_ids: Vec<i64>,
 }
@@ -2762,6 +2823,12 @@ struct RawCommitMail {
 struct ParsedCommitRows {
     rows: Vec<IngestCommitRow>,
     parse_errors: u64,
+    non_mail_commits: u64,
+    bytes_read: u64,
+    header_rejections: u64,
+    date_rejections: u64,
+    sanitization_rejections: u64,
+    other_rejections: u64,
 }
 
 struct IndexedParsedRow {
@@ -2769,70 +2836,165 @@ struct IndexedParsedRow {
     row: IngestCommitRow,
 }
 
+struct IndexedCommitOid {
+    index: usize,
+    commit_oid: String,
+}
+
+#[derive(Default)]
+struct ParseChunkOutcome {
+    parsed_rows: Vec<IndexedParsedRow>,
+    parse_errors: u64,
+    non_mail_commits: u64,
+    bytes_read: u64,
+    header_rejections: u64,
+    date_rejections: u64,
+    sanitization_rejections: u64,
+    other_rejections: u64,
+}
+
+#[derive(Copy, Clone)]
+enum ParseSkipKind {
+    MissingHeaders,
+    InvalidDate,
+    Sanitization,
+    Other,
+}
+
 enum ParseCommitResult {
     Parsed(Box<IndexedParsedRow>),
     Skipped {
         commit_oid: String,
         reason: String,
+        kind: ParseSkipKind,
         warn: bool,
     },
 }
 
 async fn parse_commit_rows(
-    raw_commits: Vec<RawCommitMail>,
-    concurrency: usize,
-) -> ParsedCommitRows {
-    if raw_commits.is_empty() {
-        return ParsedCommitRows {
+    repo_path: PathBuf,
+    commit_oids: Vec<String>,
+    worker_count: usize,
+) -> anyhow::Result<ParsedCommitRows> {
+    if commit_oids.is_empty() {
+        return Ok(ParsedCommitRows {
             rows: Vec::new(),
             parse_errors: 0,
-        };
+            non_mail_commits: 0,
+            bytes_read: 0,
+            header_rejections: 0,
+            date_rejections: 0,
+            sanitization_rejections: 0,
+            other_rejections: 0,
+        });
     }
 
+    let partitions = partition_commit_oids(commit_oids, worker_count);
     let mut joinset = JoinSet::new();
-    let mut iter = raw_commits.into_iter();
-    let max_concurrency = concurrency.max(1);
+    for partition in partitions {
+        if partition.is_empty() {
+            continue;
+        }
+        let worker_repo_path = repo_path.clone();
+        joinset.spawn_blocking(move || parse_commit_partition(worker_repo_path, partition));
+    }
 
     let mut parsed_rows = Vec::new();
     let mut parse_errors = 0u64;
+    let mut non_mail_commits = 0u64;
+    let mut bytes_read = 0u64;
+    let mut header_rejections = 0u64;
+    let mut date_rejections = 0u64;
+    let mut sanitization_rejections = 0u64;
+    let mut other_rejections = 0u64;
 
-    loop {
-        while joinset.len() < max_concurrency {
-            let Some(raw_commit) = iter.next() else {
-                break;
-            };
-            joinset.spawn_blocking(move || parse_one_commit(raw_commit));
-        }
-
-        let Some(next) = joinset.join_next().await else {
-            break;
-        };
-
+    while let Some(next) = joinset.join_next().await {
         match next {
-            Ok(ParseCommitResult::Parsed(parsed)) => parsed_rows.push(*parsed),
-            Ok(ParseCommitResult::Skipped {
-                commit_oid,
-                reason,
-                warn,
-            }) => {
-                parse_errors += 1;
-                if warn {
-                    warn!(commit_oid = %commit_oid, error = %reason, "mail parse error");
-                }
+            Ok(Ok(outcome)) => {
+                parsed_rows.extend(outcome.parsed_rows);
+                parse_errors += outcome.parse_errors;
+                non_mail_commits += outcome.non_mail_commits;
+                bytes_read += outcome.bytes_read;
+                header_rejections += outcome.header_rejections;
+                date_rejections += outcome.date_rejections;
+                sanitization_rejections += outcome.sanitization_rejections;
+                other_rejections += outcome.other_rejections;
             }
+            Ok(Err(err)) => return Err(err),
             Err(err) => {
-                parse_errors += 1;
-                warn!(error = %err, "mail parse task failed");
+                return Err(anyhow::anyhow!("mail parse task failed: {err}"));
             }
         }
     }
 
     parsed_rows.sort_by_key(|row| row.index);
 
-    ParsedCommitRows {
+    Ok(ParsedCommitRows {
         rows: parsed_rows.into_iter().map(|row| row.row).collect(),
         parse_errors,
+        non_mail_commits,
+        bytes_read,
+        header_rejections,
+        date_rejections,
+        sanitization_rejections,
+        other_rejections,
+    })
+}
+
+fn parse_commit_partition(
+    repo_path: PathBuf,
+    partition: Vec<IndexedCommitOid>,
+) -> anyhow::Result<ParseChunkOutcome> {
+    let mut gix_repo = gix::open(&repo_path)?;
+    gix_repo.object_cache_size_if_unset(64 * 1024 * 1024);
+
+    let mut outcome = ParseChunkOutcome::default();
+
+    for commit in partition {
+        let raw_mail = match read_mail_blob(&gix_repo, &commit.commit_oid) {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                outcome.non_mail_commits += 1;
+                continue;
+            }
+            Err(err) => {
+                return Err(anyhow::anyhow!(
+                    "failed to read commit blob {}: {err}",
+                    commit.commit_oid
+                ));
+            }
+        };
+
+        outcome.bytes_read += raw_mail.len() as u64;
+        let raw_commit = RawCommitMail {
+            index: commit.index,
+            commit_oid: commit.commit_oid,
+            raw_rfc822: raw_mail,
+        };
+
+        match parse_one_commit(raw_commit) {
+            ParseCommitResult::Parsed(parsed) => outcome.parsed_rows.push(*parsed),
+            ParseCommitResult::Skipped {
+                commit_oid,
+                reason,
+                kind,
+                warn,
+            } => {
+                outcome.parse_errors += 1;
+                match kind {
+                    ParseSkipKind::MissingHeaders => outcome.header_rejections += 1,
+                    ParseSkipKind::InvalidDate => outcome.date_rejections += 1,
+                    ParseSkipKind::Sanitization => outcome.sanitization_rejections += 1,
+                    ParseSkipKind::Other => outcome.other_rejections += 1,
+                }
+                if warn {
+                    warn!(commit_oid = %commit_oid, error = %reason, "mail parse error");
+                }
+            }
+        }
     }
+
+    Ok(outcome)
 }
 
 fn parse_one_commit(raw_commit: RawCommitMail) -> ParseCommitResult {
@@ -2842,6 +3004,19 @@ fn parse_one_commit(raw_commit: RawCommitMail) -> ParseCommitResult {
             return ParseCommitResult::Skipped {
                 commit_oid: raw_commit.commit_oid,
                 reason: "missing required message headers".to_string(),
+                kind: ParseSkipKind::MissingHeaders,
+                warn: false,
+            };
+        }
+        Err(
+            ParseEmailError::MissingDate { .. }
+            | ParseEmailError::InvalidDate { .. }
+            | ParseEmailError::FutureDate { .. },
+        ) => {
+            return ParseCommitResult::Skipped {
+                commit_oid: raw_commit.commit_oid,
+                reason: "invalid_or_missing_date".to_string(),
+                kind: ParseSkipKind::InvalidDate,
                 warn: false,
             };
         }
@@ -2849,6 +3024,7 @@ fn parse_one_commit(raw_commit: RawCommitMail) -> ParseCommitResult {
             return ParseCommitResult::Skipped {
                 commit_oid: raw_commit.commit_oid,
                 reason: format!("sanitization_invariant_violation:{field}"),
+                kind: ParseSkipKind::Sanitization,
                 warn: true,
             };
         }
@@ -2856,6 +3032,7 @@ fn parse_one_commit(raw_commit: RawCommitMail) -> ParseCommitResult {
             return ParseCommitResult::Skipped {
                 commit_oid: raw_commit.commit_oid,
                 reason: err.to_string(),
+                kind: ParseSkipKind::Other,
                 warn: true,
             };
         }
@@ -2959,42 +3136,29 @@ fn hash_i64_list(values: &[i64]) -> String {
     out
 }
 
-fn effective_parse_worker_count(
-    ratio: f64,
-    min_workers: usize,
-    max_workers: usize,
-    chunk_size: usize,
-) -> usize {
-    let available_cpus = std::thread::available_parallelism()
-        .map(|value| value.get())
-        .unwrap_or(1);
-    effective_parse_worker_count_with_cpus(
-        available_cpus,
-        ratio,
-        min_workers,
-        max_workers,
-        chunk_size,
-    )
+fn configured_parse_worker_count(chunk_size: usize, settings: &Settings) -> usize {
+    settings
+        .worker
+        .ingest_parse_concurrency
+        .max(1)
+        .min(chunk_size.max(1))
 }
 
-fn effective_parse_worker_count_with_cpus(
-    available_cpus: usize,
-    ratio: f64,
-    min_workers: usize,
-    max_workers: usize,
-    chunk_size: usize,
-) -> usize {
-    let mut min_workers = min_workers.max(1);
-    let max_workers = max_workers.max(1);
-    if min_workers > max_workers {
-        min_workers = max_workers;
+fn partition_commit_oids(
+    commit_oids: Vec<String>,
+    worker_count: usize,
+) -> Vec<Vec<IndexedCommitOid>> {
+    let lane_count = worker_count.max(1).min(commit_oids.len().max(1));
+    let mut lanes: Vec<Vec<IndexedCommitOid>> = (0..lane_count).map(|_| Vec::new()).collect();
+
+    for (idx, commit_oid) in commit_oids.into_iter().enumerate() {
+        lanes[idx % lane_count].push(IndexedCommitOid {
+            index: idx,
+            commit_oid,
+        });
     }
 
-    let target = ((available_cpus.max(1) as f64) * ratio).ceil() as usize;
-    target
-        .max(1)
-        .clamp(min_workers, max_workers)
-        .min(chunk_size.max(1))
+    lanes
 }
 
 fn discover_repo_relpaths(list_root: &Path) -> Result<Vec<String>, std::io::Error> {
@@ -3002,12 +3166,7 @@ fn discover_repo_relpaths(list_root: &Path) -> Result<Vec<String>, std::io::Erro
         return Ok(Vec::new());
     }
 
-    let mut repos = BTreeSet::new();
-    let all_git = list_root.join("all.git");
-    if all_git.is_dir() {
-        repos.insert("all.git".to_string());
-    }
-
+    let mut epoch_repos = BTreeSet::new();
     let git_dir = list_root.join("git");
     if git_dir.is_dir() {
         for entry in fs::read_dir(&git_dir)? {
@@ -3024,16 +3183,60 @@ fn discover_repo_relpaths(list_root: &Path) -> Result<Vec<String>, std::io::Erro
                     .file_name()
                     .and_then(|value| value.to_str())
                     .unwrap_or("");
-                repos.insert(format!("git/{repo_name}"));
+                epoch_repos.insert(format!("git/{repo_name}"));
             }
         }
     }
 
-    if repos.is_empty() && looks_like_bare_repo(list_root) {
-        repos.insert(".".to_string());
+    if !epoch_repos.is_empty() {
+        return Ok(epoch_repos.into_iter().collect());
     }
 
-    Ok(repos.into_iter().collect())
+    let all_git = list_root.join("all.git");
+    if all_git.is_dir() {
+        return Ok(vec!["all.git".to_string()]);
+    }
+
+    if looks_like_bare_repo(list_root) {
+        return Ok(vec![".".to_string()]);
+    }
+
+    Ok(Vec::new())
+}
+
+fn order_repos_for_ingest(mut repos: Vec<MailingListRepo>) -> Vec<MailingListRepo> {
+    let has_epoch_repos = repos
+        .iter()
+        .any(|repo| parse_epoch_repo_relpath(&repo.repo_relpath).is_some());
+    if has_epoch_repos {
+        repos.retain(|repo| parse_epoch_repo_relpath(&repo.repo_relpath).is_some());
+    }
+
+    repos.sort_by(|left, right| compare_repo_relpaths(&left.repo_relpath, &right.repo_relpath));
+    repos
+}
+
+fn compare_repo_relpaths(left: &str, right: &str) -> std::cmp::Ordering {
+    match (
+        parse_epoch_repo_relpath(left),
+        parse_epoch_repo_relpath(right),
+    ) {
+        (Some(l), Some(r)) => l.cmp(&r),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => left.cmp(right),
+    }
+}
+
+fn parse_epoch_repo_relpath(relpath: &str) -> Option<i64> {
+    let trimmed = relpath.trim();
+    let epoch_text = trimmed.strip_prefix("git/")?.strip_suffix(".git")?.trim();
+
+    if epoch_text.is_empty() || !epoch_text.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+
+    epoch_text.parse::<i64>().ok()
 }
 
 fn looks_like_bare_repo(path: &Path) -> bool {
@@ -3072,26 +3275,33 @@ fn read_mail_blob(repo: &gix::Repository, commit_oid: &str) -> anyhow::Result<Op
 
 #[cfg(test)]
 mod tests {
-    use super::effective_parse_worker_count_with_cpus;
+    use super::{parse_epoch_repo_relpath, partition_commit_oids};
 
     #[test]
-    fn cpu_ratio_worker_count_matches_expected_rounding() {
-        let workers = effective_parse_worker_count_with_cpus(16, 0.6, 2, 32, 10_000);
-        assert_eq!(workers, 10);
+    fn parse_epoch_repo_relpath_extracts_epoch() {
+        assert_eq!(parse_epoch_repo_relpath("git/0.git"), Some(0));
+        assert_eq!(parse_epoch_repo_relpath("git/12.git"), Some(12));
+        assert_eq!(parse_epoch_repo_relpath("all.git"), None);
+        assert_eq!(parse_epoch_repo_relpath("git/not-a-number.git"), None);
     }
 
     #[test]
-    fn cpu_ratio_worker_count_honors_chunk_size_cap() {
-        let workers = effective_parse_worker_count_with_cpus(16, 0.6, 2, 32, 3);
-        assert_eq!(workers, 3);
-    }
-
-    #[test]
-    fn cpu_ratio_worker_count_honors_min_max_bounds() {
-        let workers = effective_parse_worker_count_with_cpus(2, 0.1, 4, 8, 10_000);
-        assert_eq!(workers, 4);
-
-        let workers = effective_parse_worker_count_with_cpus(128, 0.9, 2, 32, 10_000);
-        assert_eq!(workers, 32);
+    fn partition_commit_oids_distributes_evenly() {
+        let commits = vec![
+            "c1".to_string(),
+            "c2".to_string(),
+            "c3".to_string(),
+            "c4".to_string(),
+            "c5".to_string(),
+            "c6".to_string(),
+            "c7".to_string(),
+            "c8".to_string(),
+        ];
+        let lanes = partition_commit_oids(commits, 4);
+        assert_eq!(lanes.len(), 4);
+        assert_eq!(
+            lanes.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![2, 2, 2, 2]
+        );
     }
 }

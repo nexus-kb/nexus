@@ -29,19 +29,19 @@ pub use crate::jobs::{
 pub use crate::lineage::{
     AssembledItemRecord, LineageSourceMessage, LineageStore, ListThreadsParams, MessageBodyRecord,
     MessageDetailRecord, PatchItemDetailRecord, PatchItemDiffRecord, PatchItemFileAggregateRecord,
-    PatchItemFileDiffSliceSource, PatchItemFileRecord, PatchItemRecord, PatchLogicalRecord,
-    PatchSeriesRecord, PatchSeriesVersionRecord, SeriesExportMessageRecord, SeriesListItemRecord,
-    SeriesLogicalCompareRow, SeriesVersionPatchItemRecord, SeriesVersionPatchRef,
-    SeriesVersionSummaryRecord, ThreadListItemRecord, ThreadMessageRecord, ThreadParticipantRecord,
-    ThreadRefRecord, ThreadSummaryRecord, UpsertPatchItemFileInput, UpsertPatchItemInput,
-    UpsertPatchSeriesInput, UpsertPatchSeriesVersionInput,
+    PatchItemFileBatchInput, PatchItemFileDiffSliceSource, PatchItemFileRecord, PatchItemRecord,
+    PatchLogicalRecord, PatchSeriesRecord, PatchSeriesVersionRecord, SeriesExportMessageRecord,
+    SeriesListItemRecord, SeriesLogicalCompareRow, SeriesVersionPatchItemRecord,
+    SeriesVersionPatchRef, SeriesVersionSummaryRecord, ThreadListItemRecord, ThreadMessageRecord,
+    ThreadParticipantRecord, ThreadRefRecord, ThreadSummaryRecord, UpsertPatchItemFileInput,
+    UpsertPatchItemInput, UpsertPatchSeriesInput, UpsertPatchSeriesVersionInput,
 };
 pub use crate::models::{EmbeddingBackfillRun, Job, JobState, PipelineRun};
 pub use crate::pipeline::{ListPipelineRunsParams, PipelineStore};
 pub use crate::search::SearchStore;
 pub use crate::threading::{
     ThreadComponentWrite, ThreadMessageWrite, ThreadNodeWrite, ThreadSourceMessage,
-    ThreadSummaryWrite, ThreadingApplyStats, ThreadingStore,
+    ThreadSummaryWrite, ThreadingApplyStats, ThreadingRunContext, ThreadingStore,
 };
 
 pub type Result<T> = std::result::Result<T, sqlx::Error>;

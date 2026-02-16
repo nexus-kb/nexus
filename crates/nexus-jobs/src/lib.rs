@@ -1,3 +1,4 @@
+mod b4_compat;
 mod diff_metadata;
 mod engine;
 mod lineage;

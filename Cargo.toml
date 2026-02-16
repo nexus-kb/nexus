@@ -28,6 +28,7 @@ clap = { version = "4", features = ["derive"] }
 gix = "0.63"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "json"] }
 sha2 = "0.10"
+sha1 = "0.10"
 regex = "1"
 mailparse = "0.15"
 anyhow = "1"

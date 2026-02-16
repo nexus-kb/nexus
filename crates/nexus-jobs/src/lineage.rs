@@ -11,8 +11,9 @@ use crate::patch_detect::extract_diff_text;
 use crate::patch_id::PatchIdMemo;
 use crate::patch_subject::parse_patch_subject;
 use nexus_db::{
-    AssembledItemRecord, LineageSourceMessage, LineageStore, UpsertPatchItemFileInput,
-    UpsertPatchItemInput, UpsertPatchSeriesInput, UpsertPatchSeriesVersionInput,
+    AssembledItemRecord, LineageSourceMessage, LineageStore, PatchItemFileBatchInput,
+    UpsertPatchItemFileInput, UpsertPatchItemInput, UpsertPatchSeriesInput,
+    UpsertPatchSeriesVersionInput,
 };
 
 static CHANGE_ID_RE: Lazy<Regex> =
@@ -175,41 +176,44 @@ pub async fn process_patch_extract_window(
             .await
             .context("upsert patch_series_versions")?;
 
-        let mut written_items = Vec::new();
-        let mut written_patch_count = 0u64;
-        for item in &candidate.items {
-            let record = store
-                .upsert_patch_item(
-                    version.id,
-                    &UpsertPatchItemInput {
-                        ordinal: item.ordinal.unwrap_or(0),
-                        total: item.total,
-                        message_pk: item.message_pk,
-                        subject_raw: item.subject_raw.clone(),
-                        subject_norm: item.subject_norm.clone(),
-                        commit_subject: item.commit_subject.clone(),
-                        commit_subject_norm: item.commit_subject_norm.clone(),
-                        commit_author_name: item.commit_author_name.clone(),
-                        commit_author_email: item.commit_author_email.clone(),
-                        item_type: item.item_type.clone(),
-                        has_diff: item.has_diff,
-                        patch_id_stable: item.patch_id_stable.clone(),
-                        file_count: 0,
-                        additions: 0,
-                        deletions: 0,
-                        hunk_count: 0,
-                    },
-                )
-                .await
-                .context("upsert patch_items")?;
+        let upsert_inputs = candidate
+            .items
+            .iter()
+            .map(|item| UpsertPatchItemInput {
+                ordinal: item.ordinal.unwrap_or(0),
+                total: item.total,
+                message_pk: item.message_pk,
+                subject_raw: item.subject_raw.clone(),
+                subject_norm: item.subject_norm.clone(),
+                commit_subject: item.commit_subject.clone(),
+                commit_subject_norm: item.commit_subject_norm.clone(),
+                commit_author_name: item.commit_author_name.clone(),
+                commit_author_email: item.commit_author_email.clone(),
+                item_type: item.item_type.clone(),
+                has_diff: item.has_diff,
+                patch_id_stable: item.patch_id_stable.clone(),
+                file_count: 0,
+                additions: 0,
+                deletions: 0,
+                hunk_count: 0,
+            })
+            .collect::<Vec<_>>();
+        let mut written_items = store
+            .upsert_patch_items_batch(version.id, &upsert_inputs)
+            .await
+            .context("upsert patch_items batch")?;
+        written_items.sort_by_key(|item| (item.ordinal, item.id));
 
-            if record.item_type == "patch" {
-                output.patch_item_ids.push(record.id);
-                written_patch_count += 1;
-            }
-
-            written_items.push(record);
-        }
+        let written_patch_count = written_items
+            .iter()
+            .filter(|record| record.item_type == "patch")
+            .count() as u64;
+        output.patch_item_ids.extend(
+            written_items
+                .iter()
+                .filter(|record| record.item_type == "patch")
+                .map(|record| record.id),
+        );
 
         apply_assembled_view(
             store,
@@ -261,19 +265,18 @@ pub async fn process_patch_id_compute_batch(
         .context("load patch item diffs")?;
 
     let mut memo = PatchIdMemo::default();
-    let mut updated = 0u64;
+    let mut updates = Vec::with_capacity(diffs.len());
     for row in diffs {
         let patch_id = row.diff_text.as_deref().and_then(|diff| memo.compute(diff));
-
-        store
-            .set_patch_item_patch_id(row.patch_item_id, patch_id.as_deref())
-            .await
-            .with_context(|| format!("update patch item {} patch-id", row.patch_item_id))?;
-        updated += 1;
+        updates.push((row.patch_item_id, patch_id));
     }
+    store
+        .set_patch_item_patch_ids_batch(&updates)
+        .await
+        .context("batch update patch item patch-id values")?;
 
     Ok(PatchIdComputeOutcome {
-        patch_items_updated: updated,
+        patch_items_updated: updates.len() as u64,
     })
 }
 
@@ -295,7 +298,7 @@ pub async fn process_diff_parse_patch_items(
         .await
         .context("load patch item diffs for metadata parse")?;
 
-    let mut updated = 0u64;
+    let mut updates = Vec::with_capacity(diffs.len());
     let mut files_written = 0u64;
 
     for row in diffs {
@@ -328,28 +331,25 @@ pub async fn process_diff_parse_patch_items(
             });
         }
 
-        store
-            .replace_patch_item_files(row.patch_item_id, &file_rows)
-            .await
-            .with_context(|| format!("replace patch_item_files for {}", row.patch_item_id))?;
-
-        store
-            .update_patch_item_diff_stats(
-                row.patch_item_id,
-                file_rows.len() as i32,
-                additions,
-                deletions,
-                hunk_count,
-            )
-            .await
-            .with_context(|| format!("update patch stats for {}", row.patch_item_id))?;
-
-        updated += 1;
-        files_written += file_rows.len() as u64;
+        let file_count = file_rows.len() as i32;
+        updates.push(PatchItemFileBatchInput {
+            patch_item_id: row.patch_item_id,
+            file_count,
+            additions,
+            deletions,
+            hunk_count,
+            files: file_rows,
+        });
+        files_written += file_count as u64;
     }
 
+    store
+        .replace_patch_item_files_batch(&updates)
+        .await
+        .context("replace patch item files and stats in batch")?;
+
     Ok(DiffParseOutcome {
-        patch_items_updated: updated,
+        patch_items_updated: updates.len() as u64,
         patch_item_files_written: files_written,
     })
 }
@@ -368,9 +368,14 @@ fn build_candidates(
         let mut by_subject_and_version: BTreeMap<(String, i32, bool), CandidateVersion> =
             BTreeMap::new();
         let mut cover_subject_by_version: HashMap<(i32, bool), String> = HashMap::new();
+        let mut explicit_revision_by_message_id: HashMap<String, i32> = HashMap::new();
 
         for message in &thread_messages {
             let parsed = parse_patch_subject(&message.subject_raw);
+            if parsed.has_patch_tag && !parsed.revision_inferred {
+                explicit_revision_by_message_id
+                    .insert(message.message_id_primary.clone(), parsed.version_num);
+            }
             if parsed.has_patch_tag
                 && !parsed.had_reply_prefix
                 && parsed.ordinal == Some(0)
@@ -384,6 +389,17 @@ fn build_candidates(
 
         for (thread_order, message) in thread_messages.into_iter().enumerate() {
             let parsed = parse_patch_subject(&message.subject_raw);
+            let effective_version_num = if parsed.revision_inferred {
+                message
+                    .in_reply_to_ids
+                    .iter()
+                    .chain(message.references_ids.iter())
+                    .find_map(|message_id| explicit_revision_by_message_id.get(message_id))
+                    .copied()
+                    .unwrap_or(parsed.version_num)
+            } else {
+                parsed.version_num
+            };
             let extracted_diff = message
                 .diff_text
                 .as_deref()
@@ -412,19 +428,19 @@ fn build_candidates(
             }
 
             let mut canonical_subject_norm = cover_subject_by_version
-                .get(&(parsed.version_num, parsed.is_rfc))
+                .get(&(effective_version_num, parsed.is_rfc))
                 .cloned()
                 .unwrap_or_else(|| parsed.subject_norm_base.clone());
 
             let is_synthetic_group = !cover_subject_by_version
-                .contains_key(&(parsed.version_num, parsed.is_rfc))
+                .contains_key(&(effective_version_num, parsed.is_rfc))
                 && parsed.total.unwrap_or(0) > 1;
 
             let group_key_subject = if is_synthetic_group {
                 format!(
                     "__thread:{}:v{}:r{}:t{}",
                     thread_id,
-                    parsed.version_num,
+                    effective_version_num,
                     parsed.is_rfc,
                     parsed.total.unwrap_or(0)
                 )
@@ -432,7 +448,7 @@ fn build_candidates(
                 canonical_subject_norm.clone()
             };
 
-            let key = (group_key_subject, parsed.version_num, parsed.is_rfc);
+            let key = (group_key_subject, effective_version_num, parsed.is_rfc);
 
             let entry = by_subject_and_version
                 .entry(key)
@@ -441,7 +457,7 @@ fn build_candidates(
                     canonical_subject_norm: canonical_subject_norm.clone(),
                     author_email: message.from_email.clone(),
                     author_name: message.from_name.clone(),
-                    version_num: parsed.version_num,
+                    version_num: effective_version_num,
                     is_rfc: parsed.is_rfc,
                     is_resend: parsed.is_resend,
                     sent_at: message.date_utc.unwrap_or_else(epoch_utc),
@@ -649,11 +665,25 @@ async fn resolve_series_id(
     let candidates = store
         .find_similarity_candidates(&candidate.canonical_subject_norm, from_ts, to_ts)
         .await?;
+    let similarity_series_ids = candidates.iter().map(|row| row.id).collect::<Vec<_>>();
+    let latest_patch_id_rows = store
+        .list_latest_patch_ids_for_series_bulk(&similarity_series_ids)
+        .await?;
+    let mut latest_patch_ids_by_series: HashMap<i64, HashSet<String>> = HashMap::new();
+    for (series_id, patch_id) in latest_patch_id_rows {
+        latest_patch_ids_by_series
+            .entry(series_id)
+            .or_default()
+            .insert(patch_id);
+    }
 
     let mut best: Option<SimilarityChoice> = None;
+    let empty_ids = HashSet::new();
     for row in &candidates {
-        let latest_ids = store.list_latest_patch_ids_for_series(row.id).await?;
-        let score = jaccard_similarity(&patch_ids, &latest_ids.into_iter().collect());
+        let latest_ids = latest_patch_ids_by_series
+            .get(&row.id)
+            .unwrap_or(&empty_ids);
+        let score = jaccard_similarity(&patch_ids, latest_ids);
 
         let author_matches = row.author_email == candidate.author_email;
         let allowed = if author_matches {

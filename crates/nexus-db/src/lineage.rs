@@ -1,10 +1,59 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sqlx::{PgPool, QueryBuilder};
 
 use crate::Result;
+
+const MAX_QUERY_BIND_PARAMS: usize = 60_000;
+const PATCH_ITEM_FILE_INSERT_BINDS_PER_ROW: usize = 10;
+const PATCH_ITEM_FILE_STATS_BINDS_PER_ROW: usize = 5;
+const LOAD_MESSAGES_THREAD_CHUNK_SIZE: usize = 512;
+
+fn merge_patch_item_file_row(
+    existing: &mut UpsertPatchItemFileInput,
+    incoming: &UpsertPatchItemFileInput,
+) {
+    if existing.old_path.is_none() {
+        existing.old_path = incoming.old_path.clone();
+    }
+    existing.change_type = merged_change_type(&existing.change_type, &incoming.change_type);
+    existing.is_binary |= incoming.is_binary;
+    existing.additions = existing.additions.saturating_add(incoming.additions);
+    existing.deletions = existing.deletions.saturating_add(incoming.deletions);
+    existing.hunk_count = existing.hunk_count.saturating_add(incoming.hunk_count);
+    existing.diff_start = existing.diff_start.min(incoming.diff_start);
+    existing.diff_end = existing.diff_end.max(incoming.diff_end);
+}
+
+fn merged_change_type(existing: &str, incoming: &str) -> String {
+    if existing == incoming {
+        return existing.to_string();
+    }
+    if existing == "M" {
+        return incoming.to_string();
+    }
+    if incoming == "M" {
+        return existing.to_string();
+    }
+    if existing == "B" || incoming == "B" {
+        return "B".to_string();
+    }
+    if existing == "R" || incoming == "R" {
+        return "R".to_string();
+    }
+    if existing == "C" || incoming == "C" {
+        return "C".to_string();
+    }
+    if existing == "A" || incoming == "A" {
+        return "A".to_string();
+    }
+    if existing == "D" || incoming == "D" {
+        return "D".to_string();
+    }
+    incoming.to_string()
+}
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct LineageSourceMessage {
@@ -110,6 +159,16 @@ pub struct UpsertPatchItemFileInput {
     pub hunk_count: i32,
     pub diff_start: i32,
     pub diff_end: i32,
+}
+
+#[derive(Debug, Clone)]
+pub struct PatchItemFileBatchInput {
+    pub patch_item_id: i64,
+    pub file_count: i32,
+    pub additions: i32,
+    pub deletions: i32,
+    pub hunk_count: i32,
+    pub files: Vec<UpsertPatchItemFileInput>,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -390,41 +449,64 @@ impl LineageStore {
             return Ok(Vec::new());
         }
 
-        sqlx::query_as::<_, LineageSourceMessage>(
-            r#"WITH anchor_threads AS (
-                SELECT DISTINCT tm.thread_id
-                FROM thread_messages tm
-                WHERE tm.mailing_list_id = $1
-                  AND tm.message_pk = ANY($2)
-            )
-            SELECT
-                tm.thread_id,
-                tm.message_pk,
-                tm.sort_key,
-                m.message_id_primary,
-                m.subject_raw,
-                m.subject_norm,
-                m.from_name,
-                m.from_email,
-                m.date_utc,
-                m.references_ids,
-                m.in_reply_to_ids,
-                mb.body_text,
-                mb.diff_text
+        let mut tx = self.pool.begin().await?;
+        // Avoid container /dev/shm pressure from parallel workers for large lineage windows.
+        sqlx::query("SET LOCAL max_parallel_workers_per_gather = 0")
+            .execute(&mut *tx)
+            .await?;
+
+        let thread_ids = sqlx::query_scalar::<_, i64>(
+            r#"SELECT DISTINCT tm.thread_id
             FROM thread_messages tm
-            JOIN anchor_threads at
-              ON at.thread_id = tm.thread_id
-            JOIN messages m
-              ON m.id = tm.message_pk
-            JOIN message_bodies mb
-              ON mb.id = m.body_id
             WHERE tm.mailing_list_id = $1
-            ORDER BY tm.thread_id ASC, tm.sort_key ASC"#,
+              AND tm.message_pk = ANY($2)
+            ORDER BY tm.thread_id ASC"#,
         )
         .bind(mailing_list_id)
         .bind(anchor_message_pks)
-        .fetch_all(&self.pool)
-        .await
+        .fetch_all(&mut *tx)
+        .await?;
+
+        if thread_ids.is_empty() {
+            tx.commit().await?;
+            return Ok(Vec::new());
+        }
+
+        let mut out = Vec::new();
+        for thread_chunk in thread_ids.chunks(LOAD_MESSAGES_THREAD_CHUNK_SIZE) {
+            let mut rows = sqlx::query_as::<_, LineageSourceMessage>(
+                r#"SELECT
+                    tm.thread_id,
+                    tm.message_pk,
+                    tm.sort_key,
+                    m.message_id_primary,
+                    m.subject_raw,
+                    m.subject_norm,
+                    m.from_name,
+                    m.from_email,
+                    m.date_utc,
+                    m.references_ids,
+                    m.in_reply_to_ids,
+                    mb.body_text,
+                    mb.diff_text
+                FROM thread_messages tm
+                JOIN messages m
+                  ON m.id = tm.message_pk
+                JOIN message_bodies mb
+                  ON mb.id = m.body_id
+                WHERE tm.mailing_list_id = $1
+                  AND tm.thread_id = ANY($2)
+                ORDER BY tm.thread_id ASC, tm.sort_key ASC"#,
+            )
+            .bind(mailing_list_id)
+            .bind(thread_chunk)
+            .fetch_all(&mut *tx)
+            .await?;
+            out.append(&mut rows);
+        }
+
+        tx.commit().await?;
+        Ok(out)
     }
 
     pub async fn resolve_message_ids(
@@ -572,6 +654,42 @@ impl LineageStore {
             ORDER BY pi.patch_id_stable ASC"#,
         )
         .bind(series_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn list_latest_patch_ids_for_series_bulk(
+        &self,
+        series_ids: &[i64],
+    ) -> Result<Vec<(i64, String)>> {
+        if series_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        sqlx::query_as::<_, (i64, String)>(
+            r#"WITH ranked AS (
+                SELECT
+                    id,
+                    patch_series_id,
+                    row_number() OVER (
+                        PARTITION BY patch_series_id
+                        ORDER BY version_num DESC, sent_at DESC, id DESC
+                    ) AS rn
+                FROM patch_series_versions
+                WHERE patch_series_id = ANY($1)
+            )
+            SELECT
+                ranked.patch_series_id,
+                pi.patch_id_stable
+            FROM ranked
+            JOIN patch_items pi
+              ON pi.patch_series_version_id = ranked.id
+            WHERE ranked.rn = 1
+              AND pi.item_type = 'patch'
+              AND pi.patch_id_stable IS NOT NULL
+            ORDER BY ranked.patch_series_id ASC, pi.patch_id_stable ASC"#,
+        )
+        .bind(series_ids)
         .fetch_all(&self.pool)
         .await
     }
@@ -873,6 +991,147 @@ impl LineageStore {
         .await
     }
 
+    pub async fn upsert_patch_items_batch(
+        &self,
+        patch_series_version_id: i64,
+        inputs: &[UpsertPatchItemInput],
+    ) -> Result<Vec<PatchItemRecord>> {
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut qb: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
+            "INSERT INTO patch_items \
+            (patch_series_version_id, ordinal, total, message_pk, \
+             subject_raw, subject_norm, commit_subject, commit_subject_norm, \
+             commit_author_name, commit_author_email, item_type, \
+             has_diff, patch_id_stable, file_count, additions, deletions, hunk_count) ",
+        );
+        qb.push_values(inputs.iter(), |mut b, input| {
+            b.push_bind(patch_series_version_id)
+                .push_bind(input.ordinal)
+                .push_bind(input.total)
+                .push_bind(input.message_pk)
+                .push_bind(&input.subject_raw)
+                .push_bind(&input.subject_norm)
+                .push_bind(&input.commit_subject)
+                .push_bind(&input.commit_subject_norm)
+                .push_bind(&input.commit_author_name)
+                .push_bind(&input.commit_author_email)
+                .push_bind(&input.item_type)
+                .push_bind(input.has_diff)
+                .push_bind(&input.patch_id_stable)
+                .push_bind(input.file_count)
+                .push_bind(input.additions)
+                .push_bind(input.deletions)
+                .push_bind(input.hunk_count);
+        });
+        qb.push(
+            r#" ON CONFLICT (patch_series_version_id, ordinal)
+            DO UPDATE SET total = COALESCE(EXCLUDED.total, patch_items.total),
+                          message_pk = CASE
+                              WHEN patch_items.item_type = 'patch'
+                               AND (EXCLUDED.item_type <> 'patch' OR EXCLUDED.has_diff = false)
+                              THEN patch_items.message_pk
+                              ELSE EXCLUDED.message_pk
+                          END,
+                          subject_raw = CASE
+                              WHEN patch_items.item_type = 'patch'
+                               AND (EXCLUDED.item_type <> 'patch' OR EXCLUDED.has_diff = false)
+                              THEN patch_items.subject_raw
+                              ELSE EXCLUDED.subject_raw
+                          END,
+                          subject_norm = CASE
+                              WHEN patch_items.item_type = 'patch'
+                               AND (EXCLUDED.item_type <> 'patch' OR EXCLUDED.has_diff = false)
+                              THEN patch_items.subject_norm
+                              ELSE EXCLUDED.subject_norm
+                          END,
+                          commit_subject = CASE
+                              WHEN patch_items.item_type = 'patch'
+                               AND (EXCLUDED.item_type <> 'patch' OR EXCLUDED.has_diff = false)
+                              THEN patch_items.commit_subject
+                              ELSE EXCLUDED.commit_subject
+                          END,
+                          commit_subject_norm = CASE
+                              WHEN patch_items.item_type = 'patch'
+                               AND (EXCLUDED.item_type <> 'patch' OR EXCLUDED.has_diff = false)
+                              THEN patch_items.commit_subject_norm
+                              ELSE EXCLUDED.commit_subject_norm
+                          END,
+                          commit_author_name = CASE
+                              WHEN patch_items.item_type = 'patch'
+                               AND (EXCLUDED.item_type <> 'patch' OR EXCLUDED.has_diff = false)
+                              THEN patch_items.commit_author_name
+                              ELSE EXCLUDED.commit_author_name
+                          END,
+                          commit_author_email = CASE
+                              WHEN patch_items.item_type = 'patch'
+                               AND (EXCLUDED.item_type <> 'patch' OR EXCLUDED.has_diff = false)
+                              THEN patch_items.commit_author_email
+                              ELSE EXCLUDED.commit_author_email
+                          END,
+                          item_type = CASE
+                              WHEN patch_items.item_type = 'patch'
+                               AND (EXCLUDED.item_type <> 'patch' OR EXCLUDED.has_diff = false)
+                              THEN patch_items.item_type
+                              ELSE EXCLUDED.item_type
+                          END,
+                          has_diff = CASE
+                              WHEN patch_items.item_type = 'patch'
+                               AND (EXCLUDED.item_type <> 'patch' OR EXCLUDED.has_diff = false)
+                              THEN patch_items.has_diff
+                              ELSE EXCLUDED.has_diff
+                          END,
+                          patch_id_stable = CASE
+                              WHEN patch_items.item_type = 'patch'
+                               AND (EXCLUDED.item_type <> 'patch' OR EXCLUDED.has_diff = false)
+                              THEN patch_items.patch_id_stable
+                              ELSE COALESCE(EXCLUDED.patch_id_stable, patch_items.patch_id_stable)
+                          END,
+                          file_count = CASE
+                              WHEN patch_items.item_type = 'patch'
+                               AND (EXCLUDED.item_type <> 'patch' OR EXCLUDED.has_diff = false)
+                              THEN patch_items.file_count
+                              ELSE EXCLUDED.file_count
+                          END,
+                          additions = CASE
+                              WHEN patch_items.item_type = 'patch'
+                               AND (EXCLUDED.item_type <> 'patch' OR EXCLUDED.has_diff = false)
+                              THEN patch_items.additions
+                              ELSE EXCLUDED.additions
+                          END,
+                          deletions = CASE
+                              WHEN patch_items.item_type = 'patch'
+                               AND (EXCLUDED.item_type <> 'patch' OR EXCLUDED.has_diff = false)
+                              THEN patch_items.deletions
+                              ELSE EXCLUDED.deletions
+                          END,
+                          hunk_count = CASE
+                              WHEN patch_items.item_type = 'patch'
+                               AND (EXCLUDED.item_type <> 'patch' OR EXCLUDED.has_diff = false)
+                              THEN patch_items.hunk_count
+                              ELSE EXCLUDED.hunk_count
+                          END
+            RETURNING id,
+                      patch_series_version_id,
+                      ordinal,
+                      total,
+                      message_pk,
+                      subject_raw,
+                      subject_norm,
+                      commit_subject,
+                      commit_subject_norm,
+                      item_type,
+                      has_diff,
+                      patch_id_stable"#,
+        );
+
+        qb.build_query_as::<PatchItemRecord>()
+            .fetch_all(&self.pool)
+            .await
+    }
+
     pub async fn replace_patch_item_files(
         &self,
         patch_item_id: i64,
@@ -903,6 +1162,124 @@ impl LineageStore {
                     .push_bind(file.diff_end);
             });
             qb.build().execute(&mut *tx).await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn replace_patch_item_files_batch(
+        &self,
+        batches: &[PatchItemFileBatchInput],
+    ) -> Result<()> {
+        if batches.is_empty() {
+            return Ok(());
+        }
+
+        let mut tx = self.pool.begin().await?;
+        let mut deduped_file_rows: Vec<(i64, UpsertPatchItemFileInput)> = Vec::new();
+        let mut row_idx_by_key: BTreeMap<(i64, String), usize> = BTreeMap::new();
+        let mut stats_by_patch_item: BTreeMap<i64, (i32, i32, i32, i32)> = BTreeMap::new();
+
+        for batch in batches {
+            stats_by_patch_item
+                .entry(batch.patch_item_id)
+                .or_insert((0, 0, 0, 0));
+            for file in &batch.files {
+                let key = (batch.patch_item_id, file.new_path.clone());
+                if let Some(idx) = row_idx_by_key.get(&key).copied() {
+                    merge_patch_item_file_row(&mut deduped_file_rows[idx].1, file);
+                } else {
+                    let idx = deduped_file_rows.len();
+                    deduped_file_rows.push((batch.patch_item_id, file.clone()));
+                    row_idx_by_key.insert(key, idx);
+                }
+            }
+        }
+
+        for (patch_item_id, file) in &deduped_file_rows {
+            let stats = stats_by_patch_item
+                .entry(*patch_item_id)
+                .or_insert((0, 0, 0, 0));
+            stats.0 = stats.0.saturating_add(1);
+            stats.1 = stats.1.saturating_add(file.additions);
+            stats.2 = stats.2.saturating_add(file.deletions);
+            stats.3 = stats.3.saturating_add(file.hunk_count);
+        }
+
+        let patch_item_ids: Vec<i64> = stats_by_patch_item.keys().copied().collect();
+
+        sqlx::query("DELETE FROM patch_item_files WHERE patch_item_id = ANY($1)")
+            .bind(&patch_item_ids)
+            .execute(&mut *tx)
+            .await?;
+
+        if !deduped_file_rows.is_empty() {
+            let rows_per_insert =
+                (MAX_QUERY_BIND_PARAMS / PATCH_ITEM_FILE_INSERT_BINDS_PER_ROW).max(1);
+            for chunk in deduped_file_rows.chunks(rows_per_insert) {
+                let mut qb: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
+                    "INSERT INTO patch_item_files \
+                    (patch_item_id, old_path, new_path, change_type, is_binary, additions, deletions, hunk_count, diff_start, diff_end) ",
+                );
+                qb.push_values(chunk.iter(), |mut b, (patch_item_id, file)| {
+                    b.push_bind(patch_item_id)
+                        .push_bind(&file.old_path)
+                        .push_bind(&file.new_path)
+                        .push_bind(&file.change_type)
+                        .push_bind(file.is_binary)
+                        .push_bind(file.additions)
+                        .push_bind(file.deletions)
+                        .push_bind(file.hunk_count)
+                        .push_bind(file.diff_start)
+                        .push_bind(file.diff_end);
+                });
+                qb.push(
+                    " ON CONFLICT (patch_item_id, new_path) DO UPDATE SET \
+                      old_path = EXCLUDED.old_path, \
+                      change_type = EXCLUDED.change_type, \
+                      is_binary = EXCLUDED.is_binary, \
+                      additions = EXCLUDED.additions, \
+                      deletions = EXCLUDED.deletions, \
+                      hunk_count = EXCLUDED.hunk_count, \
+                      diff_start = EXCLUDED.diff_start, \
+                      diff_end = EXCLUDED.diff_end",
+                );
+                qb.build().execute(&mut *tx).await?;
+            }
+        }
+
+        let stats_rows: Vec<(i64, i32, i32, i32, i32)> = stats_by_patch_item
+            .into_iter()
+            .map(
+                |(patch_item_id, (file_count, additions, deletions, hunk_count))| {
+                    (patch_item_id, file_count, additions, deletions, hunk_count)
+                },
+            )
+            .collect();
+        let stats_rows_per_chunk =
+            (MAX_QUERY_BIND_PARAMS / PATCH_ITEM_FILE_STATS_BINDS_PER_ROW).max(1);
+        for chunk in stats_rows.chunks(stats_rows_per_chunk) {
+            let mut stats_qb: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
+                "UPDATE patch_items pi \
+                 SET file_count = stats.file_count, \
+                     additions = stats.additions, \
+                     deletions = stats.deletions, \
+                     hunk_count = stats.hunk_count \
+                 FROM (",
+            );
+            stats_qb.push_values(chunk.iter(), |mut b, row| {
+                b.push_bind(row.0)
+                    .push_bind(row.1)
+                    .push_bind(row.2)
+                    .push_bind(row.3)
+                    .push_bind(row.4);
+            });
+            stats_qb.push(
+                ") AS stats(patch_item_id, file_count, additions, deletions, hunk_count) \
+                 WHERE pi.id = stats.patch_item_id",
+            );
+            stats_qb.build().execute(&mut *tx).await?;
         }
 
         tx.commit().await?;
@@ -2095,6 +2472,27 @@ impl LineageStore {
             .bind(patch_id_stable)
             .execute(&self.pool)
             .await?;
+        Ok(())
+    }
+
+    pub async fn set_patch_item_patch_ids_batch(
+        &self,
+        updates: &[(i64, Option<String>)],
+    ) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        let mut qb: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
+            "UPDATE patch_items pi \
+             SET patch_id_stable = vals.patch_id_stable \
+             FROM (",
+        );
+        qb.push_values(updates.iter(), |mut b, (patch_item_id, patch_id)| {
+            b.push_bind(*patch_item_id).push_bind(patch_id.clone());
+        });
+        qb.push(") AS vals(patch_item_id, patch_id_stable) WHERE pi.id = vals.patch_item_id");
+        qb.build().execute(&self.pool).await?;
         Ok(())
     }
 

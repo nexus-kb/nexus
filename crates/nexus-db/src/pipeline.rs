@@ -324,7 +324,7 @@ impl PipelineStore {
             FROM (
                 SELECT DISTINCT psv.patch_series_id
                 FROM patch_series_versions psv
-                JOIN patch_items pi ON pi.series_version_id = psv.id
+                JOIN patch_items pi ON pi.patch_series_version_id = psv.id
                 JOIN list_message_instances lmi ON lmi.message_pk = pi.message_pk
                 WHERE lmi.mailing_list_id = $1
                   AND lmi.seen_at >= $2 AND lmi.seen_at <= $3

@@ -1,45 +1,107 @@
 use std::collections::HashMap;
-use std::io::Write;
-use std::process::{Command, Stdio};
 
-use sha2::{Digest, Sha256};
+use once_cell::sync::Lazy;
+use regex::Regex;
+use sha1::{Digest, Sha1};
+use sha2::Sha256;
+
+use crate::b4_compat::normalize_line_endings;
+
+// Mirrors b4's hunk normalization semantics used for patch hashing.
+static HUNK_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@").expect("valid hunk re"));
+static FILENAME_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^(---|\+\+\+) (\S+)").expect("valid filename re"));
 
 pub fn compute_patch_id_stable(diff_text: &str) -> Option<String> {
-    let trimmed = diff_text.trim();
-    if trimmed.is_empty() {
+    let canonical = canonicalize_patch(diff_text);
+    if canonical.is_empty() {
         return None;
     }
 
-    let mut child = Command::new("git")
-        .arg("patch-id")
-        .arg("--stable")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-
-    if let Some(stdin) = child.stdin.as_mut()
-        && stdin.write_all(trimmed.as_bytes()).is_err()
-    {
-        return None;
-    }
-
-    let output = child.wait_with_output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    parse_patch_id_output(&String::from_utf8_lossy(&output.stdout))
+    let mut hasher = Sha1::new();
+    hasher.update(canonical.as_bytes());
+    let digest = hasher.finalize();
+    Some(format!("{digest:x}"))
 }
 
-fn parse_patch_id_output(output: &str) -> Option<String> {
-    output
-        .split_whitespace()
-        .next()
-        .map(str::trim)
-        .filter(|token| token.len() >= 7)
-        .map(ToString::to_string)
+fn canonicalize_patch(diff_text: &str) -> String {
+    let text = normalize_line_endings(diff_text);
+    let mut out = String::new();
+
+    for line in text.lines() {
+        if line.is_empty() {
+            continue;
+        }
+
+        if let Some(caps) = FILENAME_RE.captures(line) {
+            let marker = caps.get(1).map(|v| v.as_str()).unwrap_or_default();
+            let mut filename = caps
+                .get(2)
+                .map(|v| v.as_str())
+                .unwrap_or_default()
+                .trim_matches('"')
+                .to_string();
+
+            if filename != "/dev/null" {
+                filename = normalize_path_for_hash(filename);
+            }
+            out.push_str(marker);
+            out.push(' ');
+            out.push_str(&filename);
+            out.push('\n');
+            continue;
+        }
+
+        if let Some(caps) = HUNK_RE.captures(line) {
+            let old_count = caps
+                .get(1)
+                .and_then(|v| v.as_str().parse::<i32>().ok())
+                .unwrap_or(1);
+            let new_count = caps
+                .get(2)
+                .and_then(|v| v.as_str().parse::<i32>().ok())
+                .unwrap_or(1);
+            out.push_str(&format!("@@ -{old_count} +{new_count} @@\n"));
+            continue;
+        }
+
+        if line.starts_with('+') || line.starts_with('-') || line.starts_with(' ') {
+            if line.starts_with("+++") || line.starts_with("---") {
+                continue;
+            }
+            // Keep semantic content, normalize whitespace noise away.
+            let squashed = line
+                .chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect::<String>();
+            if !squashed.is_empty() {
+                out.push_str(&squashed);
+                out.push('\n');
+            }
+        }
+    }
+
+    out
+}
+
+fn normalize_path_for_hash(path: String) -> String {
+    if let Some(stripped) = path.strip_prefix("a/") {
+        return format!("a/{}", strip_first_dir(stripped));
+    }
+    if let Some(stripped) = path.strip_prefix("b/") {
+        return format!("b/{}", strip_first_dir(stripped));
+    }
+    path
+}
+
+fn strip_first_dir(path: &str) -> String {
+    let mut parts = path.splitn(2, '/');
+    let _ = parts.next();
+    match parts.next() {
+        Some(rest) if !rest.is_empty() => rest.to_string(),
+        _ => path.to_string(),
+    }
 }
 
 #[derive(Debug, Default)]
@@ -69,9 +131,6 @@ fn hash_key(diff_text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-
     use super::{PatchIdMemo, compute_patch_id_stable};
 
     fn fixture_diff() -> &'static str {
@@ -80,17 +139,11 @@ mod tests {
             "index 1111111..2222222 100644\n",
             "--- a/foo.c\n",
             "+++ b/foo.c\n",
-            "@@ -1 +1 @@\n",
-            "-old\n",
-            "+new\n"
+            "@@ -11,2 +21,2 @@\n",
+            "-old value\n",
+            "+new value\n",
+            " unchanged\n"
         )
-    }
-
-    #[test]
-    fn patch_id_matches_git_cli_output() {
-        let expected = git_patch_id(fixture_diff()).expect("patch-id from git");
-        let actual = compute_patch_id_stable(fixture_diff()).expect("patch-id from helper");
-        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -106,30 +159,28 @@ mod tests {
         assert!(compute_patch_id_stable("\n\n").is_none());
     }
 
-    fn git_patch_id(diff_text: &str) -> Option<String> {
-        let mut child = Command::new("git")
-            .arg("patch-id")
-            .arg("--stable")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()?;
+    #[test]
+    fn normalizes_line_endings() {
+        let a = compute_patch_id_stable(
+            "diff --git a/a b/a\r\n--- a/a\r\n+++ b/a\r\n@@ -1 +1 @@\r\n-x\r\n+y\r\n",
+        )
+        .expect("hash");
+        let b =
+            compute_patch_id_stable("diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-x\n+y\n")
+                .expect("hash");
+        assert_eq!(a, b);
+    }
 
-        if let Some(stdin) = child.stdin.as_mut()
-            && stdin.write_all(diff_text.as_bytes()).is_err()
-        {
-            return None;
-        }
-
-        let output = child.wait_with_output().ok()?;
-        if !output.status.success() {
-            return None;
-        }
-
-        String::from_utf8_lossy(&output.stdout)
-            .split_whitespace()
-            .next()
-            .map(|v| v.to_string())
+    #[test]
+    fn ignores_hunk_line_numbers() {
+        let a = compute_patch_id_stable(
+            "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1,2 +1,2 @@\n-x\n+y\n z\n",
+        )
+        .expect("hash");
+        let b = compute_patch_id_stable(
+            "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -100,2 +200,2 @@\n-x\n+y\n z\n",
+        )
+        .expect("hash");
+        assert_eq!(a, b);
     }
 }
