@@ -10,16 +10,14 @@ Nexus KB is a read-focused backend for mailing-list archives and patch-series wo
 - `crates/nexus-core`: Shared config/types.
 - `crates/nexus-cli`: Operator/developer helpers.
 
-## Deployment (Two Containers, One Image)
+## Deployment
 
 Use one packaged image for both processes:
 
-- `ghcr.io/<owner>/nexus-api-server:latest`
-
-Run **both** containers in production: one API container and one worker container.
+- `ghcr.io/nexus-kb/nexus-api-server:latest`
 
 ```bash
-IMAGE=ghcr.io/<owner>/nexus-api-server:latest
+IMAGE=ghcr.io/nexus-kb/nexus-api-server:latest
 
 docker network create nexus-kb || true
 
@@ -40,7 +38,7 @@ docker run -d --name nexus-worker \
 
 `nexus-api.env` should contain only variables in the matrix below.
 
-## Environment Variables (Runtime In Use)
+## Environment Variables
 
 This list includes only variables currently read by runtime code (`nexus-core` config + API CORS env).
 
@@ -50,8 +48,8 @@ This list includes only variables currently read by runtime code (`nexus-core` c
 | --- | --- | --- | --- |
 | `NEXUS__DATABASE__URL` | yes | none | Set to your Postgres DSN. |
 | `NEXUS__DATABASE__MAX_CONNECTIONS` | no | `20` | Increase based on DB capacity. |
-| `NEXUS__APP__HOST` | no | `0.0.0.0` | Keep default in containers. |
-| `NEXUS__APP__PORT` | no | `3000` | Keep `3000` unless remapping internally. |
+| `NEXUS__APP__HOST` | no | `0.0.0.0` | Adjust as needed. |
+| `NEXUS__APP__PORT` | no | `3000` | Adjust as needed. |
 | `NEXUS__APP__BUILD_SHA` | no | `dev` | Set from CI/release metadata. |
 | `NEXUS__APP__BUILD_TIME` | no | startup UTC timestamp | Set from CI for stable build metadata. |
 | `NEXUS__APP__SCHEMA_VERSION` | no | `phase0` | Set from release metadata if needed. |
@@ -68,14 +66,14 @@ This list includes only variables currently read by runtime code (`nexus-core` c
 | `NEXUS__MEILI__MASTER_KEY` | no | `nexus-dev-key` | Set to your real Meili master key. |
 | `NEXUS__MEILI__UPSERT_BATCH_SIZE` | no | `100` | Tune for index/write latency tradeoff. |
 
-### Embeddings (Optional Feature)
+### Embeddings
 
 | Variable | Required | Default if unset | Production guidance |
 | --- | --- | --- | --- |
 | `NEXUS__EMBEDDINGS__ENABLED` | no | `false` | Set `true` only when embedding endpoint is configured. |
 | `NEXUS__EMBEDDINGS__BASE_URL` | required if embeddings enabled | `https://openrouter.ai/api/v1` | Use your embedding provider endpoint. |
 | `NEXUS__EMBEDDINGS__API_KEY` | required if embeddings enabled | empty | Set provider API key via secret manager. |
-| `NEXUS__EMBEDDINGS__MODEL` | required if embeddings enabled | `qwen/qwen3-embedding-4b` | Pin to deployed embedding model. |
+| `NEXUS__EMBEDDINGS__MODEL` | required if embeddings enabled | `Qwen/Qwen3-Embedding-4B` | Pin to deployed embedding model. |
 | `NEXUS__EMBEDDINGS__DIMENSIONS` | no | `768` | Must match model output dimensions. |
 | `NEXUS__EMBEDDINGS__EMBEDDER_NAME` | no | `qwen3` | Keep stable for index naming/versioning. |
 | `NEXUS__EMBEDDINGS__QUERY_CACHE_TTL_SECS` | no | `120` | Increase if query patterns are repetitive. |
