@@ -35,15 +35,25 @@ Notes:
 
 ## Required environment
 
-- `NEXUS__DATABASE__URL`
+- Always required at startup (`nexus-api` and `nexus-jobs`):
+  - `NEXUS__DATABASE__URL`
+- Conditionally required:
+  - If `NEXUS__EMBEDDINGS__ENABLED=true`, these are required:
+    - `NEXUS__EMBEDDINGS__API_KEY`
+    - `NEXUS__EMBEDDINGS__BASE_URL`
+    - `NEXUS__EMBEDDINGS__MODEL`
+- Required for ingest/list-sync jobs:
+  - `NEXUS__MAIL__MIRROR_ROOT` must point to a readable mirror path (default `/opt/nexus/mailing-lists`)
 
-Optional defaults:
+Common optional overrides:
 
 - `NEXUS__APP__HOST=0.0.0.0`
 - `NEXUS__APP__PORT=3000`
 - `NEXUS__ADMIN__TOKEN=nexus-dev-admin`
 - `NEXUS__MAIL__MIRROR_ROOT=/opt/nexus/mailing-lists`
 - `NEXUS__MAIL__COMMIT_BATCH_SIZE=250`
+- `NEXUS__MEILI__URL=http://127.0.0.1:7700`
+- `NEXUS__MEILI__MASTER_KEY=nexus-dev-key`
 - `NEXUS__WORKER__BACKFILL_MODE=full_pipeline|ingest_only`
 - `NEXUS__WORKER__INGEST_PARSE_CONCURRENCY=8`
 - `NEXUS__WORKER__MAX_INFLIGHT_JOBS=1`
