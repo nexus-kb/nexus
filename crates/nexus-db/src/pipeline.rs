@@ -278,6 +278,34 @@ impl PipelineStore {
         .await
     }
 
+    /// Message PKs in ingest window scoped to specific repo IDs.
+    pub async fn query_ingest_window_message_pks_for_repo_ids(
+        &self,
+        mailing_list_id: i64,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        repo_ids: &[i64],
+    ) -> Result<Vec<i64>> {
+        if repo_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        sqlx::query_scalar::<_, i64>(
+            r#"SELECT DISTINCT message_pk
+            FROM list_message_instances
+            WHERE mailing_list_id = $1
+              AND seen_at >= $2 AND seen_at <= $3
+              AND repo_id = ANY($4)
+            ORDER BY message_pk ASC"#,
+        )
+        .bind(mailing_list_id)
+        .bind(from)
+        .bind(to)
+        .bind(repo_ids)
+        .fetch_all(&self.pool)
+        .await
+    }
+
     /// Chunked thread IDs impacted by messages in the ingest window.
     pub async fn query_impacted_thread_ids_chunk(
         &self,
