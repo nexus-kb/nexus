@@ -51,7 +51,7 @@ Optional defaults:
 - `NEXUS__WORKER__BACKFILL_BATCH_SIZE=10000`
 - `NEXUS__WORKER__INGEST_WRITE_MODE=copy|batched_sql`
 - `NEXUS__WORKER__DB_RELAXED_DURABILITY=false`
-- `NEXUS_CORS_ALLOWED_ORIGINS` (optional, comma-separated, defaults to `http://127.0.0.1:3001,http://localhost:3001,http://host.containers.internal:3001,http://host.docker.internal:3001`)
+- `NEXUS_CORS_ALLOWED_ORIGINS` (optional, comma-separated; use `*` for unrestricted CORS, which is the default)
 
 ## Run API
 
@@ -59,14 +59,13 @@ Optional defaults:
 cargo run -p nexus-api
 ```
 
-Cross-origin requests from the web app are supported with local dev defaults for
-`http://127.0.0.1:3001`, `http://localhost:3001`, `http://host.containers.internal:3001`, and
-`http://host.docker.internal:3001` so a Next frontend on port 3001 can call live API routes.
+Cross-origin requests are unrestricted by default (`NEXUS_CORS_ALLOWED_ORIGINS=*`), which is
+useful for local/LAN development and ad-hoc DNS/IP access.
 
 Override the allowed origins as needed:
 
 ```bash
-NEXUS_CORS_ALLOWED_ORIGINS=http://localhost:3001,http://127.0.0.1:3001,http://host.containers.internal:3001,https://nexus.local cargo run -p nexus-api
+NEXUS_CORS_ALLOWED_ORIGINS=http://localhost:3001,http://127.0.0.1:3001,https://nexus.local cargo run -p nexus-api
 ```
 
 ## Run worker
