@@ -1,192 +1,30 @@
-# Nexus API Server (Phase 0)
+# Nexus KB API Server
 
-Hard-reset backend focused on job orchestration + ingestion tickets 1-5.
+Nexus KB is a read-focused API and worker backend for mailing-list archives and patch-series exploration. It stores canonical message and pipeline state in Postgres, builds search documents in Meilisearch, and serves public read APIs plus token-protected admin controls. Heavy parsing/indexing work runs in background jobs so request paths stay fast.
 
-## Crates
+## Crate Layout
 
-- `crates/nexus-api`: Axum API exposing `/api/v1/*` and `/admin/v1/*`.
-- `crates/nexus-db`: Postgres schema + stores for jobs/catalog/ingest.
-- `crates/nexus-jobs`: worker runtime, repo scanner, RFC822/MIME parser, ingestion pipeline.
-- `crates/nexus-cli`: minimal CLI helper (`seed-pilot`).
-- `crates/nexus-core`: shared config.
+- `crates/nexus-api`: Axum HTTP server for `/api/v1/*` and `/admin/v1/*`.
+- `crates/nexus-jobs`: Worker runtime and pipeline stages.
+- `crates/nexus-db`: Database access layer, migrations, and models.
+- `crates/nexus-core`: Shared config and core types.
+- `crates/nexus-cli`: Small operator/developer CLI helpers.
 
-## Container-first dev workflow (recommended)
+## Deployment (Packaged Image)
 
-Use the root `compose.yml` as the canonical dev workflow for API + worker + dependencies.
+Use the packaged container image:
 
-From repo root:
+- `ghcr.io/<owner>/nexus-api-server:latest`
 
-```bash
-podman compose -f compose.yml up -d --build api worker postgres meilisearch
-```
-
-or:
-
-```bash
-docker compose -f compose.yml up -d --build api worker postgres meilisearch
-```
-
-Notes:
-
-- API and worker use `nexus-api-server/Dockerfile.dev`.
-- Source is bind-mounted from host (`./nexus-api-server`), and both services run under `cargo watch`.
-- Rust edits on host trigger rebuild/restart in the corresponding container.
-- Dev defaults are injected by compose (no shell sourcing required).
-
-## Required environment
-
-- Always required at startup (`nexus-api` and `nexus-jobs`):
-  - `NEXUS__DATABASE__URL`
-- Conditionally required:
-  - If `NEXUS__EMBEDDINGS__ENABLED=true`, these are required:
-    - `NEXUS__EMBEDDINGS__API_KEY`
-    - `NEXUS__EMBEDDINGS__BASE_URL`
-    - `NEXUS__EMBEDDINGS__MODEL`
-- Required for ingest/list-sync jobs:
-  - `NEXUS__MAIL__MIRROR_ROOT` must point to a readable mirror path (default `/opt/nexus/mailing-lists`)
-
-Common optional overrides:
-
-- `NEXUS__APP__HOST=0.0.0.0`
-- `NEXUS__APP__PORT=3000`
-- `NEXUS__ADMIN__TOKEN=nexus-dev-admin`
-- `NEXUS__MAIL__MIRROR_ROOT=/opt/nexus/mailing-lists`
-- `NEXUS__MAIL__COMMIT_BATCH_SIZE=250`
-- `NEXUS__MEILI__URL=http://127.0.0.1:7700`
-- `NEXUS__MEILI__MASTER_KEY=nexus-dev-key`
-- `NEXUS__WORKER__BACKFILL_MODE=full_pipeline|ingest_only`
-- `NEXUS__WORKER__INGEST_PARSE_CONCURRENCY=8`
-- `NEXUS__WORKER__MAX_INFLIGHT_JOBS=1`
-- `NEXUS__WORKER__MAX_INFLIGHT_INGEST_JOBS=1`
-- `NEXUS__WORKER__BACKFILL_BATCH_SIZE=10000`
-- `NEXUS__WORKER__INGEST_WRITE_MODE=copy|batched_sql`
-- `NEXUS__WORKER__DB_RELAXED_DURABILITY=false`
-- `NEXUS_CORS_ALLOWED_ORIGINS` (optional, comma-separated; use `*` for unrestricted CORS, which is the default)
-
-## Run API
-
-```bash
-cargo run -p nexus-api
-```
-
-Cross-origin requests are unrestricted by default (`NEXUS_CORS_ALLOWED_ORIGINS=*`), which is
-useful for local/LAN development and ad-hoc DNS/IP access.
-
-Override the allowed origins as needed:
-
-```bash
-NEXUS_CORS_ALLOWED_ORIGINS=http://localhost:3001,http://127.0.0.1:3001,https://nexus.local cargo run -p nexus-api
-```
-
-## Run worker
-
-```bash
-cargo run -p nexus-jobs --bin worker
-```
-
-## Docker (standalone, not compose)
-
-Build production image:
-
-```bash
-docker build -t nexus-api-server:prod -f Dockerfile .
-```
-
-Build dev image (compose-compatible tooling image):
-
-```bash
-docker build -t nexus-api-server:dev -f Dockerfile.dev .
-```
-
-Run API long-lived (default command):
+Minimal API run example:
 
 ```bash
 docker run --name nexus-api --rm -p 3000:3000 \
-  -e NEXUS__DATABASE__URL=postgresql://nexus:nexus@host.docker.internal:5432/nexus_kb \
-  -e NEXUS__MAIL__MIRROR_ROOT=/opt/nexus/mailing-lists \
-  nexus-api-server:prod
+  -e NEXUS__DATABASE__URL=postgresql://nexus:nexus@<postgres-host>:5432/nexus_kb \
+  -e NEXUS__MEILI__URL=http://<meili-host>:7700 \
+  -e NEXUS__MEILI__MASTER_KEY=<meili-master-key> \
+  -e NEXUS__ADMIN__TOKEN=<admin-token> \
+  ghcr.io/<owner>/nexus-api-server:latest
 ```
 
-Run API with explicit user mapping:
-
-```bash
-docker run --name nexus-api --rm -p 3000:3000 \
-  --user 1000:1000 \
-  -e NEXUS__DATABASE__URL=postgresql://nexus:nexus@host.docker.internal:5432/nexus_kb \
-  -e NEXUS__MAIL__MIRROR_ROOT=/opt/nexus/mailing-lists \
-  nexus-api-server:prod
-```
-
-For rootless Podman/Quadlet production, prefer `--userns=keep-id` with explicit `--user <host_uid>:<host_gid>` (or the equivalent Quadlet settings). This repository does not support `PUID`/`PGID` environment variable remapping.
-
-For Podman host networking to services, replace `host.docker.internal` with `host.containers.internal`.
-
-Run worker using the same production image:
-
-```bash
-docker run --name nexus-worker --rm \
-  --user 1000:1000 \
-  -e NEXUS__DATABASE__URL=postgresql://nexus:nexus@host.docker.internal:5432/nexus_kb \
-  -e NEXUS__MAIL__MIRROR_ROOT=/opt/nexus/mailing-lists \
-  -v /opt/nexus/mailing-lists:/opt/nexus/mailing-lists:ro \
-  nexus-api-server:prod /usr/local/bin/worker
-```
-
-Backfill-oriented worker profile example:
-
-```bash
-NEXUS__WORKER__BACKFILL_MODE=ingest_only \
-NEXUS__WORKER__INGEST_PARSE_CONCURRENCY=8 \
-NEXUS__WORKER__MAX_INFLIGHT_JOBS=4 \
-NEXUS__WORKER__MAX_INFLIGHT_INGEST_JOBS=2 \
-NEXUS__WORKER__BACKFILL_BATCH_SIZE=10000 \
-NEXUS__WORKER__INGEST_WRITE_MODE=copy \
-NEXUS__WORKER__DB_RELAXED_DURABILITY=true \
-cargo run -p nexus-jobs --bin worker
-```
-
-## CLI
-
-```bash
-cargo run -p nexus-cli -- seed-pilot
-```
-
-## Public endpoints
-
-- `GET /api/v1/healthz`
-- `GET /api/v1/readyz`
-- `GET /api/v1/version`
-- `GET /api/v1/openapi.json`
-- `GET /api/v1/lists?page=&page_size=`
-- `GET /api/v1/lists/{list_key}`
-- `GET /api/v1/lists/{list_key}/stats?window=30d`
-- `GET /api/v1/lists/{list_key}/threads?sort=&page=&page_size=&from=&to=&author=&has_diff=`
-- `GET /api/v1/lists/{list_key}/threads/{thread_id}`
-- `GET /api/v1/lists/{list_key}/threads/{thread_id}/messages?view=full|snippets&page=&page_size=`
-- `GET /api/v1/messages/{message_id}`
-- `GET /api/v1/messages/{message_id}/body?include_diff=true|false&strip_quotes=true|false`
-- `GET /api/v1/messages/{message_id}/raw`
-- `GET /api/v1/r/{msgid}`
-- `GET /api/v1/series?list_key=&sort=last_seen_desc&page=&page_size=`
-- `GET /api/v1/series/{series_id}`
-- `GET /api/v1/series/{series_id}/versions/{series_version_id}?assembled=true|false`
-- `GET /api/v1/series/{series_id}/compare?v1=&v2=&mode=summary|per_patch|per_file`
-- `GET /api/v1/search?q=&scope=thread|series|patch_item&list_key=&author=&from=&to=&has_diff=&sort=&limit=&cursor=`
-- `GET /api/v1/patch-items/{patch_item_id}`
-- `GET /api/v1/patch-items/{patch_item_id}/files`
-- `GET /api/v1/patch-items/{patch_item_id}/files/{path}/diff`
-- `GET /api/v1/patch-items/{patch_item_id}/diff`
-- `GET /api/v1/series/{series_id}/versions/{series_version_id}/export/mbox?assembled=true|false&include_cover=true|false`
-
-## Admin endpoints (token required)
-
-- `POST /admin/v1/jobs/enqueue`
-- `GET /admin/v1/jobs`
-- `GET /admin/v1/jobs/{job_id}`
-- `POST /admin/v1/jobs/{job_id}/cancel`
-- `POST /admin/v1/jobs/{job_id}/retry`
-- `POST /admin/v1/ingest/sync?list_key=<key>`
-- `POST /admin/v1/ingest/grokmirror`
-- `POST /admin/v1/ingest/reset-watermark?list_key=<key>&repo_key=<key>`
-- `POST /admin/v1/threading/rebuild?list_key=<key>&from=<iso8601>&to=<iso8601>`
-- `POST /admin/v1/lineage/rebuild?list_key=<key>&from=<iso8601>&to=<iso8601>`
+For ingest/list-sync jobs, also set `NEXUS__MAIL__MIRROR_ROOT` and mount that path read-only into the container.
