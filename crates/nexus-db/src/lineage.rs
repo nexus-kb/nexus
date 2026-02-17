@@ -359,6 +359,8 @@ pub struct SeriesListItemRecord {
     pub canonical_subject_norm: String,
     pub author_email: String,
     pub author_name: Option<String>,
+    pub first_seen_at: DateTime<Utc>,
+    pub latest_patchset_at: DateTime<Utc>,
     pub last_seen_at: DateTime<Utc>,
     pub latest_version_num: i32,
     pub is_rfc_latest: bool,
@@ -1839,12 +1841,14 @@ impl LineageStore {
                 ps.canonical_subject_norm,
                 ps.author_email,
                 ps.author_name,
+                ps.created_at AS first_seen_at,
+                COALESCE(latest.sent_at, ps.last_seen_at) AS latest_patchset_at,
                 ps.last_seen_at,
                 COALESCE(latest.version_num, 1) AS latest_version_num,
                 COALESCE(latest.is_rfc, false) AS is_rfc_latest
             FROM patch_series ps
             LEFT JOIN LATERAL (
-                SELECT psv.version_num, psv.is_rfc
+                SELECT psv.version_num, psv.is_rfc, psv.sent_at
                 FROM patch_series_versions psv
                 WHERE psv.patch_series_id = ps.id
                 ORDER BY psv.version_num DESC, psv.sent_at DESC, psv.id DESC
