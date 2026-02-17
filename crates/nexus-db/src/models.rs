@@ -78,3 +78,31 @@ pub struct EmbeddingBackfillRun {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct MeiliBootstrapRun {
+    pub id: i64,
+    pub scope: String,
+    pub list_key: Option<String>,
+    pub state: String,
+    pub embedder_name: String,
+    pub model_key: String,
+    pub job_id: Option<i64>,
+    pub thread_cursor_id: i64,
+    pub series_cursor_id: i64,
+    pub total_candidates_thread: i64,
+    pub total_candidates_series: i64,
+    pub processed_thread: i64,
+    pub processed_series: i64,
+    pub docs_upserted: i64,
+    pub vectors_attached: i64,
+    pub placeholders_written: i64,
+    pub failed_batches: i64,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub progress_json: serde_json::Value,
+    pub result_json: Option<serde_json::Value>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}

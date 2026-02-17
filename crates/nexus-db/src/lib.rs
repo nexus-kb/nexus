@@ -17,7 +17,9 @@ pub use crate::catalog::{
     MailingList, MailingListRepo,
 };
 pub use crate::db::Db;
-pub use crate::embeddings::{EmbeddingInputRow, EmbeddingVectorUpsert, EmbeddingsStore};
+pub use crate::embeddings::{
+    EmbeddingInputRow, EmbeddingVectorUpsert, EmbeddingsStore, ListMeiliBootstrapRunsParams,
+};
 pub use crate::ingest::{
     BatchWriteOutcome, IngestCommitRow, IngestStore, ParsedBodyInput, ParsedMessageInput,
     WriteOutcome,
@@ -36,7 +38,7 @@ pub use crate::lineage::{
     ThreadParticipantRecord, ThreadRefRecord, ThreadSummaryRecord, UpsertPatchItemFileInput,
     UpsertPatchItemInput, UpsertPatchSeriesInput, UpsertPatchSeriesVersionInput,
 };
-pub use crate::models::{EmbeddingBackfillRun, Job, JobState, PipelineRun};
+pub use crate::models::{EmbeddingBackfillRun, Job, JobState, MeiliBootstrapRun, PipelineRun};
 pub use crate::pipeline::{ListPipelineRunsParams, PipelineStore};
 pub use crate::search::SearchStore;
 pub use crate::threading::{

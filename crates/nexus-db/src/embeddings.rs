@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 
-use crate::{EmbeddingBackfillRun, Result};
+use crate::{EmbeddingBackfillRun, MeiliBootstrapRun, Result};
 
 #[derive(Debug, Clone)]
 pub struct EmbeddingInputRow {
@@ -20,12 +20,20 @@ pub struct EmbeddingVectorUpsert {
     pub source_hash: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ListMeiliBootstrapRunsParams {
+    pub list_key: Option<String>,
+    pub state: Option<String>,
+    pub limit: i64,
+    pub cursor: Option<i64>,
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct ThreadEmbeddingRow {
     doc_id: i64,
     subject: String,
     participants: Vec<String>,
-    snippet_corpus: Option<String>,
+    body_corpus: Option<String>,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -171,6 +179,205 @@ impl EmbeddingsStore {
         )
         .bind(run_id)
         .bind(error)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn create_meili_bootstrap_run(
+        &self,
+        scope: &str,
+        list_key: Option<&str>,
+        embedder_name: &str,
+        model_key: &str,
+    ) -> Result<MeiliBootstrapRun> {
+        sqlx::query_as::<_, MeiliBootstrapRun>(
+            r#"INSERT INTO meili_bootstrap_runs
+               (scope, list_key, state, embedder_name, model_key, progress_json)
+               VALUES ($1, $2, 'queued', $3, $4, '{}'::jsonb)
+               RETURNING *"#,
+        )
+        .bind(scope)
+        .bind(list_key)
+        .bind(embedder_name)
+        .bind(model_key)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    pub async fn set_meili_bootstrap_job_id(&self, run_id: i64, job_id: i64) -> Result<()> {
+        sqlx::query(
+            r#"UPDATE meili_bootstrap_runs
+               SET job_id = $2,
+                   updated_at = now()
+               WHERE id = $1"#,
+        )
+        .bind(run_id)
+        .bind(job_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_meili_bootstrap_run(&self, run_id: i64) -> Result<Option<MeiliBootstrapRun>> {
+        sqlx::query_as::<_, MeiliBootstrapRun>("SELECT * FROM meili_bootstrap_runs WHERE id = $1")
+            .bind(run_id)
+            .fetch_optional(&self.pool)
+            .await
+    }
+
+    pub async fn list_meili_bootstrap_runs(
+        &self,
+        params: ListMeiliBootstrapRunsParams,
+    ) -> Result<Vec<MeiliBootstrapRun>> {
+        let mut qb = sqlx::QueryBuilder::new("SELECT * FROM meili_bootstrap_runs WHERE true");
+        if let Some(list_key) = params.list_key {
+            qb.push(" AND list_key = ").push_bind(list_key);
+        }
+        if let Some(state) = params.state {
+            qb.push(" AND state = ").push_bind(state);
+        }
+        if let Some(cursor) = params.cursor {
+            qb.push(" AND id < ").push_bind(cursor);
+        }
+        qb.push(" ORDER BY id DESC LIMIT ")
+            .push_bind(params.limit.clamp(1, 200));
+        qb.build_query_as::<MeiliBootstrapRun>()
+            .fetch_all(&self.pool)
+            .await
+    }
+
+    pub async fn get_active_meili_bootstrap_run(
+        &self,
+        scope: &str,
+        list_key: Option<&str>,
+    ) -> Result<Option<MeiliBootstrapRun>> {
+        sqlx::query_as::<_, MeiliBootstrapRun>(
+            r#"SELECT *
+               FROM meili_bootstrap_runs
+               WHERE scope = $1
+                 AND list_key IS NOT DISTINCT FROM $2
+                 AND state IN ('queued', 'running')
+               ORDER BY id DESC
+               LIMIT 1"#,
+        )
+        .bind(scope)
+        .bind(list_key)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    pub async fn mark_meili_bootstrap_running(&self, run_id: i64) -> Result<()> {
+        sqlx::query(
+            r#"UPDATE meili_bootstrap_runs
+               SET state = 'running',
+                   started_at = COALESCE(started_at, now()),
+                   updated_at = now()
+               WHERE id = $1"#,
+        )
+        .bind(run_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_meili_bootstrap_progress(
+        &self,
+        run_id: i64,
+        thread_cursor_id: i64,
+        series_cursor_id: i64,
+        total_candidates_thread: i64,
+        total_candidates_series: i64,
+        processed_thread: i64,
+        processed_series: i64,
+        docs_upserted: i64,
+        vectors_attached: i64,
+        placeholders_written: i64,
+        failed_batches: i64,
+        progress_json: serde_json::Value,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"UPDATE meili_bootstrap_runs
+               SET thread_cursor_id = $2,
+                   series_cursor_id = $3,
+                   total_candidates_thread = $4,
+                   total_candidates_series = $5,
+                   processed_thread = $6,
+                   processed_series = $7,
+                   docs_upserted = $8,
+                   vectors_attached = $9,
+                   placeholders_written = $10,
+                   failed_batches = $11,
+                   progress_json = $12,
+                   updated_at = now()
+               WHERE id = $1"#,
+        )
+        .bind(run_id)
+        .bind(thread_cursor_id)
+        .bind(series_cursor_id)
+        .bind(total_candidates_thread)
+        .bind(total_candidates_series)
+        .bind(processed_thread)
+        .bind(processed_series)
+        .bind(docs_upserted)
+        .bind(vectors_attached)
+        .bind(placeholders_written)
+        .bind(failed_batches)
+        .bind(progress_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn mark_meili_bootstrap_succeeded(
+        &self,
+        run_id: i64,
+        result_json: serde_json::Value,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"UPDATE meili_bootstrap_runs
+               SET state = 'succeeded',
+                   completed_at = now(),
+                   result_json = $2,
+                   last_error = NULL,
+                   updated_at = now()
+               WHERE id = $1"#,
+        )
+        .bind(run_id)
+        .bind(result_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn mark_meili_bootstrap_failed(&self, run_id: i64, error: &str) -> Result<()> {
+        sqlx::query(
+            r#"UPDATE meili_bootstrap_runs
+               SET state = 'failed',
+                   completed_at = now(),
+                   last_error = $2,
+                   updated_at = now()
+               WHERE id = $1"#,
+        )
+        .bind(run_id)
+        .bind(error)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn mark_meili_bootstrap_cancelled(&self, run_id: i64, reason: &str) -> Result<()> {
+        sqlx::query(
+            r#"UPDATE meili_bootstrap_runs
+               SET state = 'cancelled',
+                   completed_at = now(),
+                   last_error = $2,
+                   updated_at = now()
+               WHERE id = $1"#,
+        )
+        .bind(run_id)
+        .bind(reason)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -412,10 +619,10 @@ impl EmbeddingsStore {
                      ON m.id = tm.message_pk
                    GROUP BY tm.thread_id
                ),
-               snippets AS (
+               bodies AS (
                    SELECT
                        tm.thread_id AS thread_id,
-                       STRING_AGG(nexus_safe_prefix(mb.search_text, 400), ' ' ORDER BY tm.sort_key) AS snippet_corpus
+                       STRING_AGG(nexus_safe_prefix(mb.search_text, 1000), ' ' ORDER BY tm.sort_key) AS body_corpus
                    FROM thread_messages tm
                    JOIN targets t
                      ON t.id = tm.thread_id
@@ -430,12 +637,12 @@ impl EmbeddingsStore {
                    t.id AS doc_id,
                    t.subject_norm AS subject,
                    COALESCE(p.participant_emails, ARRAY[]::text[]) AS participants,
-                   s.snippet_corpus
+                   b.body_corpus
                FROM targets t
                LEFT JOIN participants p
                  ON p.thread_id = t.id
-               LEFT JOIN snippets s
-                 ON s.thread_id = t.id
+               LEFT JOIN bodies b
+                 ON b.thread_id = t.id
                ORDER BY t.id ASC"#,
         )
         .bind(ids)
@@ -446,11 +653,13 @@ impl EmbeddingsStore {
             .into_iter()
             .filter_map(|row| {
                 let participants_joined = row.participants.join(" ");
-                let snippet = row.snippet_corpus.unwrap_or_default();
+                let body = row.body_corpus.unwrap_or_default();
+                let body_collapsed = collapse_whitespace(&body);
+                let body_capped = limit_chars(body_collapsed.as_str(), 1_000);
                 let text = normalize_embedding_text(&[
                     row.subject.as_str(),
                     participants_joined.as_str(),
-                    snippet.as_str(),
+                    body_capped.as_str(),
                 ]);
                 if text.is_empty() {
                     return None;
@@ -525,14 +734,11 @@ fn normalize_embedding_text(parts: &[&str]) -> String {
         .map(|part| part.trim())
         .collect::<Vec<_>>()
         .join("\n\n");
-    limit_chars(
-        joined
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .as_str(),
-        16_000,
-    )
+    limit_chars(collapse_whitespace(joined.as_str()).as_str(), 16_000)
+}
+
+fn collapse_whitespace(raw: &str) -> String {
+    raw.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn hash_text(raw: &str) -> Vec<u8> {

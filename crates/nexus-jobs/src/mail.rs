@@ -190,12 +190,7 @@ pub fn parse_email(raw_rfc822: &[u8]) -> Result<ParseOutcome, ParseEmailError> {
         body: &body_for_hash,
     });
 
-    let search_text = build_search_text(
-        &subject_raw,
-        &from_header,
-        body_text.as_deref(),
-        diff_text.as_deref(),
-    );
+    let search_text = build_search_text(body_text.as_deref());
 
     let outcome = ParseOutcome {
         content_hash_sha256,
@@ -221,15 +216,43 @@ pub fn parse_email(raw_rfc822: &[u8]) -> Result<ParseOutcome, ParseEmailError> {
     Ok(outcome)
 }
 
-fn build_search_text(subject: &str, from: &str, body: Option<&str>, diff: Option<&str>) -> String {
-    let mut parts = vec![subject.to_string(), from.to_string()];
-    if let Some(body) = body {
-        parts.push(limit_for_search(&sanitize_text(body), 80_000));
+fn build_search_text(body: Option<&str>) -> String {
+    let Some(body) = body else {
+        return String::new();
+    };
+    let Some(prose_body) = extract_prose_for_search(body) else {
+        return String::new();
+    };
+    limit_for_search(&sanitize_text(&prose_body), 80_000)
+}
+
+fn extract_prose_for_search(body: &str) -> Option<String> {
+    let normalized = normalize_line_endings(body);
+    if normalized.trim().is_empty() {
+        return None;
     }
-    if let Some(diff) = diff {
-        parts.push(limit_for_search(&sanitize_text(diff), 20_000));
+    let Some(diff) = extract_diff_text(&normalized) else {
+        return Some(normalized);
+    };
+    if let Some(start) = find_diff_start_index(&normalized, &diff) {
+        let prose = normalized[..start].trim();
+        if prose.is_empty() {
+            return None;
+        }
+        return Some(prose.to_string());
     }
-    parts.join("\n")
+    if has_diff_markers(&normalized) {
+        return None;
+    }
+    Some(normalized)
+}
+
+fn find_diff_start_index(body: &str, diff: &str) -> Option<usize> {
+    let direct = body.find(diff);
+    if direct.is_some() {
+        return direct;
+    }
+    body.find(format!("\n{diff}").as_str()).map(|idx| idx + 1)
 }
 
 fn limit_for_search(text: &str, limit: usize) -> String {
@@ -655,6 +678,33 @@ mod tests {
         assert!(parsed.has_diff);
         let diff = parsed.diff_text.unwrap_or_default();
         assert!(diff.starts_with("diff --git a/foo.c b/foo.c"));
+        assert!(parsed.search_text.contains("demo message"));
+        assert!(!parsed.search_text.contains("diff --git"));
+    }
+
+    #[test]
+    fn parser_patch_only_message_has_empty_search_text() {
+        let raw = concat!(
+            "From: Alice <alice@example.com>\r\n",
+            "Message-ID: <patch-only@example.com>\r\n",
+            "Date: Tue, 1 Jan 2024 00:00:00 +0000\r\n",
+            "Subject: [PATCH] patch only\r\n",
+            "Content-Type: text/plain; charset=utf-8\r\n",
+            "\r\n",
+            "diff --git a/foo.c b/foo.c\r\n",
+            "index 1111111..2222222 100644\r\n",
+            "--- a/foo.c\r\n",
+            "+++ b/foo.c\r\n",
+            "@@ -1 +1 @@\r\n",
+            "-old\r\n",
+            "+new\r\n"
+        )
+        .as_bytes()
+        .to_vec();
+
+        let parsed = parse_email(&raw).expect("parse should succeed");
+        assert!(parsed.has_diff);
+        assert_eq!(parsed.search_text, "");
     }
 
     #[test]

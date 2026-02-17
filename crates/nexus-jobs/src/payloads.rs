@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-// ── Pipeline stage payloads (4 - the core pipeline) ────────────
+// ── Pipeline stage payloads (5 - lexical-first pipeline) ───────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineIngestPayload {
@@ -19,9 +19,20 @@ pub struct PipelineLineagePayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PipelineSearchPayload {
+pub struct PipelineLexicalPayload {
     pub run_id: i64,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineEmbeddingPayload {
+    pub run_id: i64,
+    pub list_key: String,
+    pub window_from: DateTime<Utc>,
+    pub window_to: DateTime<Utc>,
+}
+
+/// Legacy alias kept for queued jobs created before the lexical rename.
+pub type PipelineSearchPayload = PipelineLexicalPayload;
 
 // ── Admin/maintenance payloads (4 - kept) ──────────────────────
 
@@ -69,9 +80,31 @@ pub struct EmbeddingGenerateBatchPayload {
     pub source_job_id: Option<i64>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MeiliBootstrapScope {
+    EmbeddingIndexes,
+}
+
+impl MeiliBootstrapScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MeiliBootstrapScope::EmbeddingIndexes => "embedding_indexes",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeiliBootstrapRunPayload {
+    pub run_id: i64,
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{EmbeddingGenerateBatchPayload, EmbeddingScope};
+    use super::{
+        EmbeddingGenerateBatchPayload, EmbeddingScope, MeiliBootstrapRunPayload,
+        MeiliBootstrapScope,
+    };
 
     #[test]
     fn embedding_scope_serializes_as_snake_case() {
@@ -84,5 +117,21 @@ mod tests {
         };
         let encoded = serde_json::to_string(&payload).expect("serialize embedding payload");
         assert!(encoded.contains("\"scope\":\"thread\""));
+    }
+
+    #[test]
+    fn meili_bootstrap_scope_serializes_as_snake_case() {
+        let encoded =
+            serde_json::to_string(&MeiliBootstrapScope::EmbeddingIndexes).expect("serialize scope");
+        assert_eq!(encoded, "\"embedding_indexes\"");
+    }
+
+    #[test]
+    fn meili_bootstrap_run_payload_round_trip() {
+        let payload = MeiliBootstrapRunPayload { run_id: 7 };
+        let encoded = serde_json::to_value(&payload).expect("serialize run payload");
+        let decoded: MeiliBootstrapRunPayload =
+            serde_json::from_value(encoded).expect("deserialize run payload");
+        assert_eq!(decoded.run_id, 7);
     }
 }

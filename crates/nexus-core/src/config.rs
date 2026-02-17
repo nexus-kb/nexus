@@ -77,6 +77,8 @@ pub struct MeiliConfig {
     pub url: String,
     #[serde(default = "default_meili_master_key")]
     pub master_key: String,
+    #[serde(default = "default_meili_upsert_batch_size")]
+    pub upsert_batch_size: usize,
 }
 
 fn default_meili_url() -> String {
@@ -85,6 +87,10 @@ fn default_meili_url() -> String {
 
 fn default_meili_master_key() -> String {
     "nexus-dev-key".to_string()
+}
+
+fn default_meili_upsert_batch_size() -> usize {
+    100
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -107,10 +113,6 @@ pub struct EmbeddingsConfig {
     pub query_cache_max_entries: usize,
     #[serde(default = "default_embeddings_batch_size")]
     pub batch_size: usize,
-    #[serde(default = "default_embeddings_max_inflight_requests")]
-    pub max_inflight_requests: usize,
-    #[serde(default = "default_embeddings_min_request_interval_ms")]
-    pub min_request_interval_ms: u64,
     #[serde(default)]
     pub openrouter_referer: Option<String>,
     #[serde(default)]
@@ -147,14 +149,6 @@ fn default_embeddings_query_cache_max_entries() -> usize {
 
 fn default_embeddings_batch_size() -> usize {
     32
-}
-
-fn default_embeddings_max_inflight_requests() -> usize {
-    2
-}
-
-fn default_embeddings_min_request_interval_ms() -> u64 {
-    50
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
@@ -306,6 +300,9 @@ pub fn load() -> Result<Settings, crate::Error> {
     if settings.meili.master_key.trim().is_empty() {
         settings.meili.master_key = default_meili_master_key();
     }
+    if settings.meili.upsert_batch_size == 0 {
+        settings.meili.upsert_batch_size = default_meili_upsert_batch_size();
+    }
     if settings.embeddings.base_url.trim().is_empty() {
         settings.embeddings.base_url = default_embeddings_base_url();
     }
@@ -326,9 +323,6 @@ pub fn load() -> Result<Settings, crate::Error> {
     }
     if settings.embeddings.batch_size == 0 {
         settings.embeddings.batch_size = default_embeddings_batch_size();
-    }
-    if settings.embeddings.max_inflight_requests == 0 {
-        settings.embeddings.max_inflight_requests = default_embeddings_max_inflight_requests();
     }
     if settings.embeddings.enabled {
         if settings.embeddings.api_key.trim().is_empty() {

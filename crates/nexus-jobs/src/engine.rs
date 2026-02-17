@@ -443,7 +443,11 @@ impl Phase0Worker {
 fn is_pipeline_job_type(job_type: &str) -> bool {
     matches!(
         job_type,
-        "pipeline_ingest" | "pipeline_threading" | "pipeline_lineage" | "pipeline_search"
+        "pipeline_ingest"
+            | "pipeline_threading"
+            | "pipeline_lineage"
+            | "pipeline_lexical"
+            | "pipeline_search"
     )
 }
 

@@ -109,6 +109,18 @@ impl PipelineStore {
         .await
     }
 
+    pub async fn get_any_active_run(&self) -> Result<Option<PipelineRun>> {
+        sqlx::query_as::<_, PipelineRun>(
+            r#"SELECT *
+            FROM pipeline_runs
+            WHERE state = 'running'
+            ORDER BY id DESC
+            LIMIT 1"#,
+        )
+        .fetch_optional(&self.pool)
+        .await
+    }
+
     pub async fn list_runs(&self, params: ListPipelineRunsParams) -> Result<Vec<PipelineRun>> {
         let mut qb = QueryBuilder::new("SELECT * FROM pipeline_runs WHERE true");
 
@@ -302,6 +314,28 @@ impl PipelineStore {
         .bind(from)
         .bind(to)
         .bind(repo_ids)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Distinct repo IDs touched in the ingest window for a mailing list.
+    pub async fn query_ingest_window_repo_ids(
+        &self,
+        mailing_list_id: i64,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<Vec<i64>> {
+        sqlx::query_scalar::<_, i64>(
+            r#"SELECT DISTINCT repo_id
+            FROM list_message_instances
+            WHERE mailing_list_id = $1
+              AND seen_at >= $2 AND seen_at <= $3
+              AND repo_id IS NOT NULL
+            ORDER BY repo_id ASC"#,
+        )
+        .bind(mailing_list_id)
+        .bind(from)
+        .bind(to)
         .fetch_all(&self.pool)
         .await
     }

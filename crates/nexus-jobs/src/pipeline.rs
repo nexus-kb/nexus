@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -27,8 +27,9 @@ use crate::mail::{ParseEmailError, parse_email};
 use crate::meili::{MeiliClient, MeiliClientError, settings_differ};
 use crate::payloads::{
     EmbeddingBackfillRunPayload, EmbeddingGenerateBatchPayload, EmbeddingScope,
-    LineageRebuildListPayload, PipelineIngestPayload, PipelineLineagePayload,
-    PipelineSearchPayload, PipelineThreadingPayload, ThreadingRebuildListPayload,
+    LineageRebuildListPayload, MeiliBootstrapRunPayload, PipelineEmbeddingPayload,
+    PipelineIngestPayload, PipelineLexicalPayload, PipelineLineagePayload,
+    PipelineThreadingPayload, ThreadingRebuildListPayload,
 };
 use crate::scanner::stream_new_commit_oid_chunks;
 use crate::threading::{ThreadingInputMessage, build_threads};
@@ -52,7 +53,15 @@ pub struct Phase0JobHandler {
 const STAGE_INGEST: &str = "ingest";
 const STAGE_THREADING: &str = "threading";
 const STAGE_LINEAGE: &str = "lineage";
-const STAGE_SEARCH: &str = "search";
+const STAGE_LEXICAL: &str = "lexical";
+const STAGE_EMBEDDING: &str = "embedding";
+
+const PRIORITY_INGEST: i32 = 20;
+const PRIORITY_THREADING: i32 = 16;
+const PRIORITY_LINEAGE: i32 = 14;
+const PRIORITY_LEXICAL: i32 = 12;
+const PRIORITY_PIPELINE_EMBEDDING: i32 = 3;
+const PRIORITY_EMBEDDING_BATCH: i32 = 2;
 
 impl Phase0JobHandler {
     pub fn new(
@@ -88,11 +97,14 @@ impl Phase0JobHandler {
             "pipeline_ingest" => self.handle_pipeline_ingest(job, ctx).await,
             "pipeline_threading" => self.handle_pipeline_threading(job, ctx).await,
             "pipeline_lineage" => self.handle_pipeline_lineage(job, ctx).await,
-            "pipeline_search" => self.handle_pipeline_search(job, ctx).await,
+            "pipeline_search" => self.handle_pipeline_lexical(job, ctx).await,
+            "pipeline_lexical" => self.handle_pipeline_lexical(job, ctx).await,
+            "pipeline_embedding" => self.handle_pipeline_embedding(job, ctx).await,
             "threading_rebuild_list" => self.handle_threading_rebuild_list(job, ctx).await,
             "lineage_rebuild_list" => self.handle_lineage_rebuild_list(job, ctx).await,
             "embedding_backfill_run" => self.handle_embedding_backfill_run(job, ctx).await,
             "embedding_generate_batch" => self.handle_embedding_generate_batch(job, ctx).await,
+            "meili_bootstrap_run" => self.handle_meili_bootstrap_run(job, ctx).await,
             other => JobExecutionOutcome::Terminal {
                 reason: format!("unknown job type: {other}"),
                 kind: "invalid_job_type".to_string(),
@@ -558,14 +570,54 @@ impl Phase0JobHandler {
             };
         }
 
-        let windows = match build_threading_epoch_windows(&repos) {
+        let touched_repo_ids = match self
+            .pipeline
+            .query_ingest_window_repo_ids(run.mailing_list_id, window_from, window_to)
+            .await
+        {
             Ok(value) => value,
-            Err(reason) => {
-                return JobExecutionOutcome::Terminal {
-                    reason,
-                    kind: "pipeline_state".to_string(),
-                    metrics: empty_metrics(started.elapsed().as_millis()),
-                };
+            Err(err) => {
+                return retryable_error(
+                    format!(
+                        "failed to query touched repos for threading stage run {}: {err}",
+                        run.id
+                    ),
+                    "db",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+        };
+        let touched_repo_set: HashSet<i64> = touched_repo_ids.into_iter().collect();
+
+        let mut min_touched_epoch: Option<i64> = None;
+        for repo in &repos {
+            if !touched_repo_set.contains(&repo.id) {
+                continue;
+            }
+            let Some(epoch) = parse_epoch_repo_relpath(&repo.repo_relpath) else {
+                continue;
+            };
+            min_touched_epoch = Some(match min_touched_epoch {
+                Some(current) => current.min(epoch),
+                None => epoch,
+            });
+        }
+        let start_epoch = min_touched_epoch.map(|value| value.saturating_sub(1));
+
+        let windows = if touched_repo_set.is_empty() {
+            Vec::new()
+        } else {
+            match build_threading_epoch_windows(&repos, start_epoch) {
+                Ok(value) => value,
+                Err(reason) => {
+                    return JobExecutionOutcome::Terminal {
+                        reason,
+                        kind: "pipeline_state".to_string(),
+                        metrics: empty_metrics(started.elapsed().as_millis()),
+                    };
+                }
             }
         };
 
@@ -671,6 +723,7 @@ impl Phase0JobHandler {
             let progress = serde_json::json!({
                 "stage": STAGE_THREADING,
                 "mode": "epoch_window",
+                "start_epoch": start_epoch,
                 "epoch_windows_total": epoch_windows_total,
                 "epoch_windows_done": epoch_windows_done,
                 "window_epochs": window.epochs,
@@ -727,6 +780,7 @@ impl Phase0JobHandler {
         let final_progress = serde_json::json!({
             "stage": STAGE_THREADING,
             "mode": "epoch_window",
+            "start_epoch": start_epoch,
             "epoch_windows_total": epoch_windows_total,
             "epoch_windows_done": epoch_windows_done,
             "window_epochs": last_window_epochs,
@@ -797,6 +851,7 @@ impl Phase0JobHandler {
                 "list_key": run.list_key,
                 "stage": STAGE_THREADING,
                 "mode": "epoch_window",
+                "start_epoch": start_epoch,
                 "epoch_windows_total": epoch_windows_total,
                 "epoch_windows_done": epoch_windows_done,
                 "window_epochs": last_window_epochs,
@@ -1024,11 +1079,11 @@ impl Phase0JobHandler {
         }
 
         if let Err(err) = self
-            .enqueue_next_stage(run.id, &run.list_key, STAGE_SEARCH)
+            .enqueue_next_stage(run.id, &run.list_key, STAGE_LEXICAL)
             .await
         {
             return retryable_error(
-                format!("failed to enqueue search stage for run {}: {err}", run.id),
+                format!("failed to enqueue lexical stage for run {}: {err}", run.id),
                 "db",
                 &job,
                 started.elapsed().as_millis(),
@@ -1037,11 +1092,11 @@ impl Phase0JobHandler {
         }
         if let Err(err) = self
             .pipeline
-            .set_run_current_stage(run.id, STAGE_SEARCH)
+            .set_run_current_stage(run.id, STAGE_LEXICAL)
             .await
         {
             return retryable_error(
-                format!("failed to move run {} to search stage: {err}", run.id),
+                format!("failed to move run {} to lexical stage: {err}", run.id),
                 "db",
                 &job,
                 started.elapsed().as_millis(),
@@ -1058,7 +1113,7 @@ impl Phase0JobHandler {
                 "series_versions_written": series_versions_written,
                 "patch_items_written": patch_items_written,
                 "patch_item_files_written": patch_item_files_written,
-                "next_stage": STAGE_SEARCH,
+                "next_stage": STAGE_LEXICAL,
             }),
             metrics: JobStoreMetrics {
                 duration_ms: started.elapsed().as_millis(),
@@ -1072,14 +1127,18 @@ impl Phase0JobHandler {
         }
     }
 
-    async fn handle_pipeline_search(&self, job: Job, ctx: ExecutionContext) -> JobExecutionOutcome {
+    async fn handle_pipeline_lexical(
+        &self,
+        job: Job,
+        ctx: ExecutionContext,
+    ) -> JobExecutionOutcome {
         let started = Instant::now();
-        let payload: PipelineSearchPayload = match serde_json::from_value(job.payload_json.clone())
+        let payload: PipelineLexicalPayload = match serde_json::from_value(job.payload_json.clone())
         {
             Ok(value) => value,
             Err(err) => {
                 return JobExecutionOutcome::Terminal {
-                    reason: format!("invalid pipeline_search payload: {err}"),
+                    reason: format!("invalid pipeline_lexical payload: {err}"),
                     kind: "payload".to_string(),
                     metrics: empty_metrics(started.elapsed().as_millis()),
                 };
@@ -1130,8 +1189,7 @@ impl Phase0JobHandler {
         let mut total_docs_upserted = 0u64;
         let mut total_ids_seen = 0u64;
         let mut family_results: Vec<SearchFamilyOutcome> = Vec::new();
-        let chunk_limit = self.settings.mail.commit_batch_size.max(1);
-        let mut embedding_jobs_enqueued = 0u64;
+        let chunk_limit = self.settings.meili.upsert_batch_size.max(1);
 
         for index in [
             MeiliIndexKind::ThreadDocs,
@@ -1219,38 +1277,10 @@ impl Phase0JobHandler {
                 chunks_done += 1;
                 ids_seen += ids.len() as u64;
 
-                if self.settings.embeddings.enabled {
-                    let scope = match index {
-                        MeiliIndexKind::ThreadDocs => Some(EmbeddingScope::Thread),
-                        MeiliIndexKind::PatchSeriesDocs => Some(EmbeddingScope::Series),
-                        MeiliIndexKind::PatchItemDocs => None,
-                    };
-                    if let Some(scope) = scope {
-                        match self
-                            .enqueue_embedding_generate_batch(
-                                &run.list_key,
-                                scope,
-                                &ids,
-                                Some(job.id),
-                                4,
-                            )
-                            .await
-                        {
-                            Ok(true) => embedding_jobs_enqueued += 1,
-                            Ok(false) => {}
-                            Err(err) => {
-                                warn!(
-                                    run_id = run.id,
-                                    scope = scope.as_str(),
-                                    error = %err,
-                                    "failed to enqueue embedding batch"
-                                );
-                            }
-                        }
-                    }
-                }
-
-                let docs = match self.build_docs_for_index(index, &ids).await {
+                let docs = match self
+                    .build_docs_for_index(index, &ids, VectorAttachmentMode::NullPlaceholder)
+                    .await
+                {
                     Ok(value) => value,
                     Err(err) => {
                         return retryable_error(
@@ -1312,7 +1342,7 @@ impl Phase0JobHandler {
         if let Err(err) = self.pipeline.mark_run_succeeded(run.id).await {
             return retryable_error(
                 format!(
-                    "failed to mark run {} succeeded after search stage: {err}",
+                    "failed to mark run {} succeeded after lexical stage: {err}",
                     run.id
                 ),
                 "db",
@@ -1334,15 +1364,40 @@ impl Phase0JobHandler {
             }
         }
 
+        let mut embedding_stage_enqueued = false;
+        if self.settings.embeddings.enabled {
+            match self
+                .enqueue_pipeline_embedding(
+                    run.id,
+                    &run.list_key,
+                    window_from,
+                    window_to,
+                    Some(job.id),
+                )
+                .await
+            {
+                Ok(true) => embedding_stage_enqueued = true,
+                Ok(false) => {}
+                Err(err) => {
+                    warn!(
+                        run_id = run.id,
+                        list_key = %run.list_key,
+                        error = %err,
+                        "failed to enqueue background embedding stage after lexical completion"
+                    );
+                }
+            }
+        }
+
         JobExecutionOutcome::Success {
             result_json: serde_json::json!({
                 "run_id": run.id,
                 "list_key": run.list_key,
-                "stage": STAGE_SEARCH,
+                "stage": STAGE_LEXICAL,
                 "total_docs_upserted": total_docs_upserted,
                 "total_ids_seen": total_ids_seen,
                 "families": family_results,
-                "embedding_jobs_enqueued": embedding_jobs_enqueued,
+                "embedding_stage_enqueued": embedding_stage_enqueued,
                 "run_state": "succeeded",
             }),
             metrics: JobStoreMetrics {
@@ -1350,6 +1405,177 @@ impl Phase0JobHandler {
                 rows_written: total_docs_upserted,
                 bytes_read: 0,
                 commit_count: total_ids_seen,
+                parse_errors: 0,
+            },
+        }
+    }
+
+    async fn handle_pipeline_embedding(
+        &self,
+        job: Job,
+        ctx: ExecutionContext,
+    ) -> JobExecutionOutcome {
+        let started = Instant::now();
+        let payload: PipelineEmbeddingPayload =
+            match serde_json::from_value(job.payload_json.clone()) {
+                Ok(value) => value,
+                Err(err) => {
+                    return JobExecutionOutcome::Terminal {
+                        reason: format!("invalid pipeline_embedding payload: {err}"),
+                        kind: "payload".to_string(),
+                        metrics: empty_metrics(started.elapsed().as_millis()),
+                    };
+                }
+            };
+
+        if !self.settings.embeddings.enabled {
+            return JobExecutionOutcome::Success {
+                result_json: serde_json::json!({
+                    "run_id": payload.run_id,
+                    "list_key": payload.list_key,
+                    "stage": STAGE_EMBEDDING,
+                    "skipped": "embeddings disabled",
+                }),
+                metrics: empty_metrics(started.elapsed().as_millis()),
+            };
+        }
+
+        let list = match self.catalog.get_mailing_list(&payload.list_key).await {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                return JobExecutionOutcome::Terminal {
+                    reason: format!("mailing list not found for list_key={}", payload.list_key),
+                    kind: "not_found".to_string(),
+                    metrics: empty_metrics(started.elapsed().as_millis()),
+                };
+            }
+            Err(err) => {
+                return retryable_error(
+                    format!("failed to load list {}: {err}", payload.list_key),
+                    "db",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+        };
+
+        let mut jobs_enqueued = 0u64;
+        let mut ids_seen = 0u64;
+        let chunk_limit = self.settings.meili.upsert_batch_size.max(1) as i64;
+
+        for scope in [EmbeddingScope::Thread, EmbeddingScope::Series] {
+            let mut id_cursor = 0i64;
+            loop {
+                if let Err(err) = ctx.heartbeat().await {
+                    warn!(job_id = job.id, error = %err, "heartbeat update failed");
+                }
+                match ctx.is_cancel_requested().await {
+                    Ok(true) => {
+                        return JobExecutionOutcome::Cancelled {
+                            reason: "cancel requested".to_string(),
+                            metrics: JobStoreMetrics {
+                                duration_ms: started.elapsed().as_millis(),
+                                rows_written: jobs_enqueued,
+                                bytes_read: 0,
+                                commit_count: ids_seen,
+                                parse_errors: 0,
+                            },
+                        };
+                    }
+                    Ok(false) => {}
+                    Err(err) => warn!(job_id = job.id, error = %err, "cancel check failed"),
+                }
+
+                let ids = match scope {
+                    EmbeddingScope::Thread => {
+                        self.pipeline
+                            .query_impacted_thread_ids_chunk(
+                                list.id,
+                                payload.window_from,
+                                payload.window_to,
+                                id_cursor,
+                                chunk_limit,
+                            )
+                            .await
+                    }
+                    EmbeddingScope::Series => {
+                        self.pipeline
+                            .query_impacted_series_ids_chunk(
+                                list.id,
+                                payload.window_from,
+                                payload.window_to,
+                                id_cursor,
+                                chunk_limit,
+                            )
+                            .await
+                    }
+                };
+                let ids = match ids {
+                    Ok(value) => value,
+                    Err(err) => {
+                        return retryable_error(
+                            format!(
+                                "failed to query impacted {} ids for run {}: {err}",
+                                scope.as_str(),
+                                payload.run_id,
+                            ),
+                            "db",
+                            &job,
+                            started.elapsed().as_millis(),
+                            &self.settings,
+                        );
+                    }
+                };
+                if ids.is_empty() {
+                    break;
+                }
+
+                id_cursor = *ids.last().unwrap_or(&id_cursor);
+                ids_seen += ids.len() as u64;
+                match self
+                    .enqueue_embedding_generate_batch(
+                        &payload.list_key,
+                        scope,
+                        &ids,
+                        Some(job.id),
+                        PRIORITY_EMBEDDING_BATCH,
+                    )
+                    .await
+                {
+                    Ok(true) => jobs_enqueued += 1,
+                    Ok(false) => {}
+                    Err(err) => {
+                        return retryable_error(
+                            format!(
+                                "failed to enqueue embedding_generate_batch for scope {}: {err}",
+                                scope.as_str()
+                            ),
+                            "db",
+                            &job,
+                            started.elapsed().as_millis(),
+                            &self.settings,
+                        );
+                    }
+                }
+            }
+        }
+
+        JobExecutionOutcome::Success {
+            result_json: serde_json::json!({
+                "run_id": payload.run_id,
+                "list_key": payload.list_key,
+                "stage": STAGE_EMBEDDING,
+                "window_from": payload.window_from,
+                "window_to": payload.window_to,
+                "ids_seen": ids_seen,
+                "embedding_jobs_enqueued": jobs_enqueued,
+            }),
+            metrics: JobStoreMetrics {
+                duration_ms: started.elapsed().as_millis(),
+                rows_written: jobs_enqueued,
+                bytes_read: 0,
+                commit_count: ids_seen,
                 parse_errors: 0,
             },
         }
@@ -1363,21 +1589,24 @@ impl Phase0JobHandler {
         list_key: &str,
         stage: &str,
     ) -> Result<(), sqlx::Error> {
-        let (job_type, payload_json) = match stage {
+        let (job_type, payload_json, priority) = match stage {
             STAGE_THREADING => (
                 "pipeline_threading",
                 serde_json::to_value(PipelineThreadingPayload { run_id })
                     .unwrap_or_else(|_| serde_json::json!({})),
+                PRIORITY_THREADING,
             ),
             STAGE_LINEAGE => (
                 "pipeline_lineage",
                 serde_json::to_value(PipelineLineagePayload { run_id })
                     .unwrap_or_else(|_| serde_json::json!({})),
+                PRIORITY_LINEAGE,
             ),
-            STAGE_SEARCH => (
-                "pipeline_search",
-                serde_json::to_value(PipelineSearchPayload { run_id })
+            STAGE_LEXICAL => (
+                "pipeline_lexical",
+                serde_json::to_value(PipelineLexicalPayload { run_id })
                     .unwrap_or_else(|_| serde_json::json!({})),
+                PRIORITY_LEXICAL,
             ),
             _ => return Ok(()),
         };
@@ -1386,7 +1615,7 @@ impl Phase0JobHandler {
             .enqueue(EnqueueJobParams {
                 job_type: job_type.to_string(),
                 payload_json,
-                priority: 10,
+                priority,
                 dedupe_scope: Some(format!("list:{list_key}:pipeline")),
                 dedupe_key: Some(format!("run:{run_id}:stage:{stage}")),
                 run_after: None,
@@ -1394,6 +1623,48 @@ impl Phase0JobHandler {
             })
             .await?;
         Ok(())
+    }
+
+    async fn enqueue_pipeline_embedding(
+        &self,
+        run_id: i64,
+        list_key: &str,
+        window_from: chrono::DateTime<Utc>,
+        window_to: chrono::DateTime<Utc>,
+        source_job_id: Option<i64>,
+    ) -> Result<bool, sqlx::Error> {
+        if !self.settings.embeddings.enabled {
+            return Ok(false);
+        }
+
+        let payload = PipelineEmbeddingPayload {
+            run_id,
+            list_key: list_key.to_string(),
+            window_from,
+            window_to,
+        };
+        let source = source_job_id.unwrap_or_default();
+        let dedupe_key = format!(
+            "run:{}:{}:{}:{}",
+            run_id,
+            source,
+            window_from.timestamp_millis(),
+            window_to.timestamp_millis()
+        );
+
+        self.jobs
+            .enqueue(EnqueueJobParams {
+                job_type: "pipeline_embedding".to_string(),
+                payload_json: serde_json::to_value(payload)
+                    .unwrap_or_else(|_| serde_json::json!({})),
+                priority: PRIORITY_PIPELINE_EMBEDDING,
+                dedupe_scope: Some(format!("list:{list_key}:pipeline")),
+                dedupe_key: Some(dedupe_key),
+                run_after: None,
+                max_attempts: Some(8),
+            })
+            .await?;
+        Ok(true)
     }
 
     /// Activate the next pending run in a batch and enqueue its ingest stage.
@@ -1412,7 +1683,7 @@ impl Phase0JobHandler {
                     job_type: "pipeline_ingest".to_string(),
                     payload_json: serde_json::to_value(payload)
                         .unwrap_or_else(|_| serde_json::json!({})),
-                    priority: 20,
+                    priority: PRIORITY_INGEST,
                     dedupe_scope: Some(format!("pipeline:run:{}", next_run.id)),
                     dedupe_key: Some("ingest".to_string()),
                     run_after: None,
@@ -2059,6 +2330,668 @@ impl Phase0JobHandler {
         }
     }
 
+    async fn handle_meili_bootstrap_run(
+        &self,
+        job: Job,
+        ctx: ExecutionContext,
+    ) -> JobExecutionOutcome {
+        let started = Instant::now();
+        let payload: MeiliBootstrapRunPayload =
+            match serde_json::from_value(job.payload_json.clone()) {
+                Ok(value) => value,
+                Err(err) => {
+                    return JobExecutionOutcome::Terminal {
+                        reason: format!("invalid meili_bootstrap_run payload: {err}"),
+                        kind: "payload".to_string(),
+                        metrics: empty_metrics(started.elapsed().as_millis()),
+                    };
+                }
+            };
+
+        if !self.settings.embeddings.enabled {
+            return JobExecutionOutcome::Terminal {
+                reason: "meili bootstrap requires embeddings.enabled=true".to_string(),
+                kind: "payload".to_string(),
+                metrics: empty_metrics(started.elapsed().as_millis()),
+            };
+        }
+
+        let mut run = match self
+            .embeddings
+            .get_meili_bootstrap_run(payload.run_id)
+            .await
+        {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                return JobExecutionOutcome::Terminal {
+                    reason: format!("meili_bootstrap_run {} not found", payload.run_id),
+                    kind: "not_found".to_string(),
+                    metrics: empty_metrics(started.elapsed().as_millis()),
+                };
+            }
+            Err(err) => {
+                return retryable_error(
+                    format!(
+                        "failed to load meili_bootstrap_run {}: {err}",
+                        payload.run_id
+                    ),
+                    "db",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+        };
+
+        if run.state == "queued" {
+            if let Err(err) = self.embeddings.mark_meili_bootstrap_running(run.id).await {
+                return retryable_error(
+                    format!(
+                        "failed to mark meili_bootstrap_run {} running: {err}",
+                        run.id
+                    ),
+                    "db",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+            run.state = "running".to_string();
+        }
+
+        if run.state != "running" {
+            return JobExecutionOutcome::Success {
+                result_json: serde_json::json!({
+                    "run_id": run.id,
+                    "skipped": format!("run is in state {}", run.state),
+                }),
+                metrics: empty_metrics(started.elapsed().as_millis()),
+            };
+        }
+
+        if run.scope != "embedding_indexes" {
+            let _ = self
+                .embeddings
+                .mark_meili_bootstrap_failed(
+                    run.id,
+                    format!("unsupported meili bootstrap scope {}", run.scope).as_str(),
+                )
+                .await;
+            return JobExecutionOutcome::Terminal {
+                reason: format!("unsupported meili bootstrap scope {}", run.scope),
+                kind: "payload".to_string(),
+                metrics: empty_metrics(started.elapsed().as_millis()),
+            };
+        }
+        if run.model_key != self.settings.embeddings.model {
+            let _ = self
+                .embeddings
+                .mark_meili_bootstrap_failed(
+                    run.id,
+                    format!(
+                        "unsupported model_key {} (configured model is {})",
+                        run.model_key, self.settings.embeddings.model
+                    )
+                    .as_str(),
+                )
+                .await;
+            return JobExecutionOutcome::Terminal {
+                reason: format!(
+                    "unsupported model_key {} (configured model is {})",
+                    run.model_key, self.settings.embeddings.model
+                ),
+                kind: "payload".to_string(),
+                metrics: empty_metrics(started.elapsed().as_millis()),
+            };
+        }
+        if run.embedder_name != self.settings.embeddings.embedder_name {
+            let _ = self
+                .embeddings
+                .mark_meili_bootstrap_failed(
+                    run.id,
+                    format!(
+                        "unsupported embedder_name {} (configured embedder is {})",
+                        run.embedder_name, self.settings.embeddings.embedder_name
+                    )
+                    .as_str(),
+                )
+                .await;
+            return JobExecutionOutcome::Terminal {
+                reason: format!(
+                    "unsupported embedder_name {} (configured embedder is {})",
+                    run.embedder_name, self.settings.embeddings.embedder_name
+                ),
+                kind: "payload".to_string(),
+                metrics: empty_metrics(started.elapsed().as_millis()),
+            };
+        }
+
+        for index in [MeiliIndexKind::ThreadDocs, MeiliIndexKind::PatchSeriesDocs] {
+            if let Err(err) = self.ensure_index_exists_only(index.spec(), &ctx).await {
+                return retryable_error(
+                    format!("failed to ensure index {} exists: {err}", index.uid()),
+                    "meili",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+        }
+
+        let chunk_limit = self.settings.meili.upsert_batch_size.max(1) as i64;
+        let list_key = run.list_key.clone();
+        let total_candidates_thread = match self
+            .embeddings
+            .count_candidate_ids("thread", list_key.as_deref(), None, None)
+            .await
+        {
+            Ok(value) => value,
+            Err(err) => {
+                return retryable_error(
+                    format!(
+                        "failed to count thread bootstrap candidates for run {}: {err}",
+                        run.id
+                    ),
+                    "db",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+        };
+        let total_candidates_series = match self
+            .embeddings
+            .count_candidate_ids("series", list_key.as_deref(), None, None)
+            .await
+        {
+            Ok(value) => value,
+            Err(err) => {
+                return retryable_error(
+                    format!(
+                        "failed to count series bootstrap candidates for run {}: {err}",
+                        run.id
+                    ),
+                    "db",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+        };
+
+        let mut thread_cursor_id = run.thread_cursor_id.max(0);
+        let mut series_cursor_id = run.series_cursor_id.max(0);
+        let mut processed_thread = run.processed_thread.max(0);
+        let mut processed_series = run.processed_series.max(0);
+        let mut docs_upserted = run.docs_upserted.max(0);
+        let mut vectors_attached = run.vectors_attached.max(0);
+        let mut placeholders_written = run.placeholders_written.max(0);
+        let mut failed_batches = run.failed_batches.max(0);
+
+        let persist_progress = |thread_cursor_id: i64,
+                                series_cursor_id: i64,
+                                processed_thread: i64,
+                                processed_series: i64,
+                                docs_upserted: i64,
+                                vectors_attached: i64,
+                                placeholders_written: i64,
+                                failed_batches: i64| {
+            serde_json::json!({
+                "scope": run.scope,
+                "list_key": run.list_key,
+                "thread_cursor_id": thread_cursor_id,
+                "series_cursor_id": series_cursor_id,
+                "total_candidates_thread": total_candidates_thread,
+                "total_candidates_series": total_candidates_series,
+                "processed_thread": processed_thread,
+                "processed_series": processed_series,
+                "docs_upserted": docs_upserted,
+                "vectors_attached": vectors_attached,
+                "placeholders_written": placeholders_written,
+                "failed_batches": failed_batches,
+            })
+        };
+
+        loop {
+            if let Err(err) = ctx.heartbeat().await {
+                warn!(job_id = job.id, error = %err, "heartbeat update failed");
+            }
+            match ctx.is_cancel_requested().await {
+                Ok(true) => {
+                    let _ = self
+                        .embeddings
+                        .mark_meili_bootstrap_cancelled(run.id, "cancel requested")
+                        .await;
+                    return JobExecutionOutcome::Cancelled {
+                        reason: "cancel requested".to_string(),
+                        metrics: JobStoreMetrics {
+                            duration_ms: started.elapsed().as_millis(),
+                            rows_written: docs_upserted as u64,
+                            bytes_read: 0,
+                            commit_count: (processed_thread + processed_series) as u64,
+                            parse_errors: failed_batches as u64,
+                        },
+                    };
+                }
+                Ok(false) => {}
+                Err(err) => warn!(job_id = job.id, error = %err, "cancel check failed"),
+            }
+
+            let ids = match self
+                .embeddings
+                .list_candidate_ids(
+                    "thread",
+                    list_key.as_deref(),
+                    None,
+                    None,
+                    thread_cursor_id,
+                    chunk_limit,
+                )
+                .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    failed_batches += 1;
+                    let progress_json = persist_progress(
+                        thread_cursor_id,
+                        series_cursor_id,
+                        processed_thread,
+                        processed_series,
+                        docs_upserted,
+                        vectors_attached,
+                        placeholders_written,
+                        failed_batches,
+                    );
+                    let _ = self
+                        .embeddings
+                        .update_meili_bootstrap_progress(
+                            run.id,
+                            thread_cursor_id,
+                            series_cursor_id,
+                            total_candidates_thread,
+                            total_candidates_series,
+                            processed_thread,
+                            processed_series,
+                            docs_upserted,
+                            vectors_attached,
+                            placeholders_written,
+                            failed_batches,
+                            progress_json,
+                        )
+                        .await;
+                    return retryable_error(
+                        format!("failed to list thread bootstrap candidates: {err}"),
+                        "db",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
+                }
+            };
+
+            if ids.is_empty() {
+                break;
+            }
+
+            match self
+                .upsert_meili_bootstrap_chunk(MeiliIndexKind::ThreadDocs, &ids, &ctx)
+                .await
+            {
+                Ok((rows, vectors, placeholders)) => {
+                    docs_upserted += rows as i64;
+                    vectors_attached += vectors;
+                    placeholders_written += placeholders;
+                    processed_thread += ids.len() as i64;
+                    if let Some(last_id) = ids.last() {
+                        thread_cursor_id = *last_id;
+                    }
+                }
+                Err(err) => {
+                    failed_batches += 1;
+                    let progress_json = persist_progress(
+                        thread_cursor_id,
+                        series_cursor_id,
+                        processed_thread,
+                        processed_series,
+                        docs_upserted,
+                        vectors_attached,
+                        placeholders_written,
+                        failed_batches,
+                    );
+                    let _ = self
+                        .embeddings
+                        .update_meili_bootstrap_progress(
+                            run.id,
+                            thread_cursor_id,
+                            series_cursor_id,
+                            total_candidates_thread,
+                            total_candidates_series,
+                            processed_thread,
+                            processed_series,
+                            docs_upserted,
+                            vectors_attached,
+                            placeholders_written,
+                            failed_batches,
+                            progress_json,
+                        )
+                        .await;
+                    return retryable_error(
+                        format!("failed to upsert thread bootstrap chunk: {err}"),
+                        "meili",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
+                }
+            }
+
+            let progress_json = persist_progress(
+                thread_cursor_id,
+                series_cursor_id,
+                processed_thread,
+                processed_series,
+                docs_upserted,
+                vectors_attached,
+                placeholders_written,
+                failed_batches,
+            );
+            if let Err(err) = self
+                .embeddings
+                .update_meili_bootstrap_progress(
+                    run.id,
+                    thread_cursor_id,
+                    series_cursor_id,
+                    total_candidates_thread,
+                    total_candidates_series,
+                    processed_thread,
+                    processed_series,
+                    docs_upserted,
+                    vectors_attached,
+                    placeholders_written,
+                    failed_batches,
+                    progress_json,
+                )
+                .await
+            {
+                return retryable_error(
+                    format!(
+                        "failed to update meili bootstrap progress for run {}: {err}",
+                        run.id
+                    ),
+                    "db",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+        }
+
+        loop {
+            if let Err(err) = ctx.heartbeat().await {
+                warn!(job_id = job.id, error = %err, "heartbeat update failed");
+            }
+            match ctx.is_cancel_requested().await {
+                Ok(true) => {
+                    let _ = self
+                        .embeddings
+                        .mark_meili_bootstrap_cancelled(run.id, "cancel requested")
+                        .await;
+                    return JobExecutionOutcome::Cancelled {
+                        reason: "cancel requested".to_string(),
+                        metrics: JobStoreMetrics {
+                            duration_ms: started.elapsed().as_millis(),
+                            rows_written: docs_upserted as u64,
+                            bytes_read: 0,
+                            commit_count: (processed_thread + processed_series) as u64,
+                            parse_errors: failed_batches as u64,
+                        },
+                    };
+                }
+                Ok(false) => {}
+                Err(err) => warn!(job_id = job.id, error = %err, "cancel check failed"),
+            }
+
+            let ids = match self
+                .embeddings
+                .list_candidate_ids(
+                    "series",
+                    list_key.as_deref(),
+                    None,
+                    None,
+                    series_cursor_id,
+                    chunk_limit,
+                )
+                .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    failed_batches += 1;
+                    let progress_json = persist_progress(
+                        thread_cursor_id,
+                        series_cursor_id,
+                        processed_thread,
+                        processed_series,
+                        docs_upserted,
+                        vectors_attached,
+                        placeholders_written,
+                        failed_batches,
+                    );
+                    let _ = self
+                        .embeddings
+                        .update_meili_bootstrap_progress(
+                            run.id,
+                            thread_cursor_id,
+                            series_cursor_id,
+                            total_candidates_thread,
+                            total_candidates_series,
+                            processed_thread,
+                            processed_series,
+                            docs_upserted,
+                            vectors_attached,
+                            placeholders_written,
+                            failed_batches,
+                            progress_json,
+                        )
+                        .await;
+                    return retryable_error(
+                        format!("failed to list series bootstrap candidates: {err}"),
+                        "db",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
+                }
+            };
+
+            if ids.is_empty() {
+                break;
+            }
+
+            match self
+                .upsert_meili_bootstrap_chunk(MeiliIndexKind::PatchSeriesDocs, &ids, &ctx)
+                .await
+            {
+                Ok((rows, vectors, placeholders)) => {
+                    docs_upserted += rows as i64;
+                    vectors_attached += vectors;
+                    placeholders_written += placeholders;
+                    processed_series += ids.len() as i64;
+                    if let Some(last_id) = ids.last() {
+                        series_cursor_id = *last_id;
+                    }
+                }
+                Err(err) => {
+                    failed_batches += 1;
+                    let progress_json = persist_progress(
+                        thread_cursor_id,
+                        series_cursor_id,
+                        processed_thread,
+                        processed_series,
+                        docs_upserted,
+                        vectors_attached,
+                        placeholders_written,
+                        failed_batches,
+                    );
+                    let _ = self
+                        .embeddings
+                        .update_meili_bootstrap_progress(
+                            run.id,
+                            thread_cursor_id,
+                            series_cursor_id,
+                            total_candidates_thread,
+                            total_candidates_series,
+                            processed_thread,
+                            processed_series,
+                            docs_upserted,
+                            vectors_attached,
+                            placeholders_written,
+                            failed_batches,
+                            progress_json,
+                        )
+                        .await;
+                    return retryable_error(
+                        format!("failed to upsert series bootstrap chunk: {err}"),
+                        "meili",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
+                }
+            }
+
+            let progress_json = persist_progress(
+                thread_cursor_id,
+                series_cursor_id,
+                processed_thread,
+                processed_series,
+                docs_upserted,
+                vectors_attached,
+                placeholders_written,
+                failed_batches,
+            );
+            if let Err(err) = self
+                .embeddings
+                .update_meili_bootstrap_progress(
+                    run.id,
+                    thread_cursor_id,
+                    series_cursor_id,
+                    total_candidates_thread,
+                    total_candidates_series,
+                    processed_thread,
+                    processed_series,
+                    docs_upserted,
+                    vectors_attached,
+                    placeholders_written,
+                    failed_batches,
+                    progress_json,
+                )
+                .await
+            {
+                return retryable_error(
+                    format!(
+                        "failed to update meili bootstrap progress for run {}: {err}",
+                        run.id
+                    ),
+                    "db",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+        }
+
+        for index in [MeiliIndexKind::ThreadDocs, MeiliIndexKind::PatchSeriesDocs] {
+            let settings = self.meili_index_settings(index);
+            if let Err(err) = self
+                .ensure_index_settings(index.spec(), &settings, &ctx)
+                .await
+            {
+                failed_batches += 1;
+                let progress_json = persist_progress(
+                    thread_cursor_id,
+                    series_cursor_id,
+                    processed_thread,
+                    processed_series,
+                    docs_upserted,
+                    vectors_attached,
+                    placeholders_written,
+                    failed_batches,
+                );
+                let _ = self
+                    .embeddings
+                    .update_meili_bootstrap_progress(
+                        run.id,
+                        thread_cursor_id,
+                        series_cursor_id,
+                        total_candidates_thread,
+                        total_candidates_series,
+                        processed_thread,
+                        processed_series,
+                        docs_upserted,
+                        vectors_attached,
+                        placeholders_written,
+                        failed_batches,
+                        progress_json,
+                    )
+                    .await;
+                return retryable_error(
+                    format!(
+                        "failed to apply final index settings for {} during bootstrap: {err}",
+                        index.uid()
+                    ),
+                    "meili",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+        }
+
+        let result_json = serde_json::json!({
+            "run_id": run.id,
+            "scope": run.scope,
+            "list_key": run.list_key,
+            "total_candidates_thread": total_candidates_thread,
+            "total_candidates_series": total_candidates_series,
+            "processed_thread": processed_thread,
+            "processed_series": processed_series,
+            "docs_upserted": docs_upserted,
+            "vectors_attached": vectors_attached,
+            "placeholders_written": placeholders_written,
+            "failed_batches": failed_batches,
+            "model_key": run.model_key,
+            "embedder_name": run.embedder_name,
+        });
+
+        if let Err(err) = self
+            .embeddings
+            .mark_meili_bootstrap_succeeded(run.id, result_json.clone())
+            .await
+        {
+            return retryable_error(
+                format!(
+                    "failed to mark meili bootstrap run {} succeeded: {err}",
+                    run.id
+                ),
+                "db",
+                &job,
+                started.elapsed().as_millis(),
+                &self.settings,
+            );
+        }
+
+        JobExecutionOutcome::Success {
+            result_json,
+            metrics: JobStoreMetrics {
+                duration_ms: started.elapsed().as_millis(),
+                rows_written: docs_upserted as u64,
+                bytes_read: 0,
+                commit_count: (processed_thread + processed_series) as u64,
+                parse_errors: failed_batches as u64,
+            },
+        }
+    }
+
     async fn handle_embedding_backfill_run(
         &self,
         job: Job,
@@ -2127,7 +3060,7 @@ impl Phase0JobHandler {
                 metrics: empty_metrics(started.elapsed().as_millis()),
             };
         };
-        let chunk_limit = self.settings.mail.commit_batch_size.max(1) as i64;
+        let chunk_limit = self.settings.meili.upsert_batch_size.max(1) as i64;
         let list_key = run.list_key.clone().unwrap_or_else(|| "global".to_string());
         let total_candidates = match self
             .embeddings
@@ -2220,7 +3153,13 @@ impl Phase0JobHandler {
             processed += ids.len() as i64;
 
             match self
-                .enqueue_embedding_generate_batch(&list_key, scope, &ids, Some(job.id), 4)
+                .enqueue_embedding_generate_batch(
+                    &list_key,
+                    scope,
+                    &ids,
+                    Some(job.id),
+                    PRIORITY_EMBEDDING_BATCH,
+                )
                 .await
             {
                 Ok(true) => jobs_enqueued += 1,
@@ -2433,14 +3372,7 @@ impl Phase0JobHandler {
             };
         }
 
-        let batch_size = self
-            .settings
-            .embeddings
-            .batch_size
-            .max(1)
-            .saturating_mul(self.settings.embeddings.max_inflight_requests.max(1));
-        let min_interval = self.settings.embeddings.min_request_interval_ms;
-        let chunk_count = inputs.chunks(batch_size).len();
+        let batch_size = self.settings.embeddings.batch_size.max(1);
         let mut upserts: Vec<EmbeddingVectorUpsert> = Vec::with_capacity(inputs.len());
         let mut bytes_read = 0u64;
         let mut request_count = 0u64;
@@ -2513,10 +3445,6 @@ impl Phase0JobHandler {
                     vector,
                     source_hash: row.source_hash.clone(),
                 });
-            }
-
-            if min_interval > 0 && idx + 1 < chunk_count {
-                sleep(Duration::from_millis(min_interval)).await;
             }
         }
 
@@ -2611,6 +3539,63 @@ impl Phase0JobHandler {
         Ok(())
     }
 
+    async fn ensure_index_exists_only(
+        &self,
+        index_spec: &'static nexus_core::search::MeiliIndexSpec,
+        ctx: &ExecutionContext,
+    ) -> Result<(), MeiliClientError> {
+        if let Some(task_uid) = self.meili.ensure_index_exists(index_spec).await? {
+            match self.wait_for_task(task_uid, ctx).await {
+                Ok(()) => {}
+                Err(MeiliClientError::Protocol(message))
+                    if message.contains("code=index_already_exists") => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(())
+    }
+
+    async fn upsert_meili_bootstrap_chunk(
+        &self,
+        index: MeiliIndexKind,
+        ids: &[i64],
+        ctx: &ExecutionContext,
+    ) -> Result<(u64, i64, i64), MeiliClientError> {
+        let docs = self
+            .build_docs_for_index(index, ids, VectorAttachmentMode::StoredVector)
+            .await
+            .map_err(|err| MeiliClientError::Protocol(format!("doc build: {err}")))?;
+        if docs.is_empty() {
+            return Ok((0, 0, 0));
+        }
+
+        let embedder_name = self.settings.embeddings.embedder_name.as_str();
+        let mut vectors_attached = 0i64;
+        let mut placeholders_written = 0i64;
+        for doc in &docs {
+            let Some(obj) = doc.as_object() else {
+                continue;
+            };
+            let Some(vector_map) = obj.get("_vectors").and_then(serde_json::Value::as_object)
+            else {
+                continue;
+            };
+            let Some(entry) = vector_map.get(embedder_name) else {
+                continue;
+            };
+            if entry.is_array() {
+                vectors_attached += 1;
+            } else if entry.is_null() {
+                placeholders_written += 1;
+            }
+        }
+
+        let task_uid = self.meili.upsert_documents(index.spec().uid, &docs).await?;
+        self.wait_for_task(task_uid, ctx).await?;
+
+        Ok((docs.len() as u64, vectors_attached, placeholders_written))
+    }
+
     async fn wait_for_task(
         &self,
         task_uid: i64,
@@ -2665,6 +3650,7 @@ impl Phase0JobHandler {
         &self,
         index: MeiliIndexKind,
         ids: &[i64],
+        vector_mode: VectorAttachmentMode,
     ) -> nexus_db::Result<Vec<serde_json::Value>> {
         let mut docs = match index {
             MeiliIndexKind::PatchItemDocs => self.search.build_patch_item_docs(ids).await?,
@@ -2685,23 +3671,33 @@ impl Phase0JobHandler {
             return Ok(docs);
         };
 
-        let vectors = self
-            .embeddings
-            .get_vectors(scope.as_str(), &self.settings.embeddings.model, ids)
-            .await?;
+        let vectors = match vector_mode {
+            VectorAttachmentMode::StoredVector => Some(
+                self.embeddings
+                    .get_vectors(scope.as_str(), &self.settings.embeddings.model, ids)
+                    .await?,
+            ),
+            VectorAttachmentMode::NullPlaceholder => None,
+        };
         let embedder_name = self.settings.embeddings.embedder_name.clone();
 
         for doc in &mut docs {
             let Some(doc_obj) = doc.as_object_mut() else {
                 continue;
             };
-            let Some(id) = doc_obj.get("id").and_then(|value| value.as_i64()) else {
-                continue;
+            let vector_value = match vector_mode {
+                VectorAttachmentMode::StoredVector => {
+                    let Some(id) = doc_obj.get("id").and_then(|value| value.as_i64()) else {
+                        continue;
+                    };
+                    vectors
+                        .as_ref()
+                        .and_then(|map| map.get(&id))
+                        .map(|vector| serde_json::json!(vector))
+                        .unwrap_or(serde_json::Value::Null)
+                }
+                VectorAttachmentMode::NullPlaceholder => serde_json::Value::Null,
             };
-            let vector_value = vectors
-                .get(&id)
-                .map(|vector| serde_json::json!(vector))
-                .unwrap_or(serde_json::Value::Null);
             doc_obj.insert(
                 "_vectors".to_string(),
                 serde_json::json!({
@@ -2743,12 +3739,12 @@ impl Phase0JobHandler {
         }
 
         let index_spec = index.spec();
-        let chunk_limit = self.settings.mail.commit_batch_size.max(1);
+        let chunk_limit = self.settings.meili.upsert_batch_size.max(1);
         let mut docs_upserted = 0u64;
 
         for chunk in ids.chunks(chunk_limit) {
             let docs = self
-                .build_docs_for_index(index, chunk)
+                .build_docs_for_index(index, chunk, VectorAttachmentMode::StoredVector)
                 .await
                 .map_err(|err| MeiliClientError::Protocol(format!("doc build: {err}")))?;
             if docs.is_empty() {
@@ -2843,6 +3839,12 @@ impl Phase0JobHandler {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VectorAttachmentMode {
+    StoredVector,
+    NullPlaceholder,
+}
+
 #[derive(Debug, Clone, serde::Serialize, Default)]
 struct SearchFamilyOutcome {
     artifact_kind: String,
@@ -2872,6 +3874,7 @@ struct ThreadingEpochWindow {
 
 fn build_threading_epoch_windows(
     repos: &[MailingListRepo],
+    start_epoch: Option<i64>,
 ) -> std::result::Result<Vec<ThreadingEpochWindow>, String> {
     if repos.is_empty() {
         return Err("no repositories available for epoch threading".to_string());
@@ -2895,18 +3898,30 @@ fn build_threading_epoch_windows(
         epoch_groups.push((epoch, vec![repo.id]));
     }
 
-    if epoch_groups.len() == 1 {
-        let (epoch, repo_ids) = &epoch_groups[0];
+    let start_idx = match start_epoch {
+        Some(value) => epoch_groups
+            .iter()
+            .position(|(epoch, _)| *epoch >= value)
+            .unwrap_or_else(|| epoch_groups.len().saturating_sub(1)),
+        None => 0,
+    };
+    let scoped = &epoch_groups[start_idx..];
+    if scoped.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if scoped.len() == 1 {
+        let (epoch, repo_ids) = &scoped[0];
         return Ok(vec![ThreadingEpochWindow {
             epochs: vec![*epoch],
             repo_ids: repo_ids.clone(),
         }]);
     }
 
-    let mut windows = Vec::with_capacity(epoch_groups.len() - 1);
-    for idx in 0..(epoch_groups.len() - 1) {
-        let (left_epoch, left_ids) = &epoch_groups[idx];
-        let (right_epoch, right_ids) = &epoch_groups[idx + 1];
+    let mut windows = Vec::with_capacity(scoped.len() - 1);
+    for idx in 0..(scoped.len() - 1) {
+        let (left_epoch, left_ids) = &scoped[idx];
+        let (right_epoch, right_ids) = &scoped[idx + 1];
         let mut repo_ids = Vec::with_capacity(left_ids.len() + right_ids.len());
         repo_ids.extend(left_ids.iter().copied());
         repo_ids.extend(right_ids.iter().copied());
@@ -3432,7 +4447,7 @@ mod tests {
             make_repo(12, "git/2.git"),
         ];
 
-        let windows = build_threading_epoch_windows(&repos).expect("build epoch windows");
+        let windows = build_threading_epoch_windows(&repos, None).expect("build epoch windows");
         assert_eq!(windows.len(), 2);
         assert_eq!(windows[0].epochs, vec![0, 1]);
         assert_eq!(windows[0].repo_ids, vec![10, 11]);
@@ -3444,9 +4459,24 @@ mod tests {
     fn build_threading_epoch_windows_single_epoch_is_single_window() {
         let repos = vec![make_repo(42, "git/7.git")];
 
-        let windows = build_threading_epoch_windows(&repos).expect("build epoch windows");
+        let windows = build_threading_epoch_windows(&repos, None).expect("build epoch windows");
         assert_eq!(windows.len(), 1);
         assert_eq!(windows[0].epochs, vec![7]);
         assert_eq!(windows[0].repo_ids, vec![42]);
+    }
+
+    #[test]
+    fn build_threading_epoch_windows_can_start_from_prior_epoch() {
+        let repos = vec![
+            make_repo(10, "git/0.git"),
+            make_repo(11, "git/1.git"),
+            make_repo(12, "git/2.git"),
+            make_repo(13, "git/3.git"),
+        ];
+
+        let windows = build_threading_epoch_windows(&repos, Some(2)).expect("build epoch windows");
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].epochs, vec![2, 3]);
+        assert_eq!(windows[0].repo_ids, vec![12, 13]);
     }
 }
