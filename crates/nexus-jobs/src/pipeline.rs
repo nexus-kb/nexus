@@ -538,20 +538,49 @@ impl Phase0JobHandler {
             }
         };
 
-        let batch_limit = self.settings.mail.commit_batch_size.max(1) as i64;
-        let checkpoint_interval = self.settings.worker.progress_checkpoint_interval.max(1) as u64;
-        let mut cursor = 0i64;
-        let mut anchors = Vec::new();
+        let repos = match self.catalog.list_repos_for_list(&run.list_key).await {
+            Ok(value) => order_repos_for_ingest(value),
+            Err(err) => {
+                return retryable_error(
+                    format!("failed to list repos for list {}: {err}", run.list_key),
+                    "db",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+        };
+        if repos.is_empty() {
+            return JobExecutionOutcome::Terminal {
+                reason: format!("no repos found for list {}", run.list_key),
+                kind: "pipeline_state".to_string(),
+                metrics: empty_metrics(started.elapsed().as_millis()),
+            };
+        }
+
+        let windows = match build_threading_epoch_windows(&repos) {
+            Ok(value) => value,
+            Err(reason) => {
+                return JobExecutionOutcome::Terminal {
+                    reason,
+                    kind: "pipeline_state".to_string(),
+                    metrics: empty_metrics(started.elapsed().as_millis()),
+                };
+            }
+        };
+
+        let epoch_windows_total = windows.len() as u64;
+        let mut epoch_windows_done = 0u64;
+        let mut processed_windows = 0u64;
+        let mut last_window_epochs: Vec<i64> = Vec::new();
         let mut anchors_scanned = 0u64;
         let mut messages_processed = 0u64;
-        let mut threads_created = 0u64;
         let mut threads_updated = 0u64;
         let mut apply_stats = ThreadingApplyStats::default();
         let mut source_messages_read = 0u64;
         let mut anchors_deduped = 0u64;
-        let mut items_since_checkpoint = 0u64;
 
-        loop {
+        for window in windows {
             if let Err(err) = ctx.heartbeat().await {
                 warn!(job_id = job.id, error = %err, "heartbeat update failed");
             }
@@ -563,7 +592,8 @@ impl Phase0JobHandler {
                             duration_ms: started.elapsed().as_millis(),
                             rows_written: apply_stats.threads_rebuilt
                                 + apply_stats.nodes_written
-                                + apply_stats.messages_written,
+                                + apply_stats.messages_written
+                                + apply_stats.stale_threads_removed,
                             bytes_read: 0,
                             commit_count: messages_processed,
                             parse_errors: 0,
@@ -574,14 +604,13 @@ impl Phase0JobHandler {
                 Err(err) => warn!(job_id = job.id, error = %err, "cancel check failed"),
             }
 
-            let chunk = match self
+            let anchors = match self
                 .pipeline
-                .query_ingest_window_message_pks(
+                .query_ingest_window_message_pks_for_repo_ids(
                     run.mailing_list_id,
                     window_from,
                     window_to,
-                    cursor,
-                    batch_limit,
+                    &window.repo_ids,
                 )
                 .await
             {
@@ -600,44 +629,76 @@ impl Phase0JobHandler {
                 }
             };
 
-            if chunk.is_empty() {
-                break;
-            }
-            let chunk_len = chunk.len() as u64;
-            cursor = *chunk.last().unwrap_or(&cursor);
-            anchors_scanned += chunk_len;
-            anchors.extend(chunk);
-            messages_processed = anchors_scanned;
-
-            items_since_checkpoint += chunk_len;
-            if items_since_checkpoint >= checkpoint_interval {
-                items_since_checkpoint = 0;
-                let progress = serde_json::json!({
-                    "stage": STAGE_THREADING,
-                    "messages_total": anchors_scanned,
-                    "messages_processed": messages_processed,
-                    "threads_created": threads_created,
-                    "threads_updated": threads_updated,
-                    "anchors_scanned": anchors_scanned,
-                    "anchors_deduped": anchors_deduped,
-                    "source_messages_read": source_messages_read,
-                    "threads_rewritten": apply_stats.threads_rebuilt,
-                    "threads_unchanged_skipped": apply_stats.threads_unchanged_skipped,
-                    "stale_threads_removed": apply_stats.stale_threads_removed,
-                });
-                if let Err(err) = self.pipeline.update_run_progress(run.id, progress).await {
-                    warn!(run_id = run.id, error = %err, "progress checkpoint failed");
+            // Missing-reference fallback is handled inside apply_threading_for_anchors:
+            // reference chains are resolved through message_id_map, and impacted existing
+            // thread members are loaded from DB before rebuilding components.
+            let outcome = if anchors.is_empty() {
+                ThreadingWindowOutcome::default()
+            } else {
+                match self
+                    .apply_threading_for_anchors(run.mailing_list_id, &run.list_key, anchors)
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(err) => {
+                        return retryable_error(
+                            format!("failed to apply threading stage for run {}: {err}", run.id),
+                            "db",
+                            &job,
+                            started.elapsed().as_millis(),
+                            &self.settings,
+                        );
+                    }
                 }
-                info!(
-                    target: "worker_job",
-                    run_id = run.id,
-                    list_key = %run.list_key,
-                    stage = STAGE_THREADING,
-                    items_processed = messages_processed,
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    "pipeline checkpoint"
-                );
+            };
+
+            processed_windows += 1;
+            epoch_windows_done += 1;
+            last_window_epochs = window.epochs.clone();
+            anchors_scanned += outcome.anchors_scanned;
+            messages_processed = anchors_scanned;
+            anchors_deduped += outcome.anchors_deduped;
+            source_messages_read += outcome.source_messages_read;
+            threads_updated += outcome.affected_threads;
+
+            apply_stats.threads_rebuilt += outcome.apply_stats.threads_rebuilt;
+            apply_stats.threads_unchanged_skipped += outcome.apply_stats.threads_unchanged_skipped;
+            apply_stats.nodes_written += outcome.apply_stats.nodes_written;
+            apply_stats.dummy_nodes_written += outcome.apply_stats.dummy_nodes_written;
+            apply_stats.messages_written += outcome.apply_stats.messages_written;
+            apply_stats.stale_threads_removed += outcome.apply_stats.stale_threads_removed;
+
+            let progress = serde_json::json!({
+                "stage": STAGE_THREADING,
+                "mode": "epoch_window",
+                "epoch_windows_total": epoch_windows_total,
+                "epoch_windows_done": epoch_windows_done,
+                "window_epochs": window.epochs,
+                "processed_windows": processed_windows,
+                "processed_chunks": processed_windows,
+                "messages_total": messages_processed,
+                "messages_processed": messages_processed,
+                "threads_created": apply_stats.threads_rebuilt,
+                "threads_updated": threads_updated,
+                "anchors_scanned": anchors_scanned,
+                "anchors_deduped": anchors_deduped,
+                "source_messages_read": source_messages_read,
+                "threads_rewritten": apply_stats.threads_rebuilt,
+                "threads_unchanged_skipped": apply_stats.threads_unchanged_skipped,
+                "stale_threads_removed": apply_stats.stale_threads_removed,
+            });
+            if let Err(err) = self.pipeline.update_run_progress(run.id, progress).await {
+                warn!(run_id = run.id, error = %err, "progress checkpoint failed");
             }
+            info!(
+                target: "worker_job",
+                run_id = run.id,
+                list_key = %run.list_key,
+                stage = STAGE_THREADING,
+                items_processed = messages_processed,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "pipeline checkpoint"
+            );
         }
 
         if let Err(err) = ctx.heartbeat().await {
@@ -651,7 +712,8 @@ impl Phase0JobHandler {
                         duration_ms: started.elapsed().as_millis(),
                         rows_written: apply_stats.threads_rebuilt
                             + apply_stats.nodes_written
-                            + apply_stats.messages_written,
+                            + apply_stats.messages_written
+                            + apply_stats.stale_threads_removed,
                         bytes_read: 0,
                         commit_count: messages_processed,
                         parse_errors: 0,
@@ -662,35 +724,17 @@ impl Phase0JobHandler {
             Err(err) => warn!(job_id = job.id, error = %err, "cancel check failed"),
         }
 
-        let outcome = match self
-            .apply_threading_for_anchors(run.mailing_list_id, &run.list_key, anchors)
-            .await
-        {
-            Ok(value) => value,
-            Err(err) => {
-                return retryable_error(
-                    format!("failed to apply threading stage for run {}: {err}", run.id),
-                    "db",
-                    &job,
-                    started.elapsed().as_millis(),
-                    &self.settings,
-                );
-            }
-        };
-
-        anchors_scanned = outcome.anchors_scanned;
-        messages_processed = anchors_scanned;
-        anchors_deduped = outcome.anchors_deduped;
-        source_messages_read = outcome.source_messages_read;
-        threads_created = outcome.apply_stats.threads_rebuilt;
-        threads_updated = outcome.affected_threads;
-        apply_stats = outcome.apply_stats;
-
         let final_progress = serde_json::json!({
             "stage": STAGE_THREADING,
-            "messages_total": anchors_scanned,
+            "mode": "epoch_window",
+            "epoch_windows_total": epoch_windows_total,
+            "epoch_windows_done": epoch_windows_done,
+            "window_epochs": last_window_epochs,
+            "processed_windows": processed_windows,
+            "processed_chunks": processed_windows,
+            "messages_total": messages_processed,
             "messages_processed": messages_processed,
-            "threads_created": threads_created,
+            "threads_created": apply_stats.threads_rebuilt,
             "threads_updated": threads_updated,
             "anchors_scanned": anchors_scanned,
             "anchors_deduped": anchors_deduped,
@@ -752,9 +796,15 @@ impl Phase0JobHandler {
                 "run_id": run.id,
                 "list_key": run.list_key,
                 "stage": STAGE_THREADING,
-                "messages_total": anchors_scanned,
+                "mode": "epoch_window",
+                "epoch_windows_total": epoch_windows_total,
+                "epoch_windows_done": epoch_windows_done,
+                "window_epochs": last_window_epochs,
+                "processed_windows": processed_windows,
+                "processed_chunks": processed_windows,
+                "messages_total": messages_processed,
                 "messages_processed": messages_processed,
-                "threads_created": threads_created,
+                "threads_created": apply_stats.threads_rebuilt,
                 "threads_updated": threads_updated,
                 "anchors_scanned": anchors_scanned,
                 "anchors_deduped": anchors_deduped,
@@ -2814,6 +2864,61 @@ struct ThreadingWindowOutcome {
     impacted_thread_ids: Vec<i64>,
 }
 
+#[derive(Debug, Clone)]
+struct ThreadingEpochWindow {
+    epochs: Vec<i64>,
+    repo_ids: Vec<i64>,
+}
+
+fn build_threading_epoch_windows(
+    repos: &[MailingListRepo],
+) -> std::result::Result<Vec<ThreadingEpochWindow>, String> {
+    if repos.is_empty() {
+        return Err("no repositories available for epoch threading".to_string());
+    }
+
+    let mut epoch_groups: Vec<(i64, Vec<i64>)> = Vec::new();
+    for repo in repos {
+        let Some(epoch) = parse_epoch_repo_relpath(&repo.repo_relpath) else {
+            return Err(format!(
+                "repo {} is not epoch formatted (expected git/<n>.git)",
+                repo.repo_relpath
+            ));
+        };
+
+        if let Some((last_epoch, repo_ids)) = epoch_groups.last_mut()
+            && *last_epoch == epoch
+        {
+            repo_ids.push(repo.id);
+            continue;
+        }
+        epoch_groups.push((epoch, vec![repo.id]));
+    }
+
+    if epoch_groups.len() == 1 {
+        let (epoch, repo_ids) = &epoch_groups[0];
+        return Ok(vec![ThreadingEpochWindow {
+            epochs: vec![*epoch],
+            repo_ids: repo_ids.clone(),
+        }]);
+    }
+
+    let mut windows = Vec::with_capacity(epoch_groups.len() - 1);
+    for idx in 0..(epoch_groups.len() - 1) {
+        let (left_epoch, left_ids) = &epoch_groups[idx];
+        let (right_epoch, right_ids) = &epoch_groups[idx + 1];
+        let mut repo_ids = Vec::with_capacity(left_ids.len() + right_ids.len());
+        repo_ids.extend(left_ids.iter().copied());
+        repo_ids.extend(right_ids.iter().copied());
+        windows.push(ThreadingEpochWindow {
+            epochs: vec![*left_epoch, *right_epoch],
+            repo_ids,
+        });
+    }
+
+    Ok(windows)
+}
+
 struct RawCommitMail {
     index: usize,
     commit_oid: String,
@@ -3275,7 +3380,21 @@ fn read_mail_blob(repo: &gix::Repository, commit_oid: &str) -> anyhow::Result<Op
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_epoch_repo_relpath, partition_commit_oids};
+    use chrono::Utc;
+    use nexus_db::MailingListRepo;
+
+    use super::{build_threading_epoch_windows, parse_epoch_repo_relpath, partition_commit_oids};
+
+    fn make_repo(id: i64, relpath: &str) -> MailingListRepo {
+        MailingListRepo {
+            id,
+            mailing_list_id: 1,
+            repo_key: relpath.to_string(),
+            repo_relpath: relpath.to_string(),
+            active: true,
+            created_at: Utc::now(),
+        }
+    }
 
     #[test]
     fn parse_epoch_repo_relpath_extracts_epoch() {
@@ -3303,5 +3422,31 @@ mod tests {
             lanes.iter().map(Vec::len).collect::<Vec<_>>(),
             vec![2, 2, 2, 2]
         );
+    }
+
+    #[test]
+    fn build_threading_epoch_windows_slides_by_one() {
+        let repos = vec![
+            make_repo(10, "git/0.git"),
+            make_repo(11, "git/1.git"),
+            make_repo(12, "git/2.git"),
+        ];
+
+        let windows = build_threading_epoch_windows(&repos).expect("build epoch windows");
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].epochs, vec![0, 1]);
+        assert_eq!(windows[0].repo_ids, vec![10, 11]);
+        assert_eq!(windows[1].epochs, vec![1, 2]);
+        assert_eq!(windows[1].repo_ids, vec![11, 12]);
+    }
+
+    #[test]
+    fn build_threading_epoch_windows_single_epoch_is_single_window() {
+        let repos = vec![make_repo(42, "git/7.git")];
+
+        let windows = build_threading_epoch_windows(&repos).expect("build epoch windows");
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].epochs, vec![7]);
+        assert_eq!(windows[0].repo_ids, vec![42]);
     }
 }
