@@ -23,6 +23,8 @@ static BASE_COMMIT_RE: Lazy<Regex> =
 
 #[derive(Debug, Clone, Default)]
 pub struct PatchExtractOutcome {
+    pub source_threads_scanned: u64,
+    pub source_messages_read: u64,
     pub series_versions_written: u64,
     pub patch_items_written: u64,
     pub patch_item_ids: Vec<i64>,
@@ -93,20 +95,54 @@ pub async fn process_patch_extract_window(
         .await
         .context("load lineage source messages")?;
 
+    process_patch_extract_source_messages(store, mailing_list_id, source_messages)
+        .await
+        .context("process lineage source messages")
+}
+
+pub async fn process_patch_extract_threads(
+    store: &LineageStore,
+    mailing_list_id: i64,
+    thread_ids: &[i64],
+) -> anyhow::Result<PatchExtractOutcome> {
+    let source_messages = store
+        .load_messages_for_threads(mailing_list_id, thread_ids)
+        .await
+        .context("load lineage source messages for threads")?;
+
+    process_patch_extract_source_messages(store, mailing_list_id, source_messages)
+        .await
+        .context("process lineage source messages")
+}
+
+async fn process_patch_extract_source_messages(
+    store: &LineageStore,
+    mailing_list_id: i64,
+    source_messages: Vec<LineageSourceMessage>,
+) -> anyhow::Result<PatchExtractOutcome> {
+    let mut output = PatchExtractOutcome {
+        source_threads_scanned: source_messages
+            .iter()
+            .map(|message| message.thread_id)
+            .collect::<BTreeSet<_>>()
+            .len() as u64,
+        source_messages_read: source_messages.len() as u64,
+        ..PatchExtractOutcome::default()
+    };
+
     if source_messages.is_empty() {
-        return Ok(PatchExtractOutcome::default());
+        return Ok(output);
     }
 
     let mut memo = PatchIdMemo::default();
     let mut candidates = build_candidates(source_messages, &mut memo);
 
     if candidates.is_empty() {
-        return Ok(PatchExtractOutcome::default());
+        return Ok(output);
     }
 
     candidates.sort_by_key(|v| (v.sent_at, v.thread_id, v.version_num));
 
-    let mut output = PatchExtractOutcome::default();
     let mut seen_series_ids = BTreeSet::new();
 
     for candidate in candidates {
@@ -966,7 +1002,7 @@ mod tests {
     use crate::patch_subject::parse_patch_subject;
 
     use super::{
-        build_candidates, process_diff_parse_patch_items, process_patch_extract_window,
+        build_candidates, process_diff_parse_patch_items, process_patch_extract_threads,
         process_patch_id_compute_batch,
     };
 
@@ -1205,8 +1241,7 @@ mod tests {
             .await?;
         }
 
-        let anchors = vec![*message_pks.last().expect("anchor")];
-        let first = process_patch_extract_window(&lineage, list.id, &anchors).await?;
+        let first = process_patch_extract_threads(&lineage, list.id, &[thread_id]).await?;
         let series_subjects: Vec<String> = sqlx::query_scalar(
             "SELECT canonical_subject_norm FROM patch_series WHERE id = ANY($1) ORDER BY id ASC",
         )
@@ -1377,7 +1412,7 @@ mod tests {
         assert!(stats_sum.3 >= 4);
 
         let before_counts = snapshot_counts(db.pool(), series_id).await?;
-        let _second = process_patch_extract_window(&lineage, list.id, &anchors).await?;
+        let _second = process_patch_extract_threads(&lineage, list.id, &[thread_id]).await?;
         let _second_diff_parse =
             process_diff_parse_patch_items(&lineage, &first.patch_item_ids).await?;
         let after_counts = snapshot_counts(db.pool(), series_id).await?;

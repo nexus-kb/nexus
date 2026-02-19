@@ -601,11 +601,7 @@ pub async fn list_detail(
         },
         facets_hint: ListFacetsHintResponse {
             default_scope: "thread".to_string(),
-            available_scopes: vec![
-                "thread".to_string(),
-                "series".to_string(),
-                "patch_item".to_string(),
-            ],
+            available_scopes: vec!["thread".to_string(), "series".to_string()],
         },
     };
 
@@ -1558,6 +1554,12 @@ pub async fn search(
         Some(raw) => SearchScope::parse(raw).ok_or(StatusCode::UNPROCESSABLE_ENTITY)?,
         None => SearchScope::Thread,
     };
+    if matches!(scope, SearchScope::PatchItem) {
+        return json_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            json!({ "error": "patch_item search is temporarily disabled" }),
+        );
+    }
     let spec = scope.index_kind().spec();
 
     let hybrid_enabled = hybrid_requested(query.hybrid, query.semantic_ratio);
@@ -1851,7 +1853,7 @@ pub async fn openapi_json(headers: HeaderMap) -> Result<Response, StatusCode> {
             "/api/v1/series/{series_id}/versions/{series_version_id}": { "get": { "summary": "Series version detail" } },
             "/api/v1/series/{series_id}/compare": { "get": { "summary": "Compare series versions" } },
             "/api/v1/series/{series_id}/versions/{series_version_id}/export/mbox": { "get": { "summary": "Export version mbox" } },
-            "/api/v1/search": { "get": { "summary": "Search across threads/series/patches" } },
+            "/api/v1/search": { "get": { "summary": "Search across threads/series" } },
             "/api/v1/patch-items/{patch_item_id}": { "get": { "summary": "Patch item metadata" } },
             "/api/v1/patch-items/{patch_item_id}/files": { "get": { "summary": "Patch item files metadata" } },
             "/api/v1/patch-items/{patch_item_id}/files/{path}/diff": { "get": { "summary": "Patch file diff slice" } },

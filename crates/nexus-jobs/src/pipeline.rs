@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use chrono::Utc;
 use gix::hash::ObjectId;
-use nexus_core::config::{IngestWriteMode, Settings};
+use nexus_core::config::{IngestWriteMode, LineageDiscoveryMode, Settings};
 use nexus_core::embeddings::{EmbeddingsClientError, OpenAiEmbeddingsClient};
 use nexus_core::search::MeiliIndexKind;
 use nexus_db::{
@@ -21,7 +21,8 @@ use tokio::time::{Duration, sleep};
 use tracing::{info, warn};
 
 use crate::lineage::{
-    process_diff_parse_patch_items, process_patch_extract_window, process_patch_id_compute_batch,
+    process_diff_parse_patch_items, process_patch_extract_threads, process_patch_extract_window,
+    process_patch_id_compute_batch,
 };
 use crate::mail::{ParseEmailError, parse_email};
 use crate::meili::{MeiliClient, MeiliClientError, settings_differ};
@@ -940,8 +941,21 @@ impl Phase0JobHandler {
 
         let batch_limit = self.settings.mail.commit_batch_size.max(1) as i64;
         let checkpoint_interval = self.settings.worker.progress_checkpoint_interval.max(1) as u64;
+        let discovery_mode = self.settings.worker.lineage_discovery_mode;
+        let discovery_mode_label = match discovery_mode {
+            LineageDiscoveryMode::ThreadFirst => "thread_first",
+            LineageDiscoveryMode::MessageLegacy => "message_legacy",
+        };
+        let work_item_kind = match discovery_mode {
+            LineageDiscoveryMode::ThreadFirst => "threads",
+            LineageDiscoveryMode::MessageLegacy => "messages",
+        };
+
         let mut cursor = 0i64;
+        let mut processed_chunks = 0u64;
+        let mut work_items_processed = 0u64;
         let mut messages_processed = 0u64;
+        let mut threads_scanned = 0u64;
         let mut series_versions_written = 0u64;
         let mut patch_items_written = 0u64;
         let mut patch_item_files_written = 0u64;
@@ -969,53 +983,114 @@ impl Phase0JobHandler {
                 Err(err) => warn!(job_id = job.id, error = %err, "cancel check failed"),
             }
 
-            let chunk = match self
-                .pipeline
-                .query_ingest_window_message_pks(
-                    run.mailing_list_id,
-                    window_from,
-                    window_to,
-                    cursor,
-                    batch_limit,
-                )
-                .await
-            {
-                Ok(value) => value,
-                Err(err) => {
-                    return retryable_error(
-                        format!(
-                            "failed to query messages for lineage stage run {}: {err}",
-                            run.id
-                        ),
-                        "db",
-                        &job,
-                        started.elapsed().as_millis(),
-                        &self.settings,
-                    );
+            let (chunk_work_items, extract_outcome) = match discovery_mode {
+                LineageDiscoveryMode::ThreadFirst => {
+                    let thread_chunk = match self
+                        .pipeline
+                        .query_ingest_window_thread_ids_chunk(
+                            run.mailing_list_id,
+                            window_from,
+                            window_to,
+                            cursor,
+                            batch_limit,
+                        )
+                        .await
+                    {
+                        Ok(value) => value,
+                        Err(err) => {
+                            return retryable_error(
+                                format!(
+                                    "failed to query threads for lineage stage run {}: {err}",
+                                    run.id
+                                ),
+                                "db",
+                                &job,
+                                started.elapsed().as_millis(),
+                                &self.settings,
+                            );
+                        }
+                    };
+                    if thread_chunk.is_empty() {
+                        break;
+                    }
+                    cursor = *thread_chunk.last().unwrap_or(&cursor);
+
+                    let extract_outcome = match process_patch_extract_threads(
+                        &self.lineage,
+                        run.mailing_list_id,
+                        &thread_chunk,
+                    )
+                    .await
+                    {
+                        Ok(value) => value,
+                        Err(err) => {
+                            return retryable_error(
+                                format!(
+                                    "patch lineage extraction failed for run {}: {err}",
+                                    run.id
+                                ),
+                                "parse",
+                                &job,
+                                started.elapsed().as_millis(),
+                                &self.settings,
+                            );
+                        }
+                    };
+                    (thread_chunk.len() as u64, extract_outcome)
                 }
-            };
+                LineageDiscoveryMode::MessageLegacy => {
+                    let message_chunk = match self
+                        .pipeline
+                        .query_ingest_window_message_pks(
+                            run.mailing_list_id,
+                            window_from,
+                            window_to,
+                            cursor,
+                            batch_limit,
+                        )
+                        .await
+                    {
+                        Ok(value) => value,
+                        Err(err) => {
+                            return retryable_error(
+                                format!(
+                                    "failed to query messages for lineage stage run {}: {err}",
+                                    run.id
+                                ),
+                                "db",
+                                &job,
+                                started.elapsed().as_millis(),
+                                &self.settings,
+                            );
+                        }
+                    };
+                    if message_chunk.is_empty() {
+                        break;
+                    }
+                    cursor = *message_chunk.last().unwrap_or(&cursor);
 
-            if chunk.is_empty() {
-                break;
-            }
-            cursor = *chunk.last().unwrap_or(&cursor);
-
-            let extract_outcome = match process_patch_extract_window(
-                &self.lineage,
-                run.mailing_list_id,
-                &chunk,
-            )
-            .await
-            {
-                Ok(value) => value,
-                Err(err) => {
-                    return retryable_error(
-                        format!("patch lineage extraction failed for run {}: {err}", run.id),
-                        "parse",
-                        &job,
-                        started.elapsed().as_millis(),
-                        &self.settings,
-                    );
+                    let extract_outcome = match process_patch_extract_window(
+                        &self.lineage,
+                        run.mailing_list_id,
+                        &message_chunk,
+                    )
+                    .await
+                    {
+                        Ok(value) => value,
+                        Err(err) => {
+                            return retryable_error(
+                                format!(
+                                    "patch lineage extraction failed for run {}: {err}",
+                                    run.id
+                                ),
+                                "parse",
+                                &job,
+                                started.elapsed().as_millis(),
+                                &self.settings,
+                            );
+                        }
+                    };
+                    (message_chunk.len() as u64, extract_outcome)
                 }
             };
 
@@ -1051,14 +1126,22 @@ impl Phase0JobHandler {
                 }
             }
 
-            messages_processed += chunk.len() as u64;
+            processed_chunks += 1;
+            work_items_processed += chunk_work_items;
+            messages_processed += extract_outcome.source_messages_read;
+            threads_scanned += extract_outcome.source_threads_scanned;
             series_versions_written += extract_outcome.series_versions_written;
             patch_items_written += extract_outcome.patch_items_written;
 
-            if messages_processed % checkpoint_interval < chunk.len() as u64 {
+            if work_items_processed % checkpoint_interval < chunk_work_items {
                 let progress = serde_json::json!({
                     "stage": STAGE_LINEAGE,
+                    "discovery_mode": discovery_mode_label,
+                    "processed_chunks": processed_chunks,
+                    "work_item_kind": work_item_kind,
+                    "work_items_processed": work_items_processed,
                     "messages_processed": messages_processed,
+                    "threads_scanned": threads_scanned,
                     "series_versions_written": series_versions_written,
                     "patch_items_written": patch_items_written,
                     "patch_files_written": patch_item_files_written,
@@ -1071,7 +1154,11 @@ impl Phase0JobHandler {
                     run_id = run.id,
                     list_key = %run.list_key,
                     stage = STAGE_LINEAGE,
-                    items_processed = messages_processed,
+                    discovery_mode = discovery_mode_label,
+                    work_item_kind,
+                    items_processed = work_items_processed,
+                    messages_processed,
+                    threads_scanned,
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     "pipeline checkpoint"
                 );
@@ -1109,7 +1196,12 @@ impl Phase0JobHandler {
                 "run_id": run.id,
                 "list_key": run.list_key,
                 "stage": STAGE_LINEAGE,
+                "discovery_mode": discovery_mode_label,
+                "processed_chunks": processed_chunks,
+                "work_item_kind": work_item_kind,
+                "work_items_processed": work_items_processed,
                 "messages_processed": messages_processed,
+                "threads_scanned": threads_scanned,
                 "series_versions_written": series_versions_written,
                 "patch_items_written": patch_items_written,
                 "patch_item_files_written": patch_item_files_written,
@@ -1191,11 +1283,7 @@ impl Phase0JobHandler {
         let mut family_results: Vec<SearchFamilyOutcome> = Vec::new();
         let chunk_limit = self.settings.meili.upsert_batch_size.max(1);
 
-        for index in [
-            MeiliIndexKind::ThreadDocs,
-            MeiliIndexKind::PatchSeriesDocs,
-            MeiliIndexKind::PatchItemDocs,
-        ] {
+        for index in [MeiliIndexKind::ThreadDocs, MeiliIndexKind::PatchSeriesDocs] {
             let index_spec = index.spec();
             let settings = self.meili_index_settings(index);
             if let Err(err) = self
@@ -1215,70 +1303,44 @@ impl Phase0JobHandler {
             let mut docs_bytes = 0u64;
             let mut tasks_submitted = 0u64;
             let mut chunks_done = 0u64;
-            let mut ids_seen = 0u64;
-            let mut id_cursor = 0i64;
+            let impacted_ids = match index {
+                MeiliIndexKind::ThreadDocs => {
+                    self.pipeline
+                        .query_impacted_thread_ids(run.mailing_list_id, window_from, window_to)
+                        .await
+                }
+                MeiliIndexKind::PatchSeriesDocs => {
+                    self.pipeline
+                        .query_impacted_series_ids(run.mailing_list_id, window_from, window_to)
+                        .await
+                }
+                MeiliIndexKind::PatchItemDocs => {
+                    unreachable!("patch_item_docs indexing is disabled in pipeline_lexical")
+                }
+            };
+            let impacted_ids = match impacted_ids {
+                Ok(value) => value,
+                Err(err) => {
+                    return retryable_error(
+                        format!("failed to query impacted ids for {}: {err}", index.uid()),
+                        "db",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
+                }
+            };
+            let ids_seen = impacted_ids.len() as u64;
 
-            loop {
+            for ids in impacted_ids.chunks(chunk_limit) {
                 if let Err(err) = ctx.heartbeat().await {
                     warn!(job_id = job.id, error = %err, "heartbeat update failed");
                 }
 
-                let ids = match index {
-                    MeiliIndexKind::ThreadDocs => {
-                        self.pipeline
-                            .query_impacted_thread_ids_chunk(
-                                run.mailing_list_id,
-                                window_from,
-                                window_to,
-                                id_cursor,
-                                chunk_limit as i64,
-                            )
-                            .await
-                    }
-                    MeiliIndexKind::PatchSeriesDocs => {
-                        self.pipeline
-                            .query_impacted_series_ids_chunk(
-                                run.mailing_list_id,
-                                window_from,
-                                window_to,
-                                id_cursor,
-                                chunk_limit as i64,
-                            )
-                            .await
-                    }
-                    MeiliIndexKind::PatchItemDocs => {
-                        self.pipeline
-                            .query_impacted_patch_item_ids_chunk(
-                                run.mailing_list_id,
-                                window_from,
-                                window_to,
-                                id_cursor,
-                                chunk_limit as i64,
-                            )
-                            .await
-                    }
-                };
-                let ids = match ids {
-                    Ok(value) => value,
-                    Err(err) => {
-                        return retryable_error(
-                            format!("failed to query impacted ids for {}: {err}", index.uid()),
-                            "db",
-                            &job,
-                            started.elapsed().as_millis(),
-                            &self.settings,
-                        );
-                    }
-                };
-                if ids.is_empty() {
-                    break;
-                }
-                id_cursor = *ids.last().unwrap_or(&id_cursor);
                 chunks_done += 1;
-                ids_seen += ids.len() as u64;
 
                 let docs = match self
-                    .build_docs_for_index(index, &ids, VectorAttachmentMode::NullPlaceholder)
+                    .build_docs_for_index(index, ids, VectorAttachmentMode::NullPlaceholder)
                     .await
                 {
                     Ok(value) => value,
@@ -1462,11 +1524,59 @@ impl Phase0JobHandler {
 
         let mut jobs_enqueued = 0u64;
         let mut ids_seen = 0u64;
-        let chunk_limit = self.settings.meili.upsert_batch_size.max(1) as i64;
+        let chunk_limit = self.settings.embeddings.enqueue_batch_size.max(1);
 
         for scope in [EmbeddingScope::Thread, EmbeddingScope::Series] {
-            let mut id_cursor = 0i64;
-            loop {
+            if let Err(err) = ctx.heartbeat().await {
+                warn!(job_id = job.id, error = %err, "heartbeat update failed");
+            }
+            match ctx.is_cancel_requested().await {
+                Ok(true) => {
+                    return JobExecutionOutcome::Cancelled {
+                        reason: "cancel requested".to_string(),
+                        metrics: JobStoreMetrics {
+                            duration_ms: started.elapsed().as_millis(),
+                            rows_written: jobs_enqueued,
+                            bytes_read: 0,
+                            commit_count: ids_seen,
+                            parse_errors: 0,
+                        },
+                    };
+                }
+                Ok(false) => {}
+                Err(err) => warn!(job_id = job.id, error = %err, "cancel check failed"),
+            }
+
+            let impacted_ids = match scope {
+                EmbeddingScope::Thread => {
+                    self.pipeline
+                        .query_impacted_thread_ids(list.id, payload.window_from, payload.window_to)
+                        .await
+                }
+                EmbeddingScope::Series => {
+                    self.pipeline
+                        .query_impacted_series_ids(list.id, payload.window_from, payload.window_to)
+                        .await
+                }
+            };
+            let impacted_ids = match impacted_ids {
+                Ok(value) => value,
+                Err(err) => {
+                    return retryable_error(
+                        format!(
+                            "failed to query impacted {} ids for run {}: {err}",
+                            scope.as_str(),
+                            payload.run_id,
+                        ),
+                        "db",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
+                }
+            };
+
+            for ids in impacted_ids.chunks(chunk_limit) {
                 if let Err(err) = ctx.heartbeat().await {
                     warn!(job_id = job.id, error = %err, "heartbeat update failed");
                 }
@@ -1486,58 +1596,12 @@ impl Phase0JobHandler {
                     Ok(false) => {}
                     Err(err) => warn!(job_id = job.id, error = %err, "cancel check failed"),
                 }
-
-                let ids = match scope {
-                    EmbeddingScope::Thread => {
-                        self.pipeline
-                            .query_impacted_thread_ids_chunk(
-                                list.id,
-                                payload.window_from,
-                                payload.window_to,
-                                id_cursor,
-                                chunk_limit,
-                            )
-                            .await
-                    }
-                    EmbeddingScope::Series => {
-                        self.pipeline
-                            .query_impacted_series_ids_chunk(
-                                list.id,
-                                payload.window_from,
-                                payload.window_to,
-                                id_cursor,
-                                chunk_limit,
-                            )
-                            .await
-                    }
-                };
-                let ids = match ids {
-                    Ok(value) => value,
-                    Err(err) => {
-                        return retryable_error(
-                            format!(
-                                "failed to query impacted {} ids for run {}: {err}",
-                                scope.as_str(),
-                                payload.run_id,
-                            ),
-                            "db",
-                            &job,
-                            started.elapsed().as_millis(),
-                            &self.settings,
-                        );
-                    }
-                };
-                if ids.is_empty() {
-                    break;
-                }
-
-                id_cursor = *ids.last().unwrap_or(&id_cursor);
                 ids_seen += ids.len() as u64;
                 match self
                     .enqueue_embedding_generate_batch(
                         &payload.list_key,
                         scope,
-                        &ids,
+                        ids,
                         Some(job.id),
                         PRIORITY_EMBEDDING_BATCH,
                     )
@@ -2048,8 +2112,14 @@ impl Phase0JobHandler {
 
             // Inline meili upsert for impacted threads
             if !outcome.impacted_thread_ids.is_empty() {
+                let lexical_chunk_limit = self.settings.meili.upsert_batch_size.max(1);
                 match self
-                    .upsert_meili_docs_inline(index, &outcome.impacted_thread_ids, &ctx)
+                    .upsert_meili_docs_inline(
+                        index,
+                        &outcome.impacted_thread_ids,
+                        lexical_chunk_limit,
+                        &ctx,
+                    )
                     .await
                 {
                     Ok(n) => meili_docs_upserted += n,
@@ -2478,7 +2548,7 @@ impl Phase0JobHandler {
             }
         }
 
-        let chunk_limit = self.settings.meili.upsert_batch_size.max(1) as i64;
+        let chunk_limit = self.settings.embeddings.enqueue_batch_size.max(1) as i64;
         let list_key = run.list_key.clone();
         let total_candidates_thread = match self
             .embeddings
@@ -3060,7 +3130,7 @@ impl Phase0JobHandler {
                 metrics: empty_metrics(started.elapsed().as_millis()),
             };
         };
-        let chunk_limit = self.settings.meili.upsert_batch_size.max(1) as i64;
+        let chunk_limit = self.settings.embeddings.enqueue_batch_size.max(1) as i64;
         let list_key = run.list_key.clone().unwrap_or_else(|| "global".to_string());
         let total_candidates = match self
             .embeddings
@@ -3478,7 +3548,11 @@ impl Phase0JobHandler {
             EmbeddingScope::Thread => MeiliIndexKind::ThreadDocs,
             EmbeddingScope::Series => MeiliIndexKind::PatchSeriesDocs,
         };
-        let meili_docs_upserted = match self.upsert_meili_docs_inline(index, &ids, &ctx).await {
+        let embedding_chunk_limit = self.settings.embeddings.enqueue_batch_size.max(1);
+        let meili_docs_upserted = match self
+            .upsert_meili_docs_inline(index, &ids, embedding_chunk_limit, &ctx)
+            .await
+        {
             Ok(n) => n,
             Err(err) => {
                 return retryable_error(
@@ -3728,6 +3802,7 @@ impl Phase0JobHandler {
         &self,
         index: MeiliIndexKind,
         ids: &[i64],
+        chunk_limit: usize,
         ctx: &ExecutionContext,
     ) -> Result<u64, MeiliClientError> {
         let mut ids = ids.to_vec();
@@ -3739,7 +3814,7 @@ impl Phase0JobHandler {
         }
 
         let index_spec = index.spec();
-        let chunk_limit = self.settings.meili.upsert_batch_size.max(1);
+        let chunk_limit = chunk_limit.max(1);
         let mut docs_upserted = 0u64;
 
         for chunk in ids.chunks(chunk_limit) {

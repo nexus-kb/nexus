@@ -340,6 +340,77 @@ impl PipelineStore {
         .await
     }
 
+    /// All thread IDs impacted by messages in the ingest window.
+    pub async fn query_impacted_thread_ids(
+        &self,
+        mailing_list_id: i64,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<Vec<i64>> {
+        sqlx::query_scalar::<_, i64>(
+            r#"SELECT tm.thread_id
+            FROM list_message_instances lmi
+            JOIN thread_messages tm
+              ON tm.mailing_list_id = lmi.mailing_list_id
+             AND tm.message_pk = lmi.message_pk
+            WHERE lmi.mailing_list_id = $1
+              AND lmi.seen_at >= $2 AND lmi.seen_at <= $3
+              AND tm.thread_id > 0
+            GROUP BY tm.thread_id
+            ORDER BY tm.thread_id ASC"#,
+        )
+        .bind(mailing_list_id)
+        .bind(from)
+        .bind(to)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// All patch series IDs impacted by messages in the ingest window.
+    pub async fn query_impacted_series_ids(
+        &self,
+        mailing_list_id: i64,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<Vec<i64>> {
+        sqlx::query_scalar::<_, i64>(
+            r#"SELECT DISTINCT psv.patch_series_id
+            FROM patch_series_versions psv
+            JOIN patch_items pi ON pi.patch_series_version_id = psv.id
+            JOIN list_message_instances lmi ON lmi.message_pk = pi.message_pk
+            WHERE lmi.mailing_list_id = $1
+              AND lmi.seen_at >= $2 AND lmi.seen_at <= $3
+            ORDER BY psv.patch_series_id ASC"#,
+        )
+        .bind(mailing_list_id)
+        .bind(from)
+        .bind(to)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// All patch item IDs impacted by messages in the ingest window.
+    pub async fn query_impacted_patch_item_ids(
+        &self,
+        mailing_list_id: i64,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<Vec<i64>> {
+        sqlx::query_scalar::<_, i64>(
+            r#"SELECT DISTINCT pi.id AS patch_item_id
+            FROM patch_items pi
+            JOIN list_message_instances lmi ON lmi.message_pk = pi.message_pk
+            WHERE lmi.mailing_list_id = $1
+              AND lmi.seen_at >= $2 AND lmi.seen_at <= $3
+            ORDER BY patch_item_id ASC"#,
+        )
+        .bind(mailing_list_id)
+        .bind(from)
+        .bind(to)
+        .fetch_all(&self.pool)
+        .await
+    }
+
     /// Chunked thread IDs impacted by messages in the ingest window.
     pub async fn query_impacted_thread_ids_chunk(
         &self,
@@ -350,17 +421,16 @@ impl PipelineStore {
         limit: i64,
     ) -> Result<Vec<i64>> {
         sqlx::query_scalar::<_, i64>(
-            r#"SELECT thread_id
-            FROM (
-                SELECT DISTINCT tm.thread_id
-                FROM thread_messages tm
-                JOIN list_message_instances lmi ON lmi.message_pk = tm.message_pk
-                WHERE lmi.mailing_list_id = $1
-                  AND lmi.seen_at >= $2 AND lmi.seen_at <= $3
-                  AND tm.thread_id IS NOT NULL
-                  AND tm.thread_id > $4
-            ) impacted
-            ORDER BY thread_id ASC
+            r#"SELECT tm.thread_id
+            FROM list_message_instances lmi
+            JOIN thread_messages tm
+              ON tm.mailing_list_id = lmi.mailing_list_id
+             AND tm.message_pk = lmi.message_pk
+            WHERE lmi.mailing_list_id = $1
+              AND lmi.seen_at >= $2 AND lmi.seen_at <= $3
+              AND tm.thread_id > $4
+            GROUP BY tm.thread_id
+            ORDER BY tm.thread_id ASC
             LIMIT $5"#,
         )
         .bind(mailing_list_id)
@@ -370,6 +440,19 @@ impl PipelineStore {
         .bind(limit.clamp(1, 50_000))
         .fetch_all(&self.pool)
         .await
+    }
+
+    /// Chunked thread IDs in the ingest window.
+    pub async fn query_ingest_window_thread_ids_chunk(
+        &self,
+        mailing_list_id: i64,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        after_thread_id: i64,
+        limit: i64,
+    ) -> Result<Vec<i64>> {
+        self.query_impacted_thread_ids_chunk(mailing_list_id, from, to, after_thread_id, limit)
+            .await
     }
 
     /// Chunked patch series IDs impacted by messages in the ingest window.

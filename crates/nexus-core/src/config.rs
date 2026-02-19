@@ -90,7 +90,7 @@ fn default_meili_master_key() -> String {
 }
 
 fn default_meili_upsert_batch_size() -> usize {
-    100
+    1000
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -113,6 +113,8 @@ pub struct EmbeddingsConfig {
     pub query_cache_max_entries: usize,
     #[serde(default = "default_embeddings_batch_size")]
     pub batch_size: usize,
+    #[serde(default = "default_embeddings_enqueue_batch_size")]
+    pub enqueue_batch_size: usize,
     #[serde(default)]
     pub openrouter_referer: Option<String>,
     #[serde(default)]
@@ -151,12 +153,24 @@ fn default_embeddings_batch_size() -> usize {
     32
 }
 
+fn default_embeddings_enqueue_batch_size() -> usize {
+    100
+}
+
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum IngestWriteMode {
     #[default]
     Copy,
     BatchedSql,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LineageDiscoveryMode {
+    #[default]
+    ThreadFirst,
+    MessageLegacy,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -187,6 +201,8 @@ pub struct WorkerConfig {
     pub max_inflight_jobs: usize,
     #[serde(default = "default_worker_ingest_write_mode")]
     pub ingest_write_mode: IngestWriteMode,
+    #[serde(default)]
+    pub lineage_discovery_mode: LineageDiscoveryMode,
     #[serde(default = "default_worker_progress_checkpoint_interval")]
     pub progress_checkpoint_interval: usize,
     #[serde(default)]
@@ -323,6 +339,9 @@ pub fn load() -> Result<Settings, crate::Error> {
     }
     if settings.embeddings.batch_size == 0 {
         settings.embeddings.batch_size = default_embeddings_batch_size();
+    }
+    if settings.embeddings.enqueue_batch_size == 0 {
+        settings.embeddings.enqueue_batch_size = default_embeddings_enqueue_batch_size();
     }
     if settings.embeddings.enabled {
         if settings.embeddings.api_key.trim().is_empty() {

@@ -64,7 +64,7 @@ This list includes only variables currently read by runtime code (`nexus-core` c
 | `NEXUS__MAIL__COMMIT_BATCH_SIZE` | no | `250` | Tune by ingest throughput and memory budget. |
 | `NEXUS__MEILI__URL` | no | `http://127.0.0.1:7700` | Point to your Meilisearch service URL. |
 | `NEXUS__MEILI__MASTER_KEY` | no | `nexus-dev-key` | Set to your real Meili master key. |
-| `NEXUS__MEILI__UPSERT_BATCH_SIZE` | no | `100` | Tune for index/write latency tradeoff. |
+| `NEXUS__MEILI__UPSERT_BATCH_SIZE` | no | `1000` | Lexical/search doc upsert chunk size to Meili. |
 
 ### Embeddings
 
@@ -79,6 +79,7 @@ This list includes only variables currently read by runtime code (`nexus-core` c
 | `NEXUS__EMBEDDINGS__QUERY_CACHE_TTL_SECS` | no | `120` | Increase if query patterns are repetitive. |
 | `NEXUS__EMBEDDINGS__QUERY_CACHE_MAX_ENTRIES` | no | `10000` | Size to memory budget. |
 | `NEXUS__EMBEDDINGS__BATCH_SIZE` | no | `32` | Tune to provider/API limits. |
+| `NEXUS__EMBEDDINGS__ENQUEUE_BATCH_SIZE` | no | `100` | Embedding ID chunk size for enqueue/upsert flow. |
 | `NEXUS__EMBEDDINGS__OPENROUTER_REFERER` | no | unset | Optional header when using OpenRouter. |
 | `NEXUS__EMBEDDINGS__OPENROUTER_TITLE` | no | unset | Optional header when using OpenRouter. |
 

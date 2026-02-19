@@ -16,6 +16,14 @@ impl Db {
         let pool = PgPoolOptions::new()
             .max_connections(cfg.max_connections)
             .acquire_timeout(Duration::from_secs(15))
+            .after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    // Most worker queries are short-lived and high-frequency; disabling JIT avoids
+                    // paying compile overhead repeatedly for large, parameterized plans.
+                    sqlx::query("SET jit = off").execute(conn).await?;
+                    Ok(())
+                })
+            })
             .connect(&cfg.url)
             .await?;
         Ok(Self { pool })

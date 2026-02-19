@@ -442,6 +442,40 @@ impl LineageStore {
         Self { pool }
     }
 
+    pub async fn load_messages_for_threads(
+        &self,
+        mailing_list_id: i64,
+        thread_ids: &[i64],
+    ) -> Result<Vec<LineageSourceMessage>> {
+        if thread_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let deduped_thread_ids = thread_ids
+            .iter()
+            .copied()
+            .filter(|thread_id| *thread_id > 0)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if deduped_thread_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut tx = self.pool.begin().await?;
+        // Avoid container /dev/shm pressure from parallel workers for large lineage windows.
+        sqlx::query("SET LOCAL max_parallel_workers_per_gather = 0")
+            .execute(&mut *tx)
+            .await?;
+
+        let out = self
+            .load_messages_for_thread_ids_in_tx(&mut tx, mailing_list_id, &deduped_thread_ids)
+            .await?;
+
+        tx.commit().await?;
+        Ok(out)
+    }
+
     pub async fn load_messages_for_anchors(
         &self,
         mailing_list_id: i64,
@@ -474,6 +508,24 @@ impl LineageStore {
             return Ok(Vec::new());
         }
 
+        let out = self
+            .load_messages_for_thread_ids_in_tx(&mut tx, mailing_list_id, &thread_ids)
+            .await?;
+
+        tx.commit().await?;
+        Ok(out)
+    }
+
+    async fn load_messages_for_thread_ids_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        mailing_list_id: i64,
+        thread_ids: &[i64],
+    ) -> Result<Vec<LineageSourceMessage>> {
+        if thread_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let mut out = Vec::new();
         for thread_chunk in thread_ids.chunks(LOAD_MESSAGES_THREAD_CHUNK_SIZE) {
             let mut rows = sqlx::query_as::<_, LineageSourceMessage>(
@@ -502,12 +554,10 @@ impl LineageStore {
             )
             .bind(mailing_list_id)
             .bind(thread_chunk)
-            .fetch_all(&mut *tx)
+            .fetch_all(&mut **tx)
             .await?;
             out.append(&mut rows);
         }
-
-        tx.commit().await?;
         Ok(out)
     }
 
