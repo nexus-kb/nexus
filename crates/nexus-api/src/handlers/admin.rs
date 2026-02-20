@@ -997,21 +997,6 @@ pub async fn threading_rebuild(
         to_seen_at: query.to,
     };
 
-    let dedupe_key = format!(
-        "{}:{}:{}",
-        query.list_key,
-        query
-            .from
-            .as_ref()
-            .map(DateTime::<Utc>::to_rfc3339)
-            .unwrap_or_else(|| "-".to_string()),
-        query
-            .to
-            .as_ref()
-            .map(DateTime::<Utc>::to_rfc3339)
-            .unwrap_or_else(|| "-".to_string())
-    );
-
     let job = state
         .jobs
         .enqueue(EnqueueJobParams {
@@ -1020,7 +1005,9 @@ pub async fn threading_rebuild(
                 .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?,
             priority: 11,
             dedupe_scope: Some(format!("list:{}", query.list_key)),
-            dedupe_key: Some(dedupe_key),
+            // Manual rebuilds should always enqueue a fresh job so operators can rerun
+            // full-list rebuilds on demand.
+            dedupe_key: None,
             run_after: None,
             max_attempts: Some(8),
         })
@@ -1069,21 +1056,6 @@ pub async fn lineage_rebuild(
         to_seen_at: query.to,
     };
 
-    let dedupe_key = format!(
-        "{}:{}:{}:lineage",
-        query.list_key,
-        query
-            .from
-            .as_ref()
-            .map(DateTime::<Utc>::to_rfc3339)
-            .unwrap_or_else(|| "-".to_string()),
-        query
-            .to
-            .as_ref()
-            .map(DateTime::<Utc>::to_rfc3339)
-            .unwrap_or_else(|| "-".to_string())
-    );
-
     let job = state
         .jobs
         .enqueue(EnqueueJobParams {
@@ -1092,7 +1064,9 @@ pub async fn lineage_rebuild(
                 .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?,
             priority: 11,
             dedupe_scope: Some(format!("list:{}", query.list_key)),
-            dedupe_key: Some(dedupe_key),
+            // Manual rebuilds should always enqueue a fresh job so operators can rerun
+            // full-list rebuilds on demand.
+            dedupe_key: None,
             run_after: None,
             max_attempts: Some(8),
         })

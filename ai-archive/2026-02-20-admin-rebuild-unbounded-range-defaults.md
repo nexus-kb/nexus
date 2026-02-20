@@ -20,10 +20,16 @@ Ensure admin rebuild/backfill APIs treat unspecified ranges as full-list/full-sc
      - blank or omitted => `None` (unbounded backfill)
      - invalid non-empty values => `422`.
 
-3. Parsing helpers
+3. Manual rebuild re-run semantics
+   - Removed dedupe keys from:
+     - `POST /admin/v1/threading/rebuild`
+     - `POST /admin/v1/lineage/rebuild`
+   - This ensures every trigger enqueues a fresh rebuild job, so operators can explicitly redo full-list rebuilds.
+
+4. Parsing helpers
    - Added `parse_timestamp(raw)` and `parse_optional_timestamp_query(raw)` for centralized, consistent parsing logic.
 
-4. Tests added (`nexus-api` unit tests)
+5. Tests added (`nexus-api` unit tests)
    - `parse_optional_timestamp_query_accepts_rfc3339`
    - `parse_optional_timestamp_query_accepts_date`
    - `parse_optional_timestamp_query_treats_empty_as_unbounded`
@@ -45,6 +51,9 @@ Ensure admin rebuild/backfill APIs treat unspecified ranges as full-list/full-sc
    - `POST /admin/v1/search/embeddings/backfill?scope=thread&list_key=bpf&from=&to=`
      - accepted
      - backfill run persisted with `from_seen_at=null`, `to_seen_at=null`
+   - Re-run behavior:
+     - repeated `threading/rebuild` calls now return distinct `job_id`s (fresh jobs queued)
+     - repeated `lineage/rebuild` calls now return distinct `job_id`s (fresh jobs queued)
 
 ## Result
 
