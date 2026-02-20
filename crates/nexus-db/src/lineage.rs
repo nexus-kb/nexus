@@ -328,17 +328,6 @@ pub struct MessageDetailRecord {
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
-pub struct SeriesExportMessageRecord {
-    pub ordinal: i32,
-    pub item_type: String,
-    pub message_pk: i64,
-    pub from_email: String,
-    pub date_utc: Option<DateTime<Utc>>,
-    pub subject_raw: String,
-    pub raw_rfc822: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct PatchLogicalRecord {
     pub id: i64,
     pub patch_series_id: i64,
@@ -1519,20 +1508,6 @@ impl LineageStore {
         .await
     }
 
-    pub async fn get_message_raw_rfc822(&self, message_pk: i64) -> Result<Option<Vec<u8>>> {
-        sqlx::query_scalar::<_, Vec<u8>>(
-            r#"SELECT mb.raw_rfc822
-            FROM messages m
-            JOIN message_bodies mb
-              ON mb.id = m.body_id
-            WHERE m.id = $1
-            LIMIT 1"#,
-        )
-        .bind(message_pk)
-        .fetch_optional(&self.pool)
-        .await
-    }
-
     pub async fn resolve_message_pk_by_message_id(&self, message_id: &str) -> Result<Option<i64>> {
         sqlx::query_scalar::<_, i64>(
             r#"SELECT message_pk
@@ -2152,78 +2127,6 @@ impl LineageStore {
             ORDER BY pif.new_path ASC"#,
         )
         .bind(patch_item_ids)
-        .fetch_all(&self.pool)
-        .await
-    }
-
-    pub async fn list_export_messages(
-        &self,
-        patch_series_id: i64,
-        series_version_id: i64,
-        assembled: bool,
-        include_cover: bool,
-    ) -> Result<Vec<SeriesExportMessageRecord>> {
-        if assembled {
-            return sqlx::query_as::<_, SeriesExportMessageRecord>(
-                r#"SELECT
-                    psvai.ordinal,
-                    pi.item_type,
-                    m.id AS message_pk,
-                    m.from_email,
-                    m.date_utc,
-                    m.subject_raw,
-                    mb.raw_rfc822
-                FROM patch_series_versions psv
-                JOIN patch_series_version_assembled_items psvai
-                  ON psvai.patch_series_version_id = psv.id
-                JOIN patch_items pi
-                  ON pi.id = psvai.patch_item_id
-                JOIN messages m
-                  ON m.id = pi.message_pk
-                JOIN message_bodies mb
-                  ON mb.id = m.body_id
-                WHERE psv.patch_series_id = $1
-                  AND psv.id = $2
-                  AND (
-                    pi.item_type = 'patch'
-                    OR ($3::boolean AND pi.item_type = 'cover')
-                  )
-                ORDER BY psvai.ordinal ASC, pi.id ASC"#,
-            )
-            .bind(patch_series_id)
-            .bind(series_version_id)
-            .bind(include_cover)
-            .fetch_all(&self.pool)
-            .await;
-        }
-
-        sqlx::query_as::<_, SeriesExportMessageRecord>(
-            r#"SELECT
-                pi.ordinal,
-                pi.item_type,
-                m.id AS message_pk,
-                m.from_email,
-                m.date_utc,
-                m.subject_raw,
-                mb.raw_rfc822
-            FROM patch_series_versions psv
-            JOIN patch_items pi
-              ON pi.patch_series_version_id = psv.id
-            JOIN messages m
-              ON m.id = pi.message_pk
-            JOIN message_bodies mb
-              ON mb.id = m.body_id
-            WHERE psv.patch_series_id = $1
-              AND psv.id = $2
-              AND (
-                pi.item_type = 'patch'
-                OR ($3::boolean AND pi.item_type = 'cover')
-              )
-            ORDER BY pi.ordinal ASC, pi.id ASC"#,
-        )
-        .bind(patch_series_id)
-        .bind(series_version_id)
-        .bind(include_cover)
         .fetch_all(&self.pool)
         .await
     }

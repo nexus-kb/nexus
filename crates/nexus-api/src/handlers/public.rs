@@ -6,9 +6,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
 use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
 use nexus_core::search::SearchScope;
-use nexus_db::{
-    ListThreadsParams, PatchItemDetailRecord, SeriesExportMessageRecord, SeriesLogicalCompareRow,
-};
+use nexus_db::{ListThreadsParams, PatchItemDetailRecord, SeriesLogicalCompareRow};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -307,14 +305,6 @@ pub struct ThreadPath {
 pub struct SeriesVersionPath {
     pub series_id: i64,
     pub series_version_id: i64,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ExportMboxQuery {
-    #[serde(default)]
-    pub assembled: Option<bool>,
-    #[serde(default)]
-    pub include_cover: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -851,23 +841,6 @@ pub async fn message_detail(
         CACHE_LONG,
         None,
     )
-}
-
-pub async fn message_raw(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Path(message_id): Path<i64>,
-) -> Result<Response, StatusCode> {
-    let Some(raw_rfc822) = state
-        .lineage
-        .get_message_raw_rfc822(message_id)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    else {
-        return Err(StatusCode::NOT_FOUND);
-    };
-
-    bytes_response_with_cache(&headers, raw_rfc822, "message/rfc822", CACHE_LONG, None)
 }
 
 pub async fn message_id_redirect(
@@ -1497,49 +1470,6 @@ pub async fn series_compare(
     )
 }
 
-pub async fn series_version_export_mbox(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Path(path): Path<SeriesVersionPath>,
-    Query(query): Query<ExportMboxQuery>,
-) -> Result<Response, StatusCode> {
-    let assembled = query.assembled.unwrap_or(true);
-    let include_cover = query.include_cover.unwrap_or(false);
-
-    let Some(version) = state
-        .lineage
-        .get_series_version(path.series_id, path.series_version_id)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    else {
-        return Err(StatusCode::NOT_FOUND);
-    };
-
-    let messages = state
-        .lineage
-        .list_export_messages(path.series_id, version.id, assembled, include_cover)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    if messages.is_empty() {
-        return Err(StatusCode::NOT_FOUND);
-    }
-
-    let mbox = render_mbox(&messages);
-    let filename = format!(
-        "{}-v{}.mbox",
-        slugify_for_filename(&version.subject_norm),
-        version.version_num
-    );
-    bytes_response_with_cache(
-        &headers,
-        mbox,
-        "application/mbox",
-        CACHE_LONG,
-        Some(&format!("attachment; filename=\"{filename}\"")),
-    )
-}
-
 pub async fn search(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -1846,13 +1776,11 @@ pub async fn openapi_json(headers: HeaderMap) -> Result<Response, StatusCode> {
             "/api/v1/lists/{list_key}/threads/{thread_id}/messages": { "get": { "summary": "Thread messages (full|snippets)" } },
             "/api/v1/messages/{message_id}": { "get": { "summary": "Message metadata" } },
             "/api/v1/messages/{message_id}/body": { "get": { "summary": "Message body payload" } },
-            "/api/v1/messages/{message_id}/raw": { "get": { "summary": "Raw RFC822" } },
             "/api/v1/r/{msgid}": { "get": { "summary": "Message-ID redirector" } },
             "/api/v1/series": { "get": { "summary": "Series list" } },
             "/api/v1/series/{series_id}": { "get": { "summary": "Series detail timeline" } },
             "/api/v1/series/{series_id}/versions/{series_version_id}": { "get": { "summary": "Series version detail" } },
             "/api/v1/series/{series_id}/compare": { "get": { "summary": "Compare series versions" } },
-            "/api/v1/series/{series_id}/versions/{series_version_id}/export/mbox": { "get": { "summary": "Export version mbox" } },
             "/api/v1/search": { "get": { "summary": "Search across threads/series" } },
             "/api/v1/patch-items/{patch_item_id}": { "get": { "summary": "Patch item metadata" } },
             "/api/v1/patch-items/{patch_item_id}/files": { "get": { "summary": "Patch item files metadata" } },
@@ -2119,35 +2047,6 @@ fn json_response_with_cache<T: Serialize>(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-fn bytes_response_with_cache(
-    headers: &HeaderMap,
-    body: Vec<u8>,
-    content_type: &str,
-    cache_control: &str,
-    content_disposition: Option<&str>,
-) -> Result<Response, StatusCode> {
-    let etag = strong_etag(&body);
-    if if_none_match_matches(headers, &etag) {
-        return not_modified_response(cache_control, &etag);
-    }
-
-    let mut builder = Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, content_type)
-        .header(header::CACHE_CONTROL, cache_control)
-        .header(header::ETAG, etag);
-    if let Some(content_disposition) = content_disposition {
-        builder = builder.header(
-            header::CONTENT_DISPOSITION,
-            HeaderValue::from_str(content_disposition)
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
-        );
-    }
-    builder
-        .body(Body::from(body))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-}
-
 fn not_modified_response(cache_control: &str, etag: &str) -> Result<Response, StatusCode> {
     Response::builder()
         .status(StatusCode::NOT_MODIFIED)
@@ -2282,54 +2181,6 @@ fn build_snippet(body: Option<&str>) -> Option<String> {
     ))
 }
 
-fn render_mbox(messages: &[SeriesExportMessageRecord]) -> Vec<u8> {
-    let mut out = Vec::new();
-
-    for msg in messages {
-        let date_part = msg
-            .date_utc
-            .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).expect("epoch"))
-            .format("%a %b %e %H:%M:%S %Y")
-            .to_string();
-        let separator = format!("From {} {}\n", msg.from_email, date_part);
-        out.extend_from_slice(separator.as_bytes());
-
-        let normalized = normalize_newlines(&String::from_utf8_lossy(&msg.raw_rfc822));
-        for line in normalized.lines() {
-            if line.starts_with("From ") {
-                out.extend_from_slice(b">");
-            }
-            out.extend_from_slice(line.as_bytes());
-            out.push(b'\n');
-        }
-        out.push(b'\n');
-    }
-
-    out
-}
-
-fn normalize_newlines(text: &str) -> String {
-    text.replace("\r\n", "\n").replace('\r', "\n")
-}
-
-fn slugify_for_filename(value: &str) -> String {
-    let mut out = String::new();
-    for ch in value.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-        } else if (ch == '-' || ch == '_' || ch == '.') && !out.ends_with(ch) {
-            out.push(ch);
-        } else if !out.ends_with('-') {
-            out.push('-');
-        }
-    }
-    out.trim_matches('-')
-        .chars()
-        .take(80)
-        .collect::<String>()
-        .if_empty_then("series")
-}
-
 fn hex_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -2339,33 +2190,14 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
-trait IfEmptyThen {
-    fn if_empty_then(self, fallback: &str) -> String;
-}
-
-impl IfEmptyThen for String {
-    fn if_empty_then(self, fallback: &str) -> String {
-        if self.is_empty() {
-            fallback.to_string()
-        } else {
-            self
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::fs;
-    use std::path::Path;
-    use std::process::Command;
-
     use axum::http::{HeaderMap, header};
-    use chrono::Utc;
-    use nexus_db::{SeriesExportMessageRecord, SeriesLogicalCompareRow};
+    use nexus_db::SeriesLogicalCompareRow;
 
     use super::{
         build_pagination, encode_search_cursor, hybrid_requested, if_none_match_matches,
-        normalize_page, parse_search_cursor, parse_timestamp, parse_window_days, render_mbox,
+        normalize_page, parse_search_cursor, parse_timestamp, parse_window_days,
         search_request_hash, slice_by_offsets, strip_quoted_lines, to_patch_compare_rows,
     };
 
@@ -2546,91 +2378,5 @@ mod tests {
             Some("qwen/qwen3-embedding-4b"),
         );
         assert_ne!(lexical, hybrid);
-    }
-
-    #[test]
-    fn rendered_mbox_applies_with_git_am() {
-        if Command::new("git").arg("--version").output().is_err() {
-            return;
-        }
-
-        let temp_root = std::env::temp_dir().join(format!(
-            "nexus-mbox-test-{}",
-            Utc::now().timestamp_nanos_opt().unwrap_or_default().abs()
-        ));
-        fs::create_dir_all(&temp_root).expect("create temp root");
-
-        init_repo_with_patch(&temp_root);
-        let raw_patch = run_git(
-            &temp_root,
-            &["format-patch", "-1", "--stdout"],
-            "format patch",
-        );
-
-        run_git(
-            &temp_root,
-            &["reset", "--hard", "HEAD~1"],
-            "reset to pre-patch",
-        );
-
-        let rendered = render_mbox(&[SeriesExportMessageRecord {
-            ordinal: 1,
-            item_type: "patch".to_string(),
-            message_pk: 1,
-            from_email: "dev@example.com".to_string(),
-            date_utc: Some(Utc::now()),
-            subject_raw: "[PATCH] demo".to_string(),
-            raw_rfc822: raw_patch.into_bytes(),
-        }]);
-
-        let mbox_path = temp_root.join("series.mbox");
-        fs::write(&mbox_path, rendered).expect("write mbox");
-
-        let status = Command::new("git")
-            .current_dir(&temp_root)
-            .arg("am")
-            .arg(&mbox_path)
-            .status()
-            .expect("run git am");
-        assert!(status.success());
-
-        let content = fs::read_to_string(temp_root.join("foo.txt")).expect("read patched file");
-        assert_eq!(content.trim(), "new");
-    }
-
-    fn init_repo_with_patch(repo: &Path) {
-        run_git(repo, &["init"], "git init");
-        run_git(
-            repo,
-            &["config", "user.name", "Nexus Test"],
-            "git config user.name",
-        );
-        run_git(
-            repo,
-            &["config", "user.email", "dev@example.com"],
-            "git config user.email",
-        );
-
-        fs::write(repo.join("foo.txt"), "old\n").expect("write file");
-        run_git(repo, &["add", "foo.txt"], "git add");
-        run_git(repo, &["commit", "-m", "base"], "commit base");
-
-        fs::write(repo.join("foo.txt"), "new\n").expect("write patch file");
-        run_git(repo, &["add", "foo.txt"], "git add updated");
-        run_git(repo, &["commit", "-m", "update foo"], "commit patch");
-    }
-
-    fn run_git(repo: &Path, args: &[&str], context: &str) -> String {
-        let output = Command::new("git")
-            .current_dir(repo)
-            .args(args)
-            .output()
-            .expect("run git command");
-        assert!(
-            output.status.success(),
-            "{context} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8_lossy(&output.stdout).to_string()
     }
 }

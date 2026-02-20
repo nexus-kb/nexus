@@ -32,11 +32,11 @@ pub use crate::lineage::{
     AssembledItemRecord, LineageSourceMessage, LineageStore, ListThreadsParams, MessageBodyRecord,
     MessageDetailRecord, PatchItemDetailRecord, PatchItemDiffRecord, PatchItemFileAggregateRecord,
     PatchItemFileBatchInput, PatchItemFileDiffSliceSource, PatchItemFileRecord, PatchItemRecord,
-    PatchLogicalRecord, PatchSeriesRecord, PatchSeriesVersionRecord, SeriesExportMessageRecord,
-    SeriesListItemRecord, SeriesLogicalCompareRow, SeriesVersionPatchItemRecord,
-    SeriesVersionPatchRef, SeriesVersionSummaryRecord, ThreadListItemRecord, ThreadMessageRecord,
-    ThreadParticipantRecord, ThreadRefRecord, ThreadSummaryRecord, UpsertPatchItemFileInput,
-    UpsertPatchItemInput, UpsertPatchSeriesInput, UpsertPatchSeriesVersionInput,
+    PatchLogicalRecord, PatchSeriesRecord, PatchSeriesVersionRecord, SeriesListItemRecord,
+    SeriesLogicalCompareRow, SeriesVersionPatchItemRecord, SeriesVersionPatchRef,
+    SeriesVersionSummaryRecord, ThreadListItemRecord, ThreadMessageRecord, ThreadParticipantRecord,
+    ThreadRefRecord, ThreadSummaryRecord, UpsertPatchItemFileInput, UpsertPatchItemInput,
+    UpsertPatchSeriesInput, UpsertPatchSeriesVersionInput,
 };
 pub use crate::models::{EmbeddingBackfillRun, Job, JobState, MeiliBootstrapRun, PipelineRun};
 pub use crate::pipeline::{ListPipelineRunsParams, PipelineStore};

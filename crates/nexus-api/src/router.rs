@@ -26,7 +26,6 @@ pub fn build_router(state: ApiState) -> Router {
         )
         .route("/messages/{message_id}", get(public::message_detail))
         .route("/messages/{message_id}/body", get(public::message_body))
-        .route("/messages/{message_id}/raw", get(public::message_raw))
         .route("/r/{msgid}", get(public::message_id_redirect))
         .route("/series", get(public::series_list))
         .route("/series/{series_id}", get(public::series_detail))
@@ -47,10 +46,6 @@ pub fn build_router(state: ApiState) -> Router {
         .route(
             "/patch-items/{patch_item_id}/diff",
             get(public::patch_item_diff),
-        )
-        .route(
-            "/series/{series_id}/versions/{series_version_id}/export/mbox",
-            get(public::series_version_export_mbox),
         )
         .route("/search", get(public::search))
         .route("/{*path}", options(preflight_options));

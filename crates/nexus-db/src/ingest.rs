@@ -113,58 +113,65 @@ impl IngestStore {
 
         let mut message_inserted = false;
 
-        let existing_message_pk =
-            sqlx::query_scalar::<_, i64>("SELECT id FROM messages WHERE content_hash_sha256 = $1")
-                .bind(&input.content_hash_sha256)
-                .fetch_optional(&mut *tx)
+        #[derive(sqlx::FromRow)]
+        struct ExistingMessageIdentityRow {
+            id: i64,
+            message_id_primary: String,
+        }
+
+        let existing_message = sqlx::query_as::<_, ExistingMessageIdentityRow>(
+            "SELECT id, message_id_primary FROM messages WHERE content_hash_sha256 = $1",
+        )
+        .bind(&input.content_hash_sha256)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let (message_pk, canonical_primary_message_id) =
+            if let Some(existing_message) = existing_message {
+                (existing_message.id, existing_message.message_id_primary)
+            } else {
+                let body_id = sqlx::query_scalar::<_, i64>(
+                    r#"INSERT INTO message_bodies
+                (body_text, diff_text, search_text, has_diff, has_attachments)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING id"#,
+                )
+                .bind(&input.body.body_text)
+                .bind(&input.body.diff_text)
+                .bind(&input.body.search_text)
+                .bind(input.body.has_diff)
+                .bind(input.body.has_attachments)
+                .fetch_one(&mut *tx)
                 .await?;
 
-        let message_pk = if let Some(id) = existing_message_pk {
-            id
-        } else {
-            let body_id = sqlx::query_scalar::<_, i64>(
-                r#"INSERT INTO message_bodies
-                (raw_rfc822, body_text, diff_text, search_text, has_diff, has_attachments)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                RETURNING id"#,
-            )
-            .bind(&input.body.raw_rfc822)
-            .bind(&input.body.body_text)
-            .bind(&input.body.diff_text)
-            .bind(&input.body.search_text)
-            .bind(input.body.has_diff)
-            .bind(input.body.has_attachments)
-            .fetch_one(&mut *tx)
-            .await?;
-
-            let message_pk = sqlx::query_scalar::<_, i64>(
-                r#"INSERT INTO messages
+                let message_pk = sqlx::query_scalar::<_, i64>(
+                    r#"INSERT INTO messages
                 (content_hash_sha256, subject_raw, subject_norm, from_name, from_email,
                  date_utc, to_raw, cc_raw, message_ids, message_id_primary,
                  in_reply_to_ids, references_ids, mime_type, body_id)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
                 RETURNING id"#,
-            )
-            .bind(&input.content_hash_sha256)
-            .bind(&input.subject_raw)
-            .bind(&input.subject_norm)
-            .bind(&input.from_name)
-            .bind(&input.from_email)
-            .bind(input.date_utc)
-            .bind(&input.to_raw)
-            .bind(&input.cc_raw)
-            .bind(&input.message_ids)
-            .bind(&input.message_id_primary)
-            .bind(&input.in_reply_to_ids)
-            .bind(&input.references_ids)
-            .bind(&input.mime_type)
-            .bind(body_id)
-            .fetch_one(&mut *tx)
-            .await?;
+                )
+                .bind(&input.content_hash_sha256)
+                .bind(&input.subject_raw)
+                .bind(&input.subject_norm)
+                .bind(&input.from_name)
+                .bind(&input.from_email)
+                .bind(input.date_utc)
+                .bind(&input.to_raw)
+                .bind(&input.cc_raw)
+                .bind(&input.message_ids)
+                .bind(&input.message_id_primary)
+                .bind(&input.in_reply_to_ids)
+                .bind(&input.references_ids)
+                .bind(&input.mime_type)
+                .bind(body_id)
+                .fetch_one(&mut *tx)
+                .await?;
 
-            message_inserted = true;
-            message_pk
-        };
+                message_inserted = true;
+                (message_pk, input.message_id_primary.clone())
+            };
 
         for message_id in &input.message_ids {
             sqlx::query(
@@ -175,7 +182,7 @@ impl IngestStore {
             )
             .bind(message_id)
             .bind(message_pk)
-            .bind(*message_id == input.message_id_primary)
+            .bind(message_id == &canonical_primary_message_id)
             .execute(&mut *tx)
             .await?;
         }
@@ -275,9 +282,16 @@ impl IngestStore {
         struct ExistingMessageRow {
             id: i64,
             content_hash_sha256: Vec<u8>,
+            message_id_primary: String,
         }
 
-        let mut existing_messages_by_hash: HashMap<Vec<u8>, i64> = HashMap::new();
+        #[derive(Debug, Clone)]
+        struct MessageIdentity {
+            id: i64,
+            message_id_primary: String,
+        }
+
+        let mut existing_messages_by_hash: HashMap<Vec<u8>, MessageIdentity> = HashMap::new();
         if !pending_indexes.is_empty() {
             let mut content_hashes = Vec::new();
             let mut seen_hashes: HashSet<Vec<u8>> = HashSet::new();
@@ -290,7 +304,8 @@ impl IngestStore {
 
             if !content_hashes.is_empty() {
                 let mut qb = QueryBuilder::<Postgres>::new(
-                    "SELECT id, content_hash_sha256 FROM messages WHERE content_hash_sha256 IN (",
+                    "SELECT id, content_hash_sha256, message_id_primary \
+                     FROM messages WHERE content_hash_sha256 IN (",
                 );
                 let mut separated = qb.separated(", ");
                 for hash in &content_hashes {
@@ -304,7 +319,13 @@ impl IngestStore {
                     .await?;
 
                 for message in existing_messages {
-                    existing_messages_by_hash.insert(message.content_hash_sha256, message.id);
+                    existing_messages_by_hash.insert(
+                        message.content_hash_sha256,
+                        MessageIdentity {
+                            id: message.id,
+                            message_id_primary: message.message_id_primary,
+                        },
+                    );
                 }
             }
         }
@@ -313,10 +334,10 @@ impl IngestStore {
         let mut pending_insert_hashes: HashSet<Vec<u8>> = HashSet::new();
         for idx in &pending_indexes {
             let row = &rows[*idx];
-            if let Some(message_pk) = existing_messages_by_hash
-                .get(&row.parsed_message.content_hash_sha256)
-                .copied()
+            if let Some(message) =
+                existing_messages_by_hash.get(&row.parsed_message.content_hash_sha256)
             {
+                let message_pk = message.id;
                 message_pk_by_commit.insert(row.git_commit_oid.clone(), message_pk);
             } else if pending_insert_hashes.insert(row.parsed_message.content_hash_sha256.clone()) {
                 insert_indexes.push(*idx);
@@ -335,14 +356,14 @@ impl IngestStore {
         }
 
         let mut inserted_messages_by_hash = HashMap::new();
+        let mut inserted_primary_by_hash = HashMap::new();
         if !insert_indexes.is_empty() {
             let mut insert_bodies_qb = QueryBuilder::<Postgres>::new(
-                "INSERT INTO message_bodies (raw_rfc822, body_text, diff_text, search_text, has_diff, has_attachments) ",
+                "INSERT INTO message_bodies (body_text, diff_text, search_text, has_diff, has_attachments) ",
             );
             insert_bodies_qb.push_values(insert_indexes.iter(), |mut b, idx| {
                 let row = &rows[*idx];
-                b.push_bind(row.parsed_message.body.raw_rfc822.as_slice())
-                    .push_bind(row.parsed_message.body.body_text.as_deref())
+                b.push_bind(row.parsed_message.body.body_text.as_deref())
                     .push_bind(row.parsed_message.body.diff_text.as_deref())
                     .push_bind(row.parsed_message.body.search_text.as_str())
                     .push_bind(row.parsed_message.body.has_diff)
@@ -391,6 +412,14 @@ impl IngestStore {
             for row in inserted_messages {
                 inserted_messages_by_hash.insert(row.content_hash_sha256, row.id);
             }
+
+            for idx in &insert_indexes {
+                let row = &rows[*idx];
+                inserted_primary_by_hash.insert(
+                    row.parsed_message.content_hash_sha256.clone(),
+                    row.parsed_message.message_id_primary.clone(),
+                );
+            }
         }
 
         for idx in &pending_indexes {
@@ -401,7 +430,7 @@ impl IngestStore {
 
             if let Some(message_pk) = existing_messages_by_hash
                 .get(&row.parsed_message.content_hash_sha256)
-                .copied()
+                .map(|message| message.id)
                 .or_else(|| {
                     inserted_messages_by_hash
                         .get(&row.parsed_message.content_hash_sha256)
@@ -421,12 +450,21 @@ impl IngestStore {
             let Some(message_pk) = message_pk_by_commit.get(&row.git_commit_oid).copied() else {
                 continue;
             };
+            let canonical_primary_message_id = existing_messages_by_hash
+                .get(&row.parsed_message.content_hash_sha256)
+                .map(|message| message.message_id_primary.as_str())
+                .or_else(|| {
+                    inserted_primary_by_hash
+                        .get(&row.parsed_message.content_hash_sha256)
+                        .map(String::as_str)
+                })
+                .unwrap_or(row.parsed_message.message_id_primary.as_str());
 
             for message_id in &row.parsed_message.message_ids {
                 message_id_rows.push((
                     message_id.clone(),
                     message_pk,
-                    *message_id == row.parsed_message.message_id_primary,
+                    message_id == canonical_primary_message_id,
                 ));
             }
 
@@ -579,9 +617,16 @@ impl IngestStore {
         struct ExistingMessageRow {
             id: i64,
             content_hash_sha256: Vec<u8>,
+            message_id_primary: String,
         }
 
-        let mut existing_messages_by_hash: HashMap<Vec<u8>, i64> = HashMap::new();
+        #[derive(Debug, Clone)]
+        struct MessageIdentity {
+            id: i64,
+            message_id_primary: String,
+        }
+
+        let mut existing_messages_by_hash: HashMap<Vec<u8>, MessageIdentity> = HashMap::new();
         if !pending_indexes.is_empty() {
             let mut content_hashes = Vec::new();
             let mut seen_hashes: HashSet<Vec<u8>> = HashSet::new();
@@ -594,7 +639,8 @@ impl IngestStore {
 
             if !content_hashes.is_empty() {
                 let mut qb = QueryBuilder::<Postgres>::new(
-                    "SELECT id, content_hash_sha256 FROM messages WHERE content_hash_sha256 IN (",
+                    "SELECT id, content_hash_sha256, message_id_primary \
+                     FROM messages WHERE content_hash_sha256 IN (",
                 );
                 let mut separated = qb.separated(", ");
                 for hash in &content_hashes {
@@ -608,7 +654,13 @@ impl IngestStore {
                     .await?;
 
                 for message in existing_messages {
-                    existing_messages_by_hash.insert(message.content_hash_sha256, message.id);
+                    existing_messages_by_hash.insert(
+                        message.content_hash_sha256,
+                        MessageIdentity {
+                            id: message.id,
+                            message_id_primary: message.message_id_primary,
+                        },
+                    );
                 }
             }
         }
@@ -617,10 +669,10 @@ impl IngestStore {
         let mut pending_insert_hashes: HashSet<Vec<u8>> = HashSet::new();
         for idx in &pending_indexes {
             let row = &rows[*idx];
-            if let Some(message_pk) = existing_messages_by_hash
-                .get(&row.parsed_message.content_hash_sha256)
-                .copied()
+            if let Some(message) =
+                existing_messages_by_hash.get(&row.parsed_message.content_hash_sha256)
             {
+                let message_pk = message.id;
                 message_pk_by_commit.insert(row.git_commit_oid.clone(), message_pk);
             } else if pending_insert_hashes.insert(row.parsed_message.content_hash_sha256.clone()) {
                 insert_indexes.push(*idx);
@@ -633,6 +685,7 @@ impl IngestStore {
         let mut body_rows = Vec::with_capacity(insert_indexes.len());
         let mut message_rows = Vec::with_capacity(insert_indexes.len());
         let mut inserted_messages_by_hash = HashMap::new();
+        let mut inserted_primary_by_hash = HashMap::new();
         for (offset, idx) in insert_indexes.iter().enumerate() {
             let row = &rows[*idx];
             let body_id = body_ids[offset];
@@ -640,7 +693,6 @@ impl IngestStore {
 
             body_rows.push(CopyMessageBodyRow {
                 id: body_id,
-                raw_rfc822: row.parsed_message.body.raw_rfc822.clone(),
                 body_text: row.parsed_message.body.body_text.clone(),
                 diff_text: row.parsed_message.body.diff_text.clone(),
                 search_text: row.parsed_message.body.search_text.clone(),
@@ -668,6 +720,10 @@ impl IngestStore {
 
             inserted_messages_by_hash
                 .insert(row.parsed_message.content_hash_sha256.clone(), message_id);
+            inserted_primary_by_hash.insert(
+                row.parsed_message.content_hash_sha256.clone(),
+                row.parsed_message.message_id_primary.clone(),
+            );
         }
 
         for idx in &pending_indexes {
@@ -678,7 +734,7 @@ impl IngestStore {
 
             if let Some(message_pk) = existing_messages_by_hash
                 .get(&row.parsed_message.content_hash_sha256)
-                .copied()
+                .map(|message| message.id)
                 .or_else(|| {
                     inserted_messages_by_hash
                         .get(&row.parsed_message.content_hash_sha256)
@@ -698,12 +754,21 @@ impl IngestStore {
             let Some(message_pk) = message_pk_by_commit.get(&row.git_commit_oid).copied() else {
                 continue;
             };
+            let canonical_primary_message_id = existing_messages_by_hash
+                .get(&row.parsed_message.content_hash_sha256)
+                .map(|message| message.message_id_primary.as_str())
+                .or_else(|| {
+                    inserted_primary_by_hash
+                        .get(&row.parsed_message.content_hash_sha256)
+                        .map(String::as_str)
+                })
+                .unwrap_or(row.parsed_message.message_id_primary.as_str());
 
             for message_id in &row.parsed_message.message_ids {
                 message_id_rows.push((
                     message_id.clone(),
                     message_pk,
-                    *message_id == row.parsed_message.message_id_primary,
+                    message_id == canonical_primary_message_id,
                 ));
             }
 
@@ -741,7 +806,7 @@ impl IngestStore {
             let payload = build_message_bodies_copy_payload(&body_rows)?;
             copy_into_table(
                 &mut tx,
-                "COPY message_bodies (id, raw_rfc822, body_text, diff_text, search_text, has_diff, has_attachments) \
+                "COPY message_bodies (id, body_text, diff_text, search_text, has_diff, has_attachments) \
                  FROM STDIN WITH (FORMAT CSV, NULL '\\N')",
                 payload,
             )
@@ -807,7 +872,6 @@ impl IngestStore {
 #[derive(Debug, Clone)]
 struct CopyMessageBodyRow {
     id: i64,
-    raw_rfc822: Vec<u8>,
     body_text: Option<String>,
     diff_text: Option<String>,
     search_text: String,
@@ -892,12 +956,10 @@ fn build_message_bodies_copy_payload(rows: &[CopyMessageBodyRow]) -> Result<Vec<
     let mut writer = make_copy_writer();
     for row in rows {
         let id = row.id.to_string();
-        let raw_rfc822 = encode_bytea_hex(&row.raw_rfc822);
         write_copy_record(
             &mut writer,
             [
                 Some(Cow::Owned(id)),
-                Some(Cow::Owned(raw_rfc822)),
                 row.body_text.as_deref().map(Cow::Borrowed),
                 row.diff_text.as_deref().map(Cow::Borrowed),
                 Some(Cow::Borrowed(row.search_text.as_str())),
@@ -1309,7 +1371,6 @@ mod tests {
     fn copy_payload_handles_csv_sensitive_content_and_nulls() {
         let payload = build_message_bodies_copy_payload(&[CopyMessageBodyRow {
             id: 42,
-            raw_rfc822: b"hello".to_vec(),
             body_text: Some("a,\"b\"\nline".to_string()),
             diff_text: None,
             search_text: "\\N".to_string(),

@@ -3,6 +3,9 @@ use sqlx::{PgPool, QueryBuilder};
 
 use crate::{PipelineRun, Result};
 
+const UNIQUE_VIOLATION_SQLSTATE: &str = "23505";
+const ACTIVATION_RETRY_ATTEMPTS: usize = 3;
+
 #[derive(Debug, Clone, Default)]
 pub struct ListPipelineRunsParams {
     pub list_key: Option<String>,
@@ -32,7 +35,7 @@ impl PipelineStore {
         batch_id: i64,
         batch_position: i32,
     ) -> Result<PipelineRun> {
-        sqlx::query_as::<_, PipelineRun>(
+        match sqlx::query_as::<_, PipelineRun>(
             r#"INSERT INTO pipeline_runs
             (mailing_list_id, list_key, state, current_stage, source, batch_id, batch_position)
             VALUES ($1, $2, 'pending', 'ingest', $3, $4, $5)
@@ -45,6 +48,17 @@ impl PipelineStore {
         .bind(batch_position)
         .fetch_one(&self.pool)
         .await
+        {
+            Ok(run) => Ok(run),
+            Err(err) if is_unique_violation(&err) => {
+                if let Some(existing) = self.get_open_run_for_list(list_key).await? {
+                    Ok(existing)
+                } else {
+                    Err(err)
+                }
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Create a run that starts immediately in `running` state (for admin single-list sync).
@@ -54,7 +68,7 @@ impl PipelineStore {
         list_key: &str,
         source: &str,
     ) -> Result<PipelineRun> {
-        sqlx::query_as::<_, PipelineRun>(
+        match sqlx::query_as::<_, PipelineRun>(
             r#"INSERT INTO pipeline_runs
             (mailing_list_id, list_key, state, current_stage, source)
             VALUES ($1, $2, 'running', 'ingest', $3)
@@ -65,62 +79,95 @@ impl PipelineStore {
         .bind(source)
         .fetch_one(&self.pool)
         .await
+        {
+            Ok(run) => Ok(run),
+            Err(err) if is_unique_violation(&err) => {
+                if let Some(existing) = self.get_open_run_for_list(list_key).await? {
+                    Ok(existing)
+                } else {
+                    Err(err)
+                }
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Activate the next pending run in a batch: set to running and return it.
     pub async fn activate_next_pending_run(&self, batch_id: i64) -> Result<Option<PipelineRun>> {
-        sqlx::query_as::<_, PipelineRun>(
-            r#"UPDATE pipeline_runs
-            SET state = 'running',
-                started_at = now(),
-                updated_at = now()
-            WHERE id = (
-                SELECT pr.id
-                FROM pipeline_runs pr
-                WHERE pr.batch_id = $1
-                  AND pr.state = 'pending'
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM pipeline_runs active
-                      WHERE active.mailing_list_id = pr.mailing_list_id
-                        AND active.state = 'running'
-                  )
-                ORDER BY pr.batch_position ASC, pr.id ASC
-                LIMIT 1
-                FOR UPDATE SKIP LOCKED
+        let mut attempts = 0usize;
+        loop {
+            attempts += 1;
+            match sqlx::query_as::<_, PipelineRun>(
+                r#"UPDATE pipeline_runs
+                SET state = 'running',
+                    started_at = now(),
+                    updated_at = now()
+                WHERE id = (
+                    SELECT pr.id
+                    FROM pipeline_runs pr
+                    WHERE pr.batch_id = $1
+                      AND pr.state = 'pending'
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM pipeline_runs active
+                          WHERE active.mailing_list_id = pr.mailing_list_id
+                            AND active.state = 'running'
+                      )
+                    ORDER BY pr.batch_position ASC, pr.id ASC
+                    LIMIT 1
+                    FOR UPDATE SKIP LOCKED
+                )
+                RETURNING *"#,
             )
-            RETURNING *"#,
-        )
-        .bind(batch_id)
-        .fetch_optional(&self.pool)
-        .await
+            .bind(batch_id)
+            .fetch_optional(&self.pool)
+            .await
+            {
+                Ok(run) => return Ok(run),
+                Err(err) if is_unique_violation(&err) && attempts < ACTIVATION_RETRY_ATTEMPTS => {
+                    continue;
+                }
+                Err(err) => return Err(err),
+            }
+        }
     }
 
     /// Activate the next pending run globally (oldest by batch/id) and return it.
     pub async fn activate_next_pending_run_any(&self) -> Result<Option<PipelineRun>> {
-        sqlx::query_as::<_, PipelineRun>(
-            r#"UPDATE pipeline_runs
-            SET state = 'running',
-                started_at = now(),
-                updated_at = now()
-            WHERE id = (
-                SELECT pr.id
-                FROM pipeline_runs pr
-                WHERE pr.state = 'pending'
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM pipeline_runs active
-                      WHERE active.mailing_list_id = pr.mailing_list_id
-                        AND active.state = 'running'
-                  )
-                ORDER BY pr.batch_id ASC NULLS LAST, pr.batch_position ASC NULLS LAST, pr.id ASC
-                LIMIT 1
-                FOR UPDATE SKIP LOCKED
+        let mut attempts = 0usize;
+        loop {
+            attempts += 1;
+            match sqlx::query_as::<_, PipelineRun>(
+                r#"UPDATE pipeline_runs
+                SET state = 'running',
+                    started_at = now(),
+                    updated_at = now()
+                WHERE id = (
+                    SELECT pr.id
+                    FROM pipeline_runs pr
+                    WHERE pr.state = 'pending'
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM pipeline_runs active
+                          WHERE active.mailing_list_id = pr.mailing_list_id
+                            AND active.state = 'running'
+                      )
+                    ORDER BY pr.batch_id ASC NULLS LAST, pr.batch_position ASC NULLS LAST, pr.id ASC
+                    LIMIT 1
+                    FOR UPDATE SKIP LOCKED
+                )
+                RETURNING *"#,
             )
-            RETURNING *"#,
-        )
-        .fetch_optional(&self.pool)
-        .await
+            .fetch_optional(&self.pool)
+            .await
+            {
+                Ok(run) => return Ok(run),
+                Err(err) if is_unique_violation(&err) && attempts < ACTIVATION_RETRY_ATTEMPTS => {
+                    continue;
+                }
+                Err(err) => return Err(err),
+            }
+        }
     }
 
     pub async fn get_run(&self, run_id: i64) -> Result<Option<PipelineRun>> {
@@ -596,5 +643,14 @@ impl PipelineStore {
         sqlx::query_scalar::<_, i64>("SELECT nextval('pipeline_run_batches_seq')")
             .fetch_one(&self.pool)
             .await
+    }
+}
+
+fn is_unique_violation(err: &sqlx::Error) -> bool {
+    match err {
+        sqlx::Error::Database(db_err) => {
+            db_err.code().as_deref() == Some(UNIQUE_VIOLATION_SQLSTATE)
+        }
+        _ => false,
     }
 }
