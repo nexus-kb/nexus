@@ -8,6 +8,7 @@ use std::fmt::Write as _;
 use crate::{MailingListRepo, Result};
 
 const COPY_NULL_SENTINEL: &str = "\u{001f}NEXUS_NULL\u{001f}";
+const MAX_QUERY_BIND_PARAMS: usize = 60_000;
 const UTF8_INTEGRITY_SAMPLE_LIMIT: usize = 4_000;
 const UTF8_INTEGRITY_OFFENDER_LIMIT: usize = 5;
 
@@ -19,6 +20,32 @@ pub struct ParsedBodyInput {
     pub search_text: String,
     pub has_diff: bool,
     pub has_attachments: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ParsedPatchFileFactInput {
+    pub old_path: Option<String>,
+    pub new_path: String,
+    pub change_type: String,
+    pub is_binary: bool,
+    pub additions: i32,
+    pub deletions: i32,
+    pub hunk_count: i32,
+    pub diff_start: i32,
+    pub diff_end: i32,
+}
+
+#[derive(Debug, Clone)]
+pub struct ParsedPatchFactsInput {
+    pub has_diff: bool,
+    pub patch_id_stable: Option<String>,
+    pub base_commit: Option<String>,
+    pub change_id: Option<String>,
+    pub file_count: i32,
+    pub additions: i32,
+    pub deletions: i32,
+    pub hunk_count: i32,
+    pub files: Vec<ParsedPatchFileFactInput>,
 }
 
 #[derive(Debug, Clone)]
@@ -37,6 +64,7 @@ pub struct ParsedMessageInput {
     pub references_ids: Vec<String>,
     pub mime_type: Option<String>,
     pub body: ParsedBodyInput,
+    pub patch_facts: Option<ParsedPatchFactsInput>,
 }
 
 #[derive(Debug, Clone)]
@@ -185,6 +213,10 @@ impl IngestStore {
             .bind(message_id == &canonical_primary_message_id)
             .execute(&mut *tx)
             .await?;
+        }
+
+        if let Some(patch_facts) = &input.patch_facts {
+            upsert_message_patch_facts(&mut tx, message_pk, patch_facts).await?;
         }
 
         let instance_result = sqlx::query(
@@ -529,6 +561,10 @@ impl IngestStore {
             }
         }
 
+        let patch_facts_by_message_pk =
+            collect_patch_facts_by_message_pk(rows, &pending_indexes, &message_pk_by_commit);
+        upsert_message_patch_facts_batch(&mut tx, &patch_facts_by_message_pk).await?;
+
         let mut message_pks: Vec<i64> = message_pk_by_commit.values().copied().collect();
         message_pks.sort_unstable();
         message_pks.dedup();
@@ -852,6 +888,10 @@ impl IngestStore {
             )
             .await?
         };
+
+        let patch_facts_by_message_pk =
+            collect_patch_facts_by_message_pk(rows, &pending_indexes, &message_pk_by_commit);
+        upsert_message_patch_facts_batch(&mut tx, &patch_facts_by_message_pk).await?;
 
         let mut message_pks: Vec<i64> = message_pk_by_commit.values().copied().collect();
         message_pks.sort_unstable();
@@ -1336,6 +1376,235 @@ async fn promote_message_id_rows(
                 .push(")");
         }
         qb.push(")");
+        qb.build().execute(&mut **tx).await?;
+    }
+
+    Ok(())
+}
+
+fn collect_patch_facts_by_message_pk(
+    rows: &[IngestCommitRow],
+    pending_indexes: &[usize],
+    message_pk_by_commit: &HashMap<String, i64>,
+) -> HashMap<i64, ParsedPatchFactsInput> {
+    let mut facts_by_message_pk = HashMap::new();
+    for idx in pending_indexes {
+        let row = &rows[*idx];
+        let Some(message_pk) = message_pk_by_commit.get(&row.git_commit_oid).copied() else {
+            continue;
+        };
+        let Some(facts) = row.parsed_message.patch_facts.as_ref() else {
+            continue;
+        };
+
+        facts_by_message_pk
+            .entry(message_pk)
+            .or_insert_with(|| facts.clone());
+    }
+    facts_by_message_pk
+}
+
+fn merge_patch_file_fact_row(
+    existing: &mut ParsedPatchFileFactInput,
+    incoming: &ParsedPatchFileFactInput,
+) {
+    if existing.old_path.is_none() {
+        existing.old_path = incoming.old_path.clone();
+    }
+    existing.is_binary |= incoming.is_binary;
+    existing.additions = existing.additions.saturating_add(incoming.additions);
+    existing.deletions = existing.deletions.saturating_add(incoming.deletions);
+    existing.hunk_count = existing.hunk_count.saturating_add(incoming.hunk_count);
+    existing.diff_start = existing.diff_start.min(incoming.diff_start);
+    existing.diff_end = existing.diff_end.max(incoming.diff_end);
+    if existing.change_type == "M" {
+        existing.change_type = incoming.change_type.clone();
+    }
+}
+
+async fn upsert_message_patch_facts(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    message_pk: i64,
+    facts: &ParsedPatchFactsInput,
+) -> Result<()> {
+    sqlx::query(
+        r#"INSERT INTO message_patch_facts
+           (message_pk, has_diff, patch_id_stable, base_commit, change_id, file_count, additions, deletions, hunk_count)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+           ON CONFLICT (message_pk)
+           DO UPDATE SET has_diff = EXCLUDED.has_diff,
+                         patch_id_stable = COALESCE(EXCLUDED.patch_id_stable, message_patch_facts.patch_id_stable),
+                         base_commit = COALESCE(EXCLUDED.base_commit, message_patch_facts.base_commit),
+                         change_id = COALESCE(EXCLUDED.change_id, message_patch_facts.change_id),
+                         file_count = EXCLUDED.file_count,
+                         additions = EXCLUDED.additions,
+                         deletions = EXCLUDED.deletions,
+                         hunk_count = EXCLUDED.hunk_count,
+                         updated_at = now()"#,
+    )
+    .bind(message_pk)
+    .bind(facts.has_diff)
+    .bind(&facts.patch_id_stable)
+    .bind(&facts.base_commit)
+    .bind(&facts.change_id)
+    .bind(facts.file_count)
+    .bind(facts.additions)
+    .bind(facts.deletions)
+    .bind(facts.hunk_count)
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query("DELETE FROM message_patch_file_facts WHERE message_pk = $1")
+        .bind(message_pk)
+        .execute(&mut **tx)
+        .await?;
+
+    if facts.files.is_empty() {
+        return Ok(());
+    }
+
+    let mut qb: QueryBuilder<'_, Postgres> = QueryBuilder::new(
+        "INSERT INTO message_patch_file_facts \
+         (message_pk, old_path, new_path, change_type, is_binary, additions, deletions, hunk_count, diff_start, diff_end) ",
+    );
+    qb.push_values(facts.files.iter(), |mut b, file| {
+        b.push_bind(message_pk)
+            .push_bind(&file.old_path)
+            .push_bind(&file.new_path)
+            .push_bind(&file.change_type)
+            .push_bind(file.is_binary)
+            .push_bind(file.additions)
+            .push_bind(file.deletions)
+            .push_bind(file.hunk_count)
+            .push_bind(file.diff_start)
+            .push_bind(file.diff_end);
+    });
+    qb.push(
+        " ON CONFLICT (message_pk, new_path) DO UPDATE SET \
+          old_path = EXCLUDED.old_path, \
+          change_type = EXCLUDED.change_type, \
+          is_binary = EXCLUDED.is_binary, \
+          additions = EXCLUDED.additions, \
+          deletions = EXCLUDED.deletions, \
+          hunk_count = EXCLUDED.hunk_count, \
+          diff_start = EXCLUDED.diff_start, \
+          diff_end = EXCLUDED.diff_end",
+    );
+    qb.build().execute(&mut **tx).await?;
+
+    Ok(())
+}
+
+async fn upsert_message_patch_facts_batch(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    facts_by_message_pk: &HashMap<i64, ParsedPatchFactsInput>,
+) -> Result<()> {
+    if facts_by_message_pk.is_empty() {
+        return Ok(());
+    }
+
+    let mut message_fact_rows = facts_by_message_pk
+        .iter()
+        .map(|(message_pk, facts)| (*message_pk, facts))
+        .collect::<Vec<_>>();
+    message_fact_rows.sort_by_key(|(message_pk, _)| *message_pk);
+
+    const MESSAGE_FACT_BINDS_PER_ROW: usize = 9;
+    let rows_per_chunk = (MAX_QUERY_BIND_PARAMS / MESSAGE_FACT_BINDS_PER_ROW).max(1);
+
+    for chunk in message_fact_rows.chunks(rows_per_chunk) {
+        let mut qb: QueryBuilder<'_, Postgres> = QueryBuilder::new(
+            "INSERT INTO message_patch_facts \
+             (message_pk, has_diff, patch_id_stable, base_commit, change_id, file_count, additions, deletions, hunk_count) ",
+        );
+        qb.push_values(chunk.iter(), |mut b, (message_pk, facts)| {
+            b.push_bind(*message_pk)
+                .push_bind(facts.has_diff)
+                .push_bind(&facts.patch_id_stable)
+                .push_bind(&facts.base_commit)
+                .push_bind(&facts.change_id)
+                .push_bind(facts.file_count)
+                .push_bind(facts.additions)
+                .push_bind(facts.deletions)
+                .push_bind(facts.hunk_count);
+        });
+        qb.push(
+            " ON CONFLICT (message_pk) DO UPDATE SET \
+              has_diff = EXCLUDED.has_diff, \
+              patch_id_stable = COALESCE(EXCLUDED.patch_id_stable, message_patch_facts.patch_id_stable), \
+              base_commit = COALESCE(EXCLUDED.base_commit, message_patch_facts.base_commit), \
+              change_id = COALESCE(EXCLUDED.change_id, message_patch_facts.change_id), \
+              file_count = EXCLUDED.file_count, \
+              additions = EXCLUDED.additions, \
+              deletions = EXCLUDED.deletions, \
+              hunk_count = EXCLUDED.hunk_count, \
+              updated_at = now()",
+        );
+        qb.build().execute(&mut **tx).await?;
+    }
+
+    let message_pks: Vec<i64> = message_fact_rows
+        .iter()
+        .map(|(message_pk, _)| *message_pk)
+        .collect();
+    sqlx::query("DELETE FROM message_patch_file_facts WHERE message_pk = ANY($1)")
+        .bind(&message_pks)
+        .execute(&mut **tx)
+        .await?;
+
+    let mut deduped_file_rows = HashMap::<(i64, String), ParsedPatchFileFactInput>::new();
+    for (message_pk, facts) in message_fact_rows {
+        for file in &facts.files {
+            let key = (message_pk, file.new_path.clone());
+            if let Some(existing) = deduped_file_rows.get_mut(&key) {
+                merge_patch_file_fact_row(existing, file);
+            } else {
+                deduped_file_rows.insert(key, file.clone());
+            }
+        }
+    }
+
+    if deduped_file_rows.is_empty() {
+        return Ok(());
+    }
+
+    let mut file_rows = deduped_file_rows
+        .into_iter()
+        .map(|((message_pk, new_path), file)| (message_pk, new_path, file))
+        .collect::<Vec<_>>();
+    file_rows.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+
+    const FILE_FACT_BINDS_PER_ROW: usize = 10;
+    let file_rows_per_chunk = (MAX_QUERY_BIND_PARAMS / FILE_FACT_BINDS_PER_ROW).max(1);
+
+    for chunk in file_rows.chunks(file_rows_per_chunk) {
+        let mut qb: QueryBuilder<'_, Postgres> = QueryBuilder::new(
+            "INSERT INTO message_patch_file_facts \
+             (message_pk, old_path, new_path, change_type, is_binary, additions, deletions, hunk_count, diff_start, diff_end) ",
+        );
+        qb.push_values(chunk.iter(), |mut b, row| {
+            b.push_bind(row.0)
+                .push_bind(&row.2.old_path)
+                .push_bind(&row.2.new_path)
+                .push_bind(&row.2.change_type)
+                .push_bind(row.2.is_binary)
+                .push_bind(row.2.additions)
+                .push_bind(row.2.deletions)
+                .push_bind(row.2.hunk_count)
+                .push_bind(row.2.diff_start)
+                .push_bind(row.2.diff_end);
+        });
+        qb.push(
+            " ON CONFLICT (message_pk, new_path) DO UPDATE SET \
+              old_path = EXCLUDED.old_path, \
+              change_type = EXCLUDED.change_type, \
+              is_binary = EXCLUDED.is_binary, \
+              additions = EXCLUDED.additions, \
+              deletions = EXCLUDED.deletions, \
+              hunk_count = EXCLUDED.hunk_count, \
+              diff_start = EXCLUDED.diff_start, \
+              diff_end = EXCLUDED.diff_end",
+        );
         qb.build().execute(&mut **tx).await?;
     }
 

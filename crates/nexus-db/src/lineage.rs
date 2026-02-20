@@ -68,6 +68,10 @@ pub struct LineageSourceMessage {
     pub date_utc: Option<DateTime<Utc>>,
     pub references_ids: Vec<String>,
     pub in_reply_to_ids: Vec<String>,
+    pub base_commit: Option<String>,
+    pub change_id: Option<String>,
+    pub has_diff: bool,
+    pub patch_id_stable: Option<String>,
     pub body_text: Option<String>,
     pub diff_text: Option<String>,
 }
@@ -169,6 +173,13 @@ pub struct PatchItemFileBatchInput {
     pub deletions: i32,
     pub hunk_count: i32,
     pub files: Vec<UpsertPatchItemFileInput>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PatchFactHydrationOutcome {
+    pub hydrated_patch_items: u64,
+    pub patch_item_files_written: u64,
+    pub missing_patch_item_ids: Vec<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -530,13 +541,19 @@ impl LineageStore {
                     m.date_utc,
                     m.references_ids,
                     m.in_reply_to_ids,
-                    mb.body_text,
-                    mb.diff_text
+                    mpf.base_commit,
+                    mpf.change_id,
+                    COALESCE(mpf.has_diff, mb.has_diff, false) AS has_diff,
+                    mpf.patch_id_stable,
+                    NULL::text AS body_text,
+                    NULL::text AS diff_text
                 FROM thread_messages tm
                 JOIN messages m
                   ON m.id = tm.message_pk
                 JOIN message_bodies mb
                   ON mb.id = m.body_id
+                LEFT JOIN message_patch_facts mpf
+                  ON mpf.message_pk = m.id
                 WHERE tm.mailing_list_id = $1
                   AND tm.thread_id = ANY($2)
                 ORDER BY tm.thread_id ASC, tm.sort_key ASC"#,
@@ -1325,6 +1342,193 @@ impl LineageStore {
 
         tx.commit().await?;
         Ok(())
+    }
+
+    pub async fn hydrate_patch_items_from_message_facts(
+        &self,
+        patch_item_ids: &[i64],
+    ) -> Result<PatchFactHydrationOutcome> {
+        let mut ids = patch_item_ids
+            .iter()
+            .copied()
+            .filter(|patch_item_id| *patch_item_id > 0)
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+
+        if ids.is_empty() {
+            return Ok(PatchFactHydrationOutcome::default());
+        }
+
+        #[derive(sqlx::FromRow)]
+        struct PatchFactRow {
+            patch_item_id: i64,
+            has_fact: bool,
+            has_diff: bool,
+            patch_id_stable: Option<String>,
+        }
+
+        let fact_rows = sqlx::query_as::<_, PatchFactRow>(
+            r#"SELECT
+                pi.id AS patch_item_id,
+                (mpf.message_pk IS NOT NULL) AS has_fact,
+                COALESCE(mpf.has_diff, false) AS has_diff,
+                mpf.patch_id_stable
+            FROM patch_items pi
+            LEFT JOIN message_patch_facts mpf
+              ON mpf.message_pk = pi.message_pk
+            WHERE pi.id = ANY($1)
+            ORDER BY pi.id ASC"#,
+        )
+        .bind(&ids)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut seen_patch_item_ids = BTreeSet::new();
+        let mut hydrated_patch_item_ids = Vec::new();
+        let mut missing_patch_item_ids = Vec::new();
+        let mut patch_id_updates = Vec::new();
+        let mut has_diff_updates = Vec::new();
+
+        for row in fact_rows {
+            seen_patch_item_ids.insert(row.patch_item_id);
+            if row.has_fact {
+                hydrated_patch_item_ids.push(row.patch_item_id);
+                patch_id_updates.push((row.patch_item_id, row.patch_id_stable));
+                has_diff_updates.push((row.patch_item_id, row.has_diff));
+            } else {
+                missing_patch_item_ids.push(row.patch_item_id);
+            }
+        }
+
+        for patch_item_id in ids {
+            if !seen_patch_item_ids.contains(&patch_item_id) {
+                missing_patch_item_ids.push(patch_item_id);
+            }
+        }
+
+        if hydrated_patch_item_ids.is_empty() {
+            missing_patch_item_ids.sort_unstable();
+            missing_patch_item_ids.dedup();
+            return Ok(PatchFactHydrationOutcome {
+                hydrated_patch_items: 0,
+                patch_item_files_written: 0,
+                missing_patch_item_ids,
+            });
+        }
+
+        #[derive(sqlx::FromRow)]
+        struct PatchFileRow {
+            patch_item_id: i64,
+            old_path: Option<String>,
+            new_path: String,
+            change_type: String,
+            is_binary: bool,
+            additions: i32,
+            deletions: i32,
+            hunk_count: i32,
+            diff_start: i32,
+            diff_end: i32,
+        }
+
+        let file_rows = sqlx::query_as::<_, PatchFileRow>(
+            r#"SELECT
+                pi.id AS patch_item_id,
+                mpff.old_path,
+                mpff.new_path,
+                mpff.change_type,
+                mpff.is_binary,
+                mpff.additions,
+                mpff.deletions,
+                mpff.hunk_count,
+                mpff.diff_start,
+                mpff.diff_end
+            FROM patch_items pi
+            JOIN message_patch_file_facts mpff
+              ON mpff.message_pk = pi.message_pk
+            WHERE pi.id = ANY($1)
+            ORDER BY pi.id ASC, mpff.new_path ASC"#,
+        )
+        .bind(&hydrated_patch_item_ids)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut files_by_patch_item = BTreeMap::<i64, Vec<UpsertPatchItemFileInput>>::new();
+        for patch_item_id in &hydrated_patch_item_ids {
+            files_by_patch_item.insert(*patch_item_id, Vec::new());
+        }
+
+        for row in file_rows {
+            files_by_patch_item
+                .entry(row.patch_item_id)
+                .or_default()
+                .push(UpsertPatchItemFileInput {
+                    old_path: row.old_path,
+                    new_path: row.new_path,
+                    change_type: row.change_type,
+                    is_binary: row.is_binary,
+                    additions: row.additions,
+                    deletions: row.deletions,
+                    hunk_count: row.hunk_count,
+                    diff_start: row.diff_start,
+                    diff_end: row.diff_end,
+                });
+        }
+
+        let mut patch_item_files_written = 0u64;
+        let mut file_batches = Vec::with_capacity(hydrated_patch_item_ids.len());
+        for patch_item_id in &hydrated_patch_item_ids {
+            let files = files_by_patch_item
+                .remove(patch_item_id)
+                .unwrap_or_default();
+            patch_item_files_written += files.len() as u64;
+
+            let mut additions = 0i32;
+            let mut deletions = 0i32;
+            let mut hunk_count = 0i32;
+            for file in &files {
+                additions = additions.saturating_add(file.additions);
+                deletions = deletions.saturating_add(file.deletions);
+                hunk_count = hunk_count.saturating_add(file.hunk_count);
+            }
+
+            file_batches.push(PatchItemFileBatchInput {
+                patch_item_id: *patch_item_id,
+                file_count: files.len() as i32,
+                additions,
+                deletions,
+                hunk_count,
+                files,
+            });
+        }
+
+        self.replace_patch_item_files_batch(&file_batches).await?;
+        self.set_patch_item_patch_ids_batch(&patch_id_updates)
+            .await?;
+
+        const HAS_DIFF_BINDS_PER_ROW: usize = 2;
+        let rows_per_chunk = (MAX_QUERY_BIND_PARAMS / HAS_DIFF_BINDS_PER_ROW).max(1);
+        for chunk in has_diff_updates.chunks(rows_per_chunk) {
+            let mut qb: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
+                "UPDATE patch_items pi \
+                 SET has_diff = vals.has_diff \
+                 FROM (",
+            );
+            qb.push_values(chunk.iter(), |mut b, (patch_item_id, has_diff)| {
+                b.push_bind(*patch_item_id).push_bind(*has_diff);
+            });
+            qb.push(") AS vals(patch_item_id, has_diff) WHERE pi.id = vals.patch_item_id");
+            qb.build().execute(&self.pool).await?;
+        }
+
+        missing_patch_item_ids.sort_unstable();
+        missing_patch_item_ids.dedup();
+
+        Ok(PatchFactHydrationOutcome {
+            hydrated_patch_items: hydrated_patch_item_ids.len() as u64,
+            patch_item_files_written,
+            missing_patch_item_ids,
+        })
     }
 
     pub async fn update_patch_item_diff_stats(

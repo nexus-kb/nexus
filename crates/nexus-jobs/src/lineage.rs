@@ -2,12 +2,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use anyhow::Context;
 use chrono::{DateTime, Duration, Utc};
-use once_cell::sync::Lazy;
-use regex::Regex;
 use sha2::{Digest, Sha256};
 
 use crate::diff_metadata::parse_diff_metadata;
-use crate::patch_detect::extract_diff_text;
 use crate::patch_id::PatchIdMemo;
 use crate::patch_subject::parse_patch_subject;
 use nexus_db::{
@@ -15,11 +12,6 @@ use nexus_db::{
     UpsertPatchItemFileInput, UpsertPatchItemInput, UpsertPatchSeriesInput,
     UpsertPatchSeriesVersionInput,
 };
-
-static CHANGE_ID_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?im)^change-id:\s*(\S+)").expect("valid change-id regex"));
-static BASE_COMMIT_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?im)^base-commit:\s*(\S+)").expect("valid base-commit regex"));
 
 #[derive(Debug, Clone, Default)]
 pub struct PatchExtractOutcome {
@@ -39,6 +31,14 @@ pub struct PatchIdComputeOutcome {
 #[derive(Debug, Clone, Default)]
 pub struct DiffParseOutcome {
     pub patch_items_updated: u64,
+    pub patch_item_files_written: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PatchEnrichmentOutcome {
+    pub patch_items_hydrated: u64,
+    pub patch_items_fallback_patch_id: u64,
+    pub patch_items_fallback_diff_parse: u64,
     pub patch_item_files_written: u64,
 }
 
@@ -134,8 +134,7 @@ async fn process_patch_extract_source_messages(
         return Ok(output);
     }
 
-    let mut memo = PatchIdMemo::default();
-    let mut candidates = build_candidates(source_messages, &mut memo);
+    let mut candidates = build_candidates(source_messages);
 
     if candidates.is_empty() {
         return Ok(output);
@@ -390,10 +389,49 @@ pub async fn process_diff_parse_patch_items(
     })
 }
 
-fn build_candidates(
-    messages: Vec<LineageSourceMessage>,
-    patch_id_memo: &mut PatchIdMemo,
-) -> Vec<CandidateVersion> {
+pub async fn process_patch_enrichment_batch(
+    store: &LineageStore,
+    patch_item_ids: &[i64],
+) -> anyhow::Result<PatchEnrichmentOutcome> {
+    let mut ids = patch_item_ids.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    ids.retain(|v| *v > 0);
+
+    if ids.is_empty() {
+        return Ok(PatchEnrichmentOutcome::default());
+    }
+
+    let hydration = store
+        .hydrate_patch_items_from_message_facts(&ids)
+        .await
+        .context("hydrate patch items from message patch facts")?;
+
+    let mut output = PatchEnrichmentOutcome {
+        patch_items_hydrated: hydration.hydrated_patch_items,
+        patch_item_files_written: hydration.patch_item_files_written,
+        ..PatchEnrichmentOutcome::default()
+    };
+
+    if hydration.missing_patch_item_ids.is_empty() {
+        return Ok(output);
+    }
+
+    let patch_id_outcome = process_patch_id_compute_batch(store, &hydration.missing_patch_item_ids)
+        .await
+        .context("fallback patch-id compute for missing patch facts")?;
+    let diff_outcome = process_diff_parse_patch_items(store, &hydration.missing_patch_item_ids)
+        .await
+        .context("fallback diff parse for missing patch facts")?;
+
+    output.patch_items_fallback_patch_id = patch_id_outcome.patch_items_updated;
+    output.patch_items_fallback_diff_parse = diff_outcome.patch_items_updated;
+    output.patch_item_files_written += diff_outcome.patch_item_files_written;
+
+    Ok(output)
+}
+
+fn build_candidates(messages: Vec<LineageSourceMessage>) -> Vec<CandidateVersion> {
     let mut by_thread: BTreeMap<i64, Vec<LineageSourceMessage>> = BTreeMap::new();
     for msg in messages {
         by_thread.entry(msg.thread_id).or_default().push(msg);
@@ -436,15 +474,7 @@ fn build_candidates(
             } else {
                 parsed.version_num
             };
-            let extracted_diff = message
-                .diff_text
-                .as_deref()
-                .and_then(extract_diff_text)
-                .or_else(|| message.body_text.as_deref().and_then(extract_diff_text));
-            let has_diff = extracted_diff
-                .as_deref()
-                .map(|value| !value.trim().is_empty())
-                .unwrap_or(false);
+            let has_diff = message.has_diff;
 
             if !parsed.has_patch_tag {
                 continue;
@@ -501,8 +531,8 @@ fn build_candidates(
                     subject_norm: message.subject_norm.clone(),
                     cover_message_pk: None,
                     first_patch_message_pk: None,
-                    base_commit: message.body_text.as_deref().and_then(extract_base_commit),
-                    change_id: message.body_text.as_deref().and_then(extract_change_id),
+                    base_commit: message.base_commit.clone(),
+                    change_id: message.change_id.clone(),
                     reference_message_ids: lineage_reference_ids(&message),
                     items: Vec::new(),
                 });
@@ -521,10 +551,10 @@ fn build_candidates(
             }
 
             if entry.change_id.is_none() {
-                entry.change_id = message.body_text.as_deref().and_then(extract_change_id);
+                entry.change_id = message.change_id.clone();
             }
             if entry.base_commit.is_none() {
-                entry.base_commit = message.body_text.as_deref().and_then(extract_base_commit);
+                entry.base_commit = message.base_commit.clone();
             }
             if entry.reference_message_ids.is_empty() {
                 entry.reference_message_ids = lineage_reference_ids(&message);
@@ -539,9 +569,11 @@ fn build_candidates(
                 entry.first_patch_message_pk = Some(message.message_pk);
             }
 
-            let patch_id_stable = extracted_diff
-                .as_deref()
-                .and_then(|diff| patch_id_memo.compute(diff));
+            let patch_id_stable = if item_type == "patch" {
+                message.patch_id_stable.clone()
+            } else {
+                None
+            };
 
             entry.items.push(CandidateItem {
                 message_pk: message.message_pk,
@@ -967,22 +999,6 @@ fn lineage_reference_ids(message: &LineageSourceMessage) -> Vec<String> {
     nexus_db::LineageStore::unique_message_ids(&message.references_ids, &message.in_reply_to_ids)
 }
 
-fn extract_change_id(body_text: &str) -> Option<String> {
-    CHANGE_ID_RE
-        .captures(body_text)
-        .and_then(|caps| caps.get(1))
-        .map(|value| value.as_str().trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-fn extract_base_commit(body_text: &str) -> Option<String> {
-    BASE_COMMIT_RE
-        .captures(body_text)
-        .and_then(|caps| caps.get(1))
-        .map(|value| value.as_str().trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
 fn epoch_utc() -> DateTime<Utc> {
     DateTime::<Utc>::from_timestamp(0, 0).expect("unix epoch valid")
 }
@@ -998,13 +1014,9 @@ mod tests {
     use sqlx::Row;
 
     use crate::mail::parse_email;
-    use crate::patch_id::PatchIdMemo;
     use crate::patch_subject::parse_patch_subject;
 
-    use super::{
-        build_candidates, process_diff_parse_patch_items, process_patch_extract_threads,
-        process_patch_id_compute_batch,
-    };
+    use super::{build_candidates, process_patch_enrichment_batch, process_patch_extract_threads};
 
     #[test]
     fn subject_examples_are_supported() {
@@ -1093,8 +1105,7 @@ mod tests {
             ),
         ];
 
-        let mut memo = PatchIdMemo::default();
-        let candidates = build_candidates(messages, &mut memo);
+        let candidates = build_candidates(messages);
         assert_eq!(candidates.len(), 1);
 
         let candidate = &candidates[0];
@@ -1189,6 +1200,7 @@ mod tests {
                     has_diff: parsed.has_diff,
                     has_attachments: parsed.has_attachments,
                 },
+                patch_facts: None,
             };
 
             let outcome = ingest
@@ -1257,13 +1269,12 @@ mod tests {
         );
         assert!(!first.patch_item_ids.is_empty());
 
-        let patch_id_outcome =
-            process_patch_id_compute_batch(&lineage, &first.patch_item_ids).await?;
-        assert!(patch_id_outcome.patch_items_updated >= 1);
-        let diff_parse_outcome =
-            process_diff_parse_patch_items(&lineage, &first.patch_item_ids).await?;
-        assert!(diff_parse_outcome.patch_items_updated >= 1);
-        assert!(diff_parse_outcome.patch_item_files_written >= 1);
+        let enrichment_outcome =
+            process_patch_enrichment_batch(&lineage, &first.patch_item_ids).await?;
+        assert!(enrichment_outcome.patch_items_hydrated == 0);
+        assert!(enrichment_outcome.patch_items_fallback_patch_id >= 1);
+        assert!(enrichment_outcome.patch_items_fallback_diff_parse >= 1);
+        assert!(enrichment_outcome.patch_item_files_written >= 1);
 
         let series_id = first.series_ids[0];
         let series_count: i64 =
@@ -1413,8 +1424,8 @@ mod tests {
 
         let before_counts = snapshot_counts(db.pool(), series_id).await?;
         let _second = process_patch_extract_threads(&lineage, list.id, &[thread_id]).await?;
-        let _second_diff_parse =
-            process_diff_parse_patch_items(&lineage, &first.patch_item_ids).await?;
+        let _second_enrichment =
+            process_patch_enrichment_batch(&lineage, &first.patch_item_ids).await?;
         let after_counts = snapshot_counts(db.pool(), series_id).await?;
         assert_eq!(before_counts, after_counts);
 
@@ -1572,6 +1583,10 @@ mod tests {
             date_utc: Some(date_utc),
             references_ids: Vec::new(),
             in_reply_to_ids: Vec::new(),
+            base_commit: None,
+            change_id: None,
+            has_diff: diff_text.is_some(),
+            patch_id_stable: None,
             body_text: Some(body_text.to_string()),
             diff_text: diff_text.map(str::to_string),
         }

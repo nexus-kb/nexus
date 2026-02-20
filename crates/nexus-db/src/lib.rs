@@ -22,7 +22,7 @@ pub use crate::embeddings::{
 };
 pub use crate::ingest::{
     BatchWriteOutcome, IngestCommitRow, IngestStore, ParsedBodyInput, ParsedMessageInput,
-    WriteOutcome,
+    ParsedPatchFactsInput, ParsedPatchFileFactInput, WriteOutcome,
 };
 pub use crate::jobs::{
     EnqueueJobParams, JobAttempt, JobStateCount, JobStore, JobStoreMetrics, JobTypeStateCount,
@@ -30,13 +30,14 @@ pub use crate::jobs::{
 };
 pub use crate::lineage::{
     AssembledItemRecord, LineageSourceMessage, LineageStore, ListThreadsParams, MessageBodyRecord,
-    MessageDetailRecord, PatchItemDetailRecord, PatchItemDiffRecord, PatchItemFileAggregateRecord,
-    PatchItemFileBatchInput, PatchItemFileDiffSliceSource, PatchItemFileRecord, PatchItemRecord,
-    PatchLogicalRecord, PatchSeriesRecord, PatchSeriesVersionRecord, SeriesListItemRecord,
-    SeriesLogicalCompareRow, SeriesVersionPatchItemRecord, SeriesVersionPatchRef,
-    SeriesVersionSummaryRecord, ThreadListItemRecord, ThreadMessageRecord, ThreadParticipantRecord,
-    ThreadRefRecord, ThreadSummaryRecord, UpsertPatchItemFileInput, UpsertPatchItemInput,
-    UpsertPatchSeriesInput, UpsertPatchSeriesVersionInput,
+    MessageDetailRecord, PatchFactHydrationOutcome, PatchItemDetailRecord, PatchItemDiffRecord,
+    PatchItemFileAggregateRecord, PatchItemFileBatchInput, PatchItemFileDiffSliceSource,
+    PatchItemFileRecord, PatchItemRecord, PatchLogicalRecord, PatchSeriesRecord,
+    PatchSeriesVersionRecord, SeriesListItemRecord, SeriesLogicalCompareRow,
+    SeriesVersionPatchItemRecord, SeriesVersionPatchRef, SeriesVersionSummaryRecord,
+    ThreadListItemRecord, ThreadMessageRecord, ThreadParticipantRecord, ThreadRefRecord,
+    ThreadSummaryRecord, UpsertPatchItemFileInput, UpsertPatchItemInput, UpsertPatchSeriesInput,
+    UpsertPatchSeriesVersionInput,
 };
 pub use crate::models::{EmbeddingBackfillRun, Job, JobState, MeiliBootstrapRun, PipelineRun};
 pub use crate::pipeline::{ListPipelineRunsParams, PipelineStore};

@@ -12,20 +12,25 @@ use nexus_core::search::MeiliIndexKind;
 use nexus_db::{
     CatalogStore, EmbeddingVectorUpsert, EmbeddingsStore, EnqueueJobParams, IngestCommitRow,
     IngestStore, Job, JobStore, JobStoreMetrics, LineageStore, MailingListRepo, ParsedBodyInput,
-    ParsedMessageInput, PipelineStore, SearchStore, ThreadComponentWrite, ThreadMessageWrite,
-    ThreadNodeWrite, ThreadSummaryWrite, ThreadingApplyStats, ThreadingRunContext, ThreadingStore,
+    ParsedMessageInput, ParsedPatchFactsInput, ParsedPatchFileFactInput, PipelineStore,
+    SearchStore, ThreadComponentWrite, ThreadMessageWrite, ThreadNodeWrite, ThreadSummaryWrite,
+    ThreadingApplyStats, ThreadingRunContext, ThreadingStore,
 };
+use once_cell::sync::Lazy;
+use regex::Regex;
 use sha2::{Digest, Sha256};
 use tokio::task::JoinSet;
 use tokio::time::{Duration, sleep};
 use tracing::{info, warn};
 
+use crate::diff_metadata::parse_diff_metadata;
 use crate::lineage::{
-    process_diff_parse_patch_items, process_patch_extract_threads, process_patch_extract_window,
-    process_patch_id_compute_batch,
+    process_patch_enrichment_batch, process_patch_extract_threads, process_patch_extract_window,
 };
 use crate::mail::{ParseEmailError, parse_email};
 use crate::meili::{MeiliClient, MeiliClientError, settings_differ};
+use crate::patch_detect::extract_diff_text;
+use crate::patch_id::compute_patch_id_stable;
 use crate::payloads::{
     EmbeddingBackfillRunPayload, EmbeddingGenerateBatchPayload, EmbeddingScope,
     LineageRebuildListPayload, MeiliBootstrapRunPayload, PipelineEmbeddingPayload,
@@ -63,6 +68,11 @@ const PRIORITY_LINEAGE: i32 = 14;
 const PRIORITY_LEXICAL: i32 = 12;
 const PRIORITY_PIPELINE_EMBEDDING: i32 = 3;
 const PRIORITY_EMBEDDING_BATCH: i32 = 2;
+
+static CHANGE_ID_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?im)^change-id:\s*(\S+)").expect("valid change-id regex"));
+static BASE_COMMIT_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?im)^base-commit:\s*(\S+)").expect("valid base-commit regex"));
 
 impl Phase0JobHandler {
     pub fn new(
@@ -959,6 +969,9 @@ impl Phase0JobHandler {
         let mut series_versions_written = 0u64;
         let mut patch_items_written = 0u64;
         let mut patch_item_files_written = 0u64;
+        let mut patch_items_hydrated = 0u64;
+        let mut patch_items_fallback_patch_id = 0u64;
+        let mut patch_items_fallback_diff_parse = 0u64;
 
         loop {
             if let Err(err) = ctx.heartbeat().await {
@@ -1095,28 +1108,20 @@ impl Phase0JobHandler {
             };
 
             if !extract_outcome.patch_item_ids.is_empty() {
-                let patch_item_ids = extract_outcome.patch_item_ids.clone();
-                let (patch_id_result, diff_result) = tokio::join!(
-                    process_patch_id_compute_batch(&self.lineage, &patch_item_ids),
-                    process_diff_parse_patch_items(&self.lineage, &patch_item_ids),
-                );
-
-                if let Err(err) = patch_id_result {
-                    return retryable_error(
-                        format!("patch_id compute failed for run {}: {err}", run.id),
-                        "parse",
-                        &job,
-                        started.elapsed().as_millis(),
-                        &self.settings,
-                    );
-                }
-                match diff_result {
-                    Ok(diff_outcome) => {
-                        patch_item_files_written += diff_outcome.patch_item_files_written;
+                match process_patch_enrichment_batch(&self.lineage, &extract_outcome.patch_item_ids)
+                    .await
+                {
+                    Ok(enrichment_outcome) => {
+                        patch_item_files_written += enrichment_outcome.patch_item_files_written;
+                        patch_items_hydrated += enrichment_outcome.patch_items_hydrated;
+                        patch_items_fallback_patch_id +=
+                            enrichment_outcome.patch_items_fallback_patch_id;
+                        patch_items_fallback_diff_parse +=
+                            enrichment_outcome.patch_items_fallback_diff_parse;
                     }
                     Err(err) => {
                         return retryable_error(
-                            format!("diff parse failed for run {}: {err}", run.id),
+                            format!("patch enrichment failed for run {}: {err}", run.id),
                             "parse",
                             &job,
                             started.elapsed().as_millis(),
@@ -1145,6 +1150,9 @@ impl Phase0JobHandler {
                     "series_versions_written": series_versions_written,
                     "patch_items_written": patch_items_written,
                     "patch_files_written": patch_item_files_written,
+                    "patch_items_hydrated": patch_items_hydrated,
+                    "patch_items_fallback_patch_id": patch_items_fallback_patch_id,
+                    "patch_items_fallback_diff_parse": patch_items_fallback_diff_parse,
                 });
                 if let Err(err) = self.pipeline.update_run_progress(run.id, progress).await {
                     warn!(run_id = run.id, error = %err, "progress checkpoint failed");
@@ -1205,6 +1213,9 @@ impl Phase0JobHandler {
                 "series_versions_written": series_versions_written,
                 "patch_items_written": patch_items_written,
                 "patch_item_files_written": patch_item_files_written,
+                "patch_items_hydrated": patch_items_hydrated,
+                "patch_items_fallback_patch_id": patch_items_fallback_patch_id,
+                "patch_items_fallback_diff_parse": patch_items_fallback_diff_parse,
                 "next_stage": STAGE_LEXICAL,
             }),
             metrics: JobStoreMetrics {
@@ -2450,6 +2461,9 @@ impl Phase0JobHandler {
         let mut series_versions_written = 0u64;
         let mut patch_items_written = 0u64;
         let mut patch_item_files_written = 0u64;
+        let mut patch_items_hydrated = 0u64;
+        let mut patch_items_fallback_patch_id = 0u64;
+        let mut patch_items_fallback_diff_parse = 0u64;
         let mut last_progress_log = Instant::now();
         let batch_limit = self.settings.mail.commit_batch_size.max(1) as i64;
 
@@ -2572,28 +2586,20 @@ impl Phase0JobHandler {
             };
 
             if !extract_outcome.patch_item_ids.is_empty() {
-                let patch_item_ids = extract_outcome.patch_item_ids.clone();
-                let (patch_id_result, diff_result) = tokio::join!(
-                    process_patch_id_compute_batch(&self.lineage, &patch_item_ids),
-                    process_diff_parse_patch_items(&self.lineage, &patch_item_ids),
-                );
-
-                if let Err(err) = patch_id_result {
-                    return retryable_error(
-                        format!("patch_id compute failed: {err}"),
-                        "parse",
-                        &job,
-                        started.elapsed().as_millis(),
-                        &self.settings,
-                    );
-                }
-                match diff_result {
-                    Ok(diff_outcome) => {
-                        patch_item_files_written += diff_outcome.patch_item_files_written;
+                match process_patch_enrichment_batch(&self.lineage, &extract_outcome.patch_item_ids)
+                    .await
+                {
+                    Ok(enrichment_outcome) => {
+                        patch_item_files_written += enrichment_outcome.patch_item_files_written;
+                        patch_items_hydrated += enrichment_outcome.patch_items_hydrated;
+                        patch_items_fallback_patch_id +=
+                            enrichment_outcome.patch_items_fallback_patch_id;
+                        patch_items_fallback_diff_parse +=
+                            enrichment_outcome.patch_items_fallback_diff_parse;
                     }
                     Err(err) => {
                         return retryable_error(
-                            format!("diff parse failed: {err}"),
+                            format!("patch enrichment failed: {err}"),
                             "parse",
                             &job,
                             started.elapsed().as_millis(),
@@ -2624,6 +2630,9 @@ impl Phase0JobHandler {
                     series_versions_written,
                     patch_items_written,
                     patch_item_files_written,
+                    patch_items_hydrated,
+                    patch_items_fallback_patch_id,
+                    patch_items_fallback_diff_parse,
                     "lineage_rebuild_list progress"
                 );
                 last_progress_log = Instant::now();
@@ -2641,6 +2650,9 @@ impl Phase0JobHandler {
             series_versions_written,
             patch_items_written,
             patch_item_files_written,
+            patch_items_hydrated,
+            patch_items_fallback_patch_id,
+            patch_items_fallback_diff_parse,
             "lineage_rebuild_list completed inline"
         );
 
@@ -2658,6 +2670,9 @@ impl Phase0JobHandler {
                 "series_versions_written": series_versions_written,
                 "patch_items_written": patch_items_written,
                 "patch_item_files_written": patch_item_files_written,
+                "patch_items_hydrated": patch_items_hydrated,
+                "patch_items_fallback_patch_id": patch_items_fallback_patch_id,
+                "patch_items_fallback_diff_parse": patch_items_fallback_diff_parse,
                 "from_seen_at": payload.from_seen_at,
                 "to_seen_at": payload.to_seen_at,
             }),
@@ -4504,6 +4519,12 @@ fn parse_one_commit(raw_commit: RawCommitMail) -> ParseCommitResult {
         }
     };
 
+    let patch_facts = extract_patch_facts(
+        parsed.body_text.as_deref(),
+        parsed.diff_text.as_deref(),
+        parsed.has_diff,
+    );
+
     let parsed_input = ParsedMessageInput {
         content_hash_sha256: parsed.content_hash_sha256,
         subject_raw: parsed.subject_raw,
@@ -4526,6 +4547,7 @@ fn parse_one_commit(raw_commit: RawCommitMail) -> ParseCommitResult {
             has_diff: parsed.has_diff,
             has_attachments: parsed.has_attachments,
         },
+        patch_facts,
     };
 
     ParseCommitResult::Parsed(Box::new(IndexedParsedRow {
@@ -4535,6 +4557,90 @@ fn parse_one_commit(raw_commit: RawCommitMail) -> ParseCommitResult {
             parsed_message: parsed_input,
         },
     }))
+}
+
+fn extract_patch_facts(
+    body_text: Option<&str>,
+    diff_text: Option<&str>,
+    has_diff: bool,
+) -> Option<ParsedPatchFactsInput> {
+    let extracted_diff = diff_text
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| body_text.and_then(extract_diff_text));
+
+    let has_diff = has_diff
+        || extracted_diff
+            .as_deref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+
+    let patch_id_stable = extracted_diff.as_deref().and_then(compute_patch_id_stable);
+
+    let parsed_files = extracted_diff
+        .as_deref()
+        .map(parse_diff_metadata)
+        .unwrap_or_default();
+
+    let mut files = Vec::with_capacity(parsed_files.len());
+    let mut additions = 0i32;
+    let mut deletions = 0i32;
+    let mut hunk_count = 0i32;
+
+    for file in parsed_files {
+        additions = additions.saturating_add(file.additions);
+        deletions = deletions.saturating_add(file.deletions);
+        hunk_count = hunk_count.saturating_add(file.hunk_count);
+        files.push(ParsedPatchFileFactInput {
+            old_path: file.old_path,
+            new_path: file.new_path,
+            change_type: file.change_type,
+            is_binary: file.is_binary,
+            additions: file.additions,
+            deletions: file.deletions,
+            hunk_count: file.hunk_count,
+            diff_start: file.diff_start,
+            diff_end: file.diff_end,
+        });
+    }
+
+    let base_commit = body_text.and_then(extract_base_commit);
+    let change_id = body_text.and_then(extract_change_id);
+
+    if !has_diff
+        && patch_id_stable.is_none()
+        && base_commit.is_none()
+        && change_id.is_none()
+        && files.is_empty()
+    {
+        return None;
+    }
+
+    Some(ParsedPatchFactsInput {
+        has_diff,
+        patch_id_stable,
+        base_commit,
+        change_id,
+        file_count: files.len() as i32,
+        additions,
+        deletions,
+        hunk_count,
+        files,
+    })
+}
+
+fn extract_change_id(body_text: &str) -> Option<String> {
+    CHANGE_ID_RE
+        .captures(body_text)
+        .and_then(|captures| captures.get(1))
+        .map(|matched| matched.as_str().trim().to_ascii_lowercase())
+}
+
+fn extract_base_commit(body_text: &str) -> Option<String> {
+    BASE_COMMIT_RE
+        .captures(body_text)
+        .and_then(|captures| captures.get(1))
+        .map(|matched| matched.as_str().trim().to_ascii_lowercase())
 }
 
 fn empty_metrics(duration_ms: u128) -> JobStoreMetrics {
