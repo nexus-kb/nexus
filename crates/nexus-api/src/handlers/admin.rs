@@ -16,6 +16,7 @@ use nexus_jobs::payloads::{
     MeiliBootstrapRunPayload, MeiliBootstrapScope, PipelineIngestPayload,
     ThreadingRebuildListPayload,
 };
+use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -960,9 +961,9 @@ pub async fn reset_watermark(
 #[derive(Debug, Deserialize)]
 pub struct ThreadingRebuildQuery {
     pub list_key: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_datetime_query")]
     pub from: Option<DateTime<Utc>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_datetime_query")]
     pub to: Option<DateTime<Utc>>,
 }
 
@@ -1032,9 +1033,9 @@ pub async fn threading_rebuild(
 #[derive(Debug, Deserialize)]
 pub struct LineageRebuildQuery {
     pub list_key: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_datetime_query")]
     pub from: Option<DateTime<Utc>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_datetime_query")]
     pub to: Option<DateTime<Utc>>,
 }
 
@@ -1203,18 +1204,10 @@ pub async fn search_embeddings_backfill(
         }
     }
 
-    let from = match query.from.as_deref() {
-        Some(raw) => Some(
-            parse_backfill_timestamp(raw).ok_or(axum::http::StatusCode::UNPROCESSABLE_ENTITY)?,
-        ),
-        None => None,
-    };
-    let to = match query.to.as_deref() {
-        Some(raw) => Some(
-            parse_backfill_timestamp(raw).ok_or(axum::http::StatusCode::UNPROCESSABLE_ENTITY)?,
-        ),
-        None => None,
-    };
+    let from = parse_optional_timestamp_query(query.from.as_deref())
+        .ok_or(axum::http::StatusCode::UNPROCESSABLE_ENTITY)?;
+    let to = parse_optional_timestamp_query(query.to.as_deref())
+        .ok_or(axum::http::StatusCode::UNPROCESSABLE_ENTITY)?;
 
     let run = state
         .embeddings
@@ -1746,13 +1739,36 @@ fn parse_meili_bootstrap_scope(raw: &str) -> Option<MeiliBootstrapScope> {
     }
 }
 
-fn parse_backfill_timestamp(raw: &str) -> Option<DateTime<Utc>> {
+fn parse_timestamp(raw: &str) -> Option<DateTime<Utc>> {
     if let Ok(ts) = DateTime::parse_from_rfc3339(raw) {
         return Some(ts.with_timezone(&Utc));
     }
     let date = chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d").ok()?;
     let naive = date.and_hms_opt(0, 0, 0)?;
     Some(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
+}
+
+fn parse_optional_timestamp_query(raw: Option<&str>) -> Option<Option<DateTime<Utc>>> {
+    let Some(value) = raw else {
+        return Some(None);
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Some(None);
+    }
+    parse_timestamp(trimmed).map(Some)
+}
+
+fn deserialize_optional_datetime_query<'de, D>(
+    deserializer: D,
+) -> Result<Option<DateTime<Utc>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    parse_optional_timestamp_query(raw.as_deref()).ok_or_else(|| {
+        de::Error::custom("invalid datetime: expected RFC3339 timestamp or YYYY-MM-DD")
+    })
 }
 
 #[cfg(test)]
@@ -1767,6 +1783,7 @@ mod tests {
     use super::{
         StorageMeiliListResponse, discover_mirror_lists, discover_repo_relpaths,
         merge_meili_list_counts, parse_meili_facet_counts, parse_meili_totals,
+        parse_optional_timestamp_query,
     };
 
     struct TempDir {
@@ -1926,5 +1943,30 @@ mod tests {
         assert_eq!(lkml.thread_docs, 4);
         assert_eq!(lkml.patch_series_docs, 0);
         assert_eq!(lkml.patch_item_docs, 0);
+    }
+
+    #[test]
+    fn parse_optional_timestamp_query_accepts_rfc3339() {
+        let parsed =
+            parse_optional_timestamp_query(Some("2026-02-20T14:05:06Z")).expect("valid timestamp");
+        assert!(parsed.is_some());
+    }
+
+    #[test]
+    fn parse_optional_timestamp_query_accepts_date() {
+        let parsed = parse_optional_timestamp_query(Some("2026-02-20")).expect("valid date");
+        assert!(parsed.is_some());
+    }
+
+    #[test]
+    fn parse_optional_timestamp_query_treats_empty_as_unbounded() {
+        let parsed = parse_optional_timestamp_query(Some("   ")).expect("empty is allowed");
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn parse_optional_timestamp_query_rejects_invalid_input() {
+        let parsed = parse_optional_timestamp_query(Some("not-a-date"));
+        assert!(parsed.is_none());
     }
 }
