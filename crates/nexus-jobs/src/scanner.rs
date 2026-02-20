@@ -76,7 +76,9 @@ pub fn stream_new_commit_oid_chunks(
         .arg(repo_path)
         .arg("rev-list")
         .arg("--reverse")
-        .arg("--all");
+        // Track commit progress against branch tips only; `--all` includes metadata refs
+        // (for example `refs/meta/*`) and can repeatedly resurface historical commits.
+        .arg("--branches");
 
     if let Some(since) = incremental_since {
         // Exclude the prior watermark and everything reachable from it to avoid a full scan.

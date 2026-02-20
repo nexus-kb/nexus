@@ -731,12 +731,47 @@ pub async fn ingest_grokmirror(
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // Phase 1: ensure catalog entries and create pending runs for all lists
+    // Phase 1: ensure catalog entries and create pending runs for lists that do not already
+    // have an open run.
     let mut pending_runs: Vec<(String, Vec<String>, i64)> = Vec::new(); // (list_key, repos, run_id)
 
     for (position, candidate) in candidates.iter().enumerate() {
         match ensure_catalog_entries(&state, &candidate.list_key, &candidate.repos).await {
             Ok(list_id) => {
+                let open_run = match state
+                    .pipeline
+                    .get_open_run_for_list(&candidate.list_key)
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(err) => {
+                        results.push(IngestGrokmirrorListResult {
+                            list_key: candidate.list_key.clone(),
+                            status: "error".to_string(),
+                            queued: 0,
+                            repos: candidate.repos.clone(),
+                            pipeline_run_id: None,
+                            current_stage: None,
+                            error: Some(format!("failed to check open pipeline run: {err}")),
+                        });
+                        continue;
+                    }
+                };
+
+                if let Some(run) = open_run {
+                    queued_lists += 1;
+                    results.push(IngestGrokmirrorListResult {
+                        list_key: candidate.list_key.clone(),
+                        status: run.state,
+                        queued: 0,
+                        repos: candidate.repos.clone(),
+                        pipeline_run_id: Some(run.id),
+                        current_stage: Some(run.current_stage),
+                        error: None,
+                    });
+                    continue;
+                }
+
                 match state
                     .pipeline
                     .create_pending_run(
@@ -782,11 +817,18 @@ pub async fn ingest_grokmirror(
         }
     }
 
-    // Phase 2: activate the first pending run and enqueue its ingest job.
-    // If enqueue fails after activation, mark that run failed and try the next pending run.
+    // Phase 2: if no pipeline run is currently active, activate the first pending run in this
+    // batch and enqueue its ingest job. If enqueue fails after activation, mark that run failed
+    // and try the next pending run.
     let mut started_run_id: Option<i64> = None;
     let mut launch_errors: BTreeMap<i64, String> = BTreeMap::new();
-    if !pending_runs.is_empty() {
+    let has_active_run = state
+        .pipeline
+        .get_any_active_run()
+        .await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?
+        .is_some();
+    if !pending_runs.is_empty() && !has_active_run {
         loop {
             let activated = match state.pipeline.activate_next_pending_run(batch_id).await {
                 Ok(Some(run)) => run,
@@ -1616,17 +1658,17 @@ async fn queue_list_ingest(
 ) -> Result<IngestSyncResponse, IngestQueueError> {
     if let Some(active) = state
         .pipeline
-        .get_active_run_for_list(list_key)
+        .get_open_run_for_list(list_key)
         .await
         .map_err(|err| {
             IngestQueueError::internal(format!(
-                "failed to check active pipeline run for list {list_key}: {err}"
+                "failed to check open pipeline run for list {list_key}: {err}"
             ))
         })?
     {
         return Err(IngestQueueError::conflict(format!(
-            "pipeline run {} is already running for list {list_key}",
-            active.id
+            "pipeline run {} is already {} for list {list_key}",
+            active.id, active.state
         )));
     }
 

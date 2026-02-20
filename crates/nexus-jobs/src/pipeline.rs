@@ -1731,11 +1731,25 @@ impl Phase0JobHandler {
         Ok(true)
     }
 
-    /// Activate the next pending run in a batch and enqueue its ingest stage.
+    /// Activate the next pending run in the same batch, then fall back to the global pending queue.
     async fn activate_and_enqueue_next_list(&self, batch_id: i64) -> Result<(), sqlx::Error> {
+        if self
+            .activate_and_enqueue_next_list_in_batch(batch_id)
+            .await?
+        {
+            return Ok(());
+        }
+        let _ = self.activate_and_enqueue_next_list_global().await?;
+        Ok(())
+    }
+
+    async fn activate_and_enqueue_next_list_in_batch(
+        &self,
+        batch_id: i64,
+    ) -> Result<bool, sqlx::Error> {
         loop {
             let Some(next_run) = self.pipeline.activate_next_pending_run(batch_id).await? else {
-                return Ok(());
+                return Ok(false);
             };
 
             let payload = PipelineIngestPayload {
@@ -1762,7 +1776,7 @@ impl Phase0JobHandler {
                         batch_id,
                         "activated next pending list in batch"
                     );
-                    return Ok(());
+                    return Ok(true);
                 }
                 Err(err) => {
                     let reason =
@@ -1773,6 +1787,52 @@ impl Phase0JobHandler {
                         batch_id,
                         error = %err,
                         "marking activated run failed and trying next pending run"
+                    );
+                    self.pipeline.mark_run_failed(next_run.id, &reason).await?;
+                }
+            }
+        }
+    }
+
+    async fn activate_and_enqueue_next_list_global(&self) -> Result<bool, sqlx::Error> {
+        loop {
+            let Some(next_run) = self.pipeline.activate_next_pending_run_any().await? else {
+                return Ok(false);
+            };
+
+            let payload = PipelineIngestPayload {
+                run_id: next_run.id,
+            };
+            match self
+                .jobs
+                .enqueue(EnqueueJobParams {
+                    job_type: "pipeline_ingest".to_string(),
+                    payload_json: serde_json::to_value(payload)
+                        .unwrap_or_else(|_| serde_json::json!({})),
+                    priority: PRIORITY_INGEST,
+                    dedupe_scope: Some(format!("pipeline:run:{}", next_run.id)),
+                    dedupe_key: Some("ingest".to_string()),
+                    run_after: None,
+                    max_attempts: Some(8),
+                })
+                .await
+            {
+                Ok(_) => {
+                    info!(
+                        run_id = next_run.id,
+                        list_key = %next_run.list_key,
+                        "activated next pending list from global queue"
+                    );
+                    return Ok(true);
+                }
+                Err(err) => {
+                    let reason =
+                        format!("failed to enqueue pipeline_ingest after activation: {err}");
+                    warn!(
+                        run_id = next_run.id,
+                        list_key = %next_run.list_key,
+                        error = %err,
+                        "marking globally activated run failed and trying next pending run"
                     );
                     self.pipeline.mark_run_failed(next_run.id, &reason).await?;
                 }

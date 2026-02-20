@@ -159,9 +159,22 @@ impl Phase0Worker {
     async fn run_maintenance(&self) -> Result<(), sqlx::Error> {
         let promoted = self.jobs.promote_ready_jobs().await?;
         let (requeued, terminal) = self.jobs.requeue_stuck_jobs().await?;
+        let collapsed_pending = self.pipeline.collapse_duplicate_pending_runs().await?;
 
-        if promoted > 0 || requeued > 0 || terminal > 0 {
-            info!(promoted, requeued, terminal, "job maintenance sweep");
+        if promoted > 0 || requeued > 0 || terminal > 0 || collapsed_pending > 0 {
+            info!(
+                promoted,
+                requeued, terminal, collapsed_pending, "job maintenance sweep"
+            );
+        }
+
+        // Recovery path for orphaned pending pipeline runs (for example after overlapping
+        // webhook triggers): if no run is currently active, kick one pending run.
+        if self.pipeline.get_any_active_run().await?.is_none() {
+            let activated = self.activate_and_enqueue_next_list_global().await?;
+            if activated {
+                info!("activated pending pipeline run from global queue during maintenance");
+            }
         }
 
         Ok(())
@@ -169,9 +182,14 @@ impl Phase0Worker {
 
     async fn drain_once(&self) -> Result<(), sqlx::Error> {
         self.jobs.promote_ready_jobs().await?;
+        let claim_limit = self
+            .cfg
+            .claim_batch
+            .max(1)
+            .min(self.cfg.max_inflight_jobs as i64);
         let claimed = self
             .jobs
-            .claim_jobs(self.cfg.claim_batch, &self.worker_id, self.cfg.lease_ms)
+            .claim_jobs(claim_limit, &self.worker_id, self.cfg.lease_ms)
             .await?;
 
         if claimed.is_empty() {
@@ -392,9 +410,23 @@ impl Phase0Worker {
     }
 
     async fn activate_and_enqueue_next_list(&self, batch_id: i64) -> Result<(), sqlx::Error> {
+        if self
+            .activate_and_enqueue_next_list_in_batch(batch_id)
+            .await?
+        {
+            return Ok(());
+        }
+        let _ = self.activate_and_enqueue_next_list_global().await?;
+        Ok(())
+    }
+
+    async fn activate_and_enqueue_next_list_in_batch(
+        &self,
+        batch_id: i64,
+    ) -> Result<bool, sqlx::Error> {
         loop {
             let Some(next_run) = self.pipeline.activate_next_pending_run(batch_id).await? else {
-                return Ok(());
+                return Ok(false);
             };
 
             let payload = PipelineIngestPayload {
@@ -421,7 +453,7 @@ impl Phase0Worker {
                         batch_id,
                         "activated next pending list in batch"
                     );
-                    return Ok(());
+                    return Ok(true);
                 }
                 Err(err) => {
                     let reason =
@@ -432,6 +464,52 @@ impl Phase0Worker {
                         batch_id,
                         error = %err,
                         "marking activated run failed and trying next pending run"
+                    );
+                    self.pipeline.mark_run_failed(next_run.id, &reason).await?;
+                }
+            }
+        }
+    }
+
+    async fn activate_and_enqueue_next_list_global(&self) -> Result<bool, sqlx::Error> {
+        loop {
+            let Some(next_run) = self.pipeline.activate_next_pending_run_any().await? else {
+                return Ok(false);
+            };
+
+            let payload = PipelineIngestPayload {
+                run_id: next_run.id,
+            };
+            match self
+                .jobs
+                .enqueue(EnqueueJobParams {
+                    job_type: "pipeline_ingest".to_string(),
+                    payload_json: serde_json::to_value(payload)
+                        .unwrap_or_else(|_| serde_json::json!({})),
+                    priority: 20,
+                    dedupe_scope: Some(format!("pipeline:run:{}", next_run.id)),
+                    dedupe_key: Some("ingest".to_string()),
+                    run_after: None,
+                    max_attempts: Some(8),
+                })
+                .await
+            {
+                Ok(_) => {
+                    info!(
+                        run_id = next_run.id,
+                        list_key = %next_run.list_key,
+                        "activated next pending list from global queue"
+                    );
+                    return Ok(true);
+                }
+                Err(err) => {
+                    let reason =
+                        format!("failed to enqueue pipeline_ingest after activation: {err}");
+                    warn!(
+                        run_id = next_run.id,
+                        list_key = %next_run.list_key,
+                        error = %err,
+                        "marking globally activated run failed and trying next pending run"
                     );
                     self.pipeline.mark_run_failed(next_run.id, &reason).await?;
                 }

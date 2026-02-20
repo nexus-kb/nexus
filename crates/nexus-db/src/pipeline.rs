@@ -75,15 +75,50 @@ impl PipelineStore {
                 started_at = now(),
                 updated_at = now()
             WHERE id = (
-                SELECT id FROM pipeline_runs
-                WHERE batch_id = $1 AND state = 'pending'
-                ORDER BY batch_position ASC
+                SELECT pr.id
+                FROM pipeline_runs pr
+                WHERE pr.batch_id = $1
+                  AND pr.state = 'pending'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM pipeline_runs active
+                      WHERE active.mailing_list_id = pr.mailing_list_id
+                        AND active.state = 'running'
+                  )
+                ORDER BY pr.batch_position ASC, pr.id ASC
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
             )
             RETURNING *"#,
         )
         .bind(batch_id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// Activate the next pending run globally (oldest by batch/id) and return it.
+    pub async fn activate_next_pending_run_any(&self) -> Result<Option<PipelineRun>> {
+        sqlx::query_as::<_, PipelineRun>(
+            r#"UPDATE pipeline_runs
+            SET state = 'running',
+                started_at = now(),
+                updated_at = now()
+            WHERE id = (
+                SELECT pr.id
+                FROM pipeline_runs pr
+                WHERE pr.state = 'pending'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM pipeline_runs active
+                      WHERE active.mailing_list_id = pr.mailing_list_id
+                        AND active.state = 'running'
+                  )
+                ORDER BY pr.batch_id ASC NULLS LAST, pr.batch_position ASC NULLS LAST, pr.id ASC
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING *"#,
+        )
         .fetch_optional(&self.pool)
         .await
     }
@@ -102,6 +137,20 @@ impl PipelineStore {
             WHERE list_key = $1
               AND state = 'running'
             ORDER BY id DESC
+            LIMIT 1"#,
+        )
+        .bind(list_key)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    pub async fn get_open_run_for_list(&self, list_key: &str) -> Result<Option<PipelineRun>> {
+        sqlx::query_as::<_, PipelineRun>(
+            r#"SELECT *
+            FROM pipeline_runs
+            WHERE list_key = $1
+              AND state IN ('running', 'pending')
+            ORDER BY CASE state WHEN 'running' THEN 0 ELSE 1 END, id ASC
             LIMIT 1"#,
         )
         .bind(list_key)
@@ -259,6 +308,30 @@ impl PipelineStore {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Keep only the newest pending run per list; cancel older pending duplicates.
+    pub async fn collapse_duplicate_pending_runs(&self) -> Result<u64> {
+        let result = sqlx::query(
+            r#"WITH ranked AS (
+                SELECT id,
+                       ROW_NUMBER() OVER (PARTITION BY mailing_list_id ORDER BY id DESC) AS rn
+                FROM pipeline_runs
+                WHERE state = 'pending'
+            )
+            UPDATE pipeline_runs pr
+            SET state = 'cancelled',
+                completed_at = COALESCE(pr.completed_at, now()),
+                last_error = COALESCE(pr.last_error, 'superseded by newer pending pipeline run'),
+                updated_at = now()
+            FROM ranked r
+            WHERE pr.id = r.id
+              AND r.rn > 1"#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected())
     }
 
     // ── Ingest window queries (replaces artifact tables) ───────────
