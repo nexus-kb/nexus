@@ -19,16 +19,6 @@ impl Phase0JobHandler {
                 }
             };
 
-        if !self.settings.embeddings.enabled {
-            return JobExecutionOutcome::Success {
-                result_json: serde_json::json!({
-                    "run_id": payload.run_id,
-                    "skipped": "embeddings_disabled"
-                }),
-                metrics: empty_metrics(started.elapsed().as_millis()),
-            };
-        }
-
         let run = match self.embeddings.get_backfill_run(payload.run_id).await {
             Ok(Some(value)) => value,
             Ok(None) => {

@@ -183,12 +183,9 @@ pub(super) async fn compute_or_get_query_embedding(
         return Ok(vector);
     }
 
-    let client = state
-        .embedding_client
-        .as_ref()
-        .ok_or_else(|| "embeddings client is not configured".to_string())?;
     let prompt = hybrid_query_prompt(scope, &normalized_query);
-    let vector = client
+    let vector = state
+        .embedding_client
         .embed_query(&prompt)
         .await
         .map_err(|err| format!("query embedding request failed: {err}"))?;

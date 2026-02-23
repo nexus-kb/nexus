@@ -230,13 +230,7 @@ impl Phase0JobHandler {
                 sanitization_rejections += parsed_outcome.sanitization_rejections;
                 other_rejections += parsed_outcome.other_rejections;
 
-                let batch_outcome = match self
-                    .write_ingest_rows(
-                        &repo,
-                        &parsed_outcome.rows,
-                        self.settings.worker.db_relaxed_durability,
-                    )
-                    .await
+                let batch_outcome = match self.write_ingest_rows(&repo, &parsed_outcome.rows).await
                 {
                     Ok(value) => value,
                     Err(err) => {

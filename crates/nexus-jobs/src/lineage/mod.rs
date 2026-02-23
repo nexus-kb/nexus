@@ -92,14 +92,6 @@ mod tests;
 
 use similarity::*;
 
-pub async fn process_patch_extract_window(
-    store: &LineageStore,
-    mailing_list_id: i64,
-    anchor_message_pks: &[i64],
-) -> anyhow::Result<PatchExtractOutcome> {
-    core::process_patch_extract_window(store, mailing_list_id, anchor_message_pks).await
-}
-
 pub async fn process_patch_extract_threads(
     store: &LineageStore,
     mailing_list_id: i64,

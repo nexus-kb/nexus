@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use chrono::Utc;
 use gix::hash::ObjectId;
-use nexus_core::config::{IngestWriteMode, LineageDiscoveryMode, Settings};
+use nexus_core::config::Settings;
 use nexus_core::embeddings::{EmbeddingsClientError, OpenAiEmbeddingsClient};
 use nexus_core::search::MeiliIndexKind;
 use nexus_db::{
@@ -24,9 +24,7 @@ use tokio::time::{Duration, sleep};
 use tracing::{info, warn};
 
 use crate::diff_metadata::parse_diff_metadata;
-use crate::lineage::{
-    process_patch_enrichment_batch, process_patch_extract_threads, process_patch_extract_window,
-};
+use crate::lineage::{process_patch_enrichment_batch, process_patch_extract_threads};
 use crate::mail::{ParseEmailError, parse_email};
 use crate::meili::{MeiliClient, MeiliClientError, settings_differ};
 use crate::patch_detect::extract_diff_text;
@@ -53,7 +51,7 @@ pub struct Phase0JobHandler {
     embeddings: EmbeddingsStore,
     jobs: JobStore,
     meili: MeiliClient,
-    embedding_client: Option<OpenAiEmbeddingsClient>,
+    embedding_client: OpenAiEmbeddingsClient,
 }
 
 const STAGE_INGEST: &str = "ingest";

@@ -1,20 +1,5 @@
 use super::*;
 
-pub async fn process_patch_extract_window(
-    store: &LineageStore,
-    mailing_list_id: i64,
-    anchor_message_pks: &[i64],
-) -> anyhow::Result<PatchExtractOutcome> {
-    let source_messages = store
-        .load_messages_for_anchors(mailing_list_id, anchor_message_pks)
-        .await
-        .context("load lineage source messages")?;
-
-    process_patch_extract_source_messages(store, mailing_list_id, source_messages)
-        .await
-        .context("process lineage source messages")
-}
-
 pub async fn process_patch_extract_threads(
     store: &LineageStore,
     mailing_list_id: i64,

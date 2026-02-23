@@ -70,10 +70,9 @@ This list includes only variables currently read by runtime code (`nexus-core` c
 
 | Variable | Required | Default if unset | Production guidance |
 | --- | --- | --- | --- |
-| `NEXUS__EMBEDDINGS__ENABLED` | no | `false` | Set `true` only when embedding endpoint is configured. |
-| `NEXUS__EMBEDDINGS__BASE_URL` | required if embeddings enabled | `https://openrouter.ai/api/v1` | Use your embedding provider endpoint. |
-| `NEXUS__EMBEDDINGS__API_KEY` | required if embeddings enabled | empty | Set provider API key via secret manager. |
-| `NEXUS__EMBEDDINGS__MODEL` | required if embeddings enabled | `Qwen/Qwen3-Embedding-4B` | Pin to deployed embedding model. |
+| `NEXUS__EMBEDDINGS__BASE_URL` | no | `https://openrouter.ai/api/v1` | Use your embedding provider endpoint. |
+| `NEXUS__EMBEDDINGS__API_KEY` | yes | empty | Set provider API key via secret manager. |
+| `NEXUS__EMBEDDINGS__MODEL` | no | `Qwen/Qwen3-Embedding-4B` | Pin to deployed embedding model. |
 | `NEXUS__EMBEDDINGS__DIMENSIONS` | no | `768` | Must match model output dimensions. |
 | `NEXUS__EMBEDDINGS__EMBEDDER_NAME` | no | `qwen3` | Keep stable for index naming/versioning. |
 | `NEXUS__EMBEDDINGS__QUERY_CACHE_TTL_SECS` | no | `120` | Increase if query patterns are repetitive. |
@@ -95,10 +94,5 @@ This list includes only variables currently read by runtime code (`nexus-core` c
 | `NEXUS__WORKER__BASE_BACKOFF_MS` | no | `15000` | Retry backoff base. |
 | `NEXUS__WORKER__MAX_BACKOFF_MS` | no | `3600000` | Retry backoff cap. |
 | `NEXUS__WORKER__INGEST_PARSE_CONCURRENCY` | no | `8` | Parser parallelism target. |
-| `NEXUS__WORKER__INGEST_PARSE_CPU_RATIO` | no | `0.6` | CPU fraction for parser worker sizing. |
-| `NEXUS__WORKER__INGEST_PARSE_WORKERS_MIN` | no | `2` | Parser worker lower bound. |
-| `NEXUS__WORKER__INGEST_PARSE_WORKERS_MAX` | no | `32` | Parser worker upper bound. |
 | `NEXUS__WORKER__MAX_INFLIGHT_JOBS` | no | `1` | Global concurrent jobs in worker process. |
-| `NEXUS__WORKER__INGEST_WRITE_MODE` | no | `copy` | `copy` (default) or `batched_sql`. |
 | `NEXUS__WORKER__PROGRESS_CHECKPOINT_INTERVAL` | no | `10000` | Progress checkpoint cadence. |
-| `NEXUS__WORKER__DB_RELAXED_DURABILITY` | no | `false` | Enable only with accepted durability tradeoff. |

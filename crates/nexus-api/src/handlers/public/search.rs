@@ -28,12 +28,6 @@ pub async fn search(
         if !(0.0..=1.0).contains(&semantic_ratio) {
             return Err(StatusCode::UNPROCESSABLE_ENTITY);
         }
-        if !state.settings.embeddings.enabled {
-            return json_error_response(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                json!({ "error": "hybrid requires embeddings to be enabled" }),
-            );
-        }
         if !matches!(scope, SearchScope::Thread | SearchScope::Series) {
             return json_error_response(
                 StatusCode::UNPROCESSABLE_ENTITY,

@@ -33,9 +33,6 @@ pub async fn start_meili_bootstrap(
     State(state): State<ApiState>,
     Query(query): Query<StartMeiliBootstrapQuery>,
 ) -> Result<Json<StartMeiliBootstrapResponse>, axum::http::StatusCode> {
-    if !state.settings.embeddings.enabled {
-        return Err(axum::http::StatusCode::UNPROCESSABLE_ENTITY);
-    }
     let scope = parse_meili_bootstrap_scope(&query.scope)
         .ok_or(axum::http::StatusCode::UNPROCESSABLE_ENTITY)?;
 

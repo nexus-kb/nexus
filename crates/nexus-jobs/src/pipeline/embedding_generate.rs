@@ -19,16 +19,6 @@ impl Phase0JobHandler {
                 }
             };
 
-        if !self.settings.embeddings.enabled {
-            return JobExecutionOutcome::Success {
-                result_json: serde_json::json!({
-                    "scope": payload.scope.as_str(),
-                    "ids_count": payload.ids.len(),
-                    "skipped": "embeddings_disabled",
-                }),
-                metrics: empty_metrics(started.elapsed().as_millis()),
-            };
-        }
         if payload.model_key != self.settings.embeddings.model {
             return JobExecutionOutcome::Terminal {
                 reason: format!(
@@ -377,12 +367,10 @@ impl Phase0JobHandler {
 
     pub(super) fn meili_index_settings(&self, index: MeiliIndexKind) -> serde_json::Value {
         let mut settings = index.spec().settings_json();
-        if self.settings.embeddings.enabled
-            && matches!(
-                index,
-                MeiliIndexKind::ThreadDocs | MeiliIndexKind::PatchSeriesDocs
-            )
-        {
+        if matches!(
+            index,
+            MeiliIndexKind::ThreadDocs | MeiliIndexKind::PatchSeriesDocs
+        ) {
             settings["embedders"] = serde_json::json!({
                 self.settings.embeddings.embedder_name.clone(): {
                     "source": "userProvided",
@@ -404,10 +392,6 @@ impl Phase0JobHandler {
             MeiliIndexKind::PatchSeriesDocs => self.search.build_patch_series_docs(ids).await?,
             MeiliIndexKind::ThreadDocs => self.search.build_thread_docs(ids).await?,
         };
-
-        if !self.settings.embeddings.enabled {
-            return Ok(docs);
-        }
 
         let scope = match index {
             MeiliIndexKind::ThreadDocs => Some(EmbeddingScope::Thread),
@@ -519,10 +503,6 @@ impl Phase0JobHandler {
         source_job_id: Option<i64>,
         priority: i32,
     ) -> Result<bool, sqlx::Error> {
-        if !self.settings.embeddings.enabled {
-            return Ok(false);
-        }
-
         let mut ids = ids.to_vec();
         ids.sort_unstable();
         ids.dedup();
@@ -566,17 +546,11 @@ impl Phase0JobHandler {
         &self,
         texts: &[String],
     ) -> Result<Vec<Vec<f32>>, EmbeddingsClientError> {
-        let Some(client) = self.embedding_client.as_ref() else {
-            return Err(EmbeddingsClientError::Protocol(
-                "embeddings client is not configured".to_string(),
-            ));
-        };
-
         let mut backoff_ms = self.settings.worker.base_backoff_ms.max(250);
         let mut attempts = 0u8;
         loop {
             attempts = attempts.saturating_add(1);
-            match client.embed_texts(texts).await {
+            match self.embedding_client.embed_texts(texts).await {
                 Ok(vectors) => return Ok(vectors),
                 Err(err) => {
                     if !err.is_transient() || attempts >= 4 {

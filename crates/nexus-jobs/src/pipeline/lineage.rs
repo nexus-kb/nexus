@@ -62,15 +62,8 @@ impl Phase0JobHandler {
 
         let batch_limit = self.settings.mail.commit_batch_size.max(1) as i64;
         let checkpoint_interval = self.settings.worker.progress_checkpoint_interval.max(1) as u64;
-        let discovery_mode = self.settings.worker.lineage_discovery_mode;
-        let discovery_mode_label = match discovery_mode {
-            LineageDiscoveryMode::ThreadFirst => "thread_first",
-            LineageDiscoveryMode::MessageLegacy => "message_legacy",
-        };
-        let work_item_kind = match discovery_mode {
-            LineageDiscoveryMode::ThreadFirst => "threads",
-            LineageDiscoveryMode::MessageLegacy => "messages",
-        };
+        let discovery_mode_label = "thread_first";
+        let work_item_kind = "threads";
 
         let mut cursor = 0i64;
         let mut processed_chunks = 0u64;
@@ -107,116 +100,55 @@ impl Phase0JobHandler {
                 Err(err) => warn!(job_id = job.id, error = %err, "cancel check failed"),
             }
 
-            let (chunk_work_items, extract_outcome) = match discovery_mode {
-                LineageDiscoveryMode::ThreadFirst => {
-                    let thread_chunk = match self
-                        .pipeline
-                        .query_ingest_window_thread_ids_chunk(
-                            run.mailing_list_id,
-                            window_from,
-                            window_to,
-                            cursor,
-                            batch_limit,
-                        )
-                        .await
-                    {
-                        Ok(value) => value,
-                        Err(err) => {
-                            return retryable_error(
-                                format!(
-                                    "failed to query threads for lineage stage run {}: {err}",
-                                    run.id
-                                ),
-                                "db",
-                                &job,
-                                started.elapsed().as_millis(),
-                                &self.settings,
-                            );
-                        }
-                    };
-                    if thread_chunk.is_empty() {
-                        break;
-                    }
-                    cursor = *thread_chunk.last().unwrap_or(&cursor);
-
-                    let extract_outcome = match process_patch_extract_threads(
-                        &self.lineage,
-                        run.mailing_list_id,
-                        &thread_chunk,
-                    )
-                    .await
-                    {
-                        Ok(value) => value,
-                        Err(err) => {
-                            return retryable_error(
-                                format!(
-                                    "patch lineage extraction failed for run {}: {err}",
-                                    run.id
-                                ),
-                                "parse",
-                                &job,
-                                started.elapsed().as_millis(),
-                                &self.settings,
-                            );
-                        }
-                    };
-                    (thread_chunk.len() as u64, extract_outcome)
-                }
-                LineageDiscoveryMode::MessageLegacy => {
-                    let message_chunk = match self
-                        .pipeline
-                        .query_ingest_window_message_pks(
-                            run.mailing_list_id,
-                            window_from,
-                            window_to,
-                            cursor,
-                            batch_limit,
-                        )
-                        .await
-                    {
-                        Ok(value) => value,
-                        Err(err) => {
-                            return retryable_error(
-                                format!(
-                                    "failed to query messages for lineage stage run {}: {err}",
-                                    run.id
-                                ),
-                                "db",
-                                &job,
-                                started.elapsed().as_millis(),
-                                &self.settings,
-                            );
-                        }
-                    };
-                    if message_chunk.is_empty() {
-                        break;
-                    }
-                    cursor = *message_chunk.last().unwrap_or(&cursor);
-
-                    let extract_outcome = match process_patch_extract_window(
-                        &self.lineage,
-                        run.mailing_list_id,
-                        &message_chunk,
-                    )
-                    .await
-                    {
-                        Ok(value) => value,
-                        Err(err) => {
-                            return retryable_error(
-                                format!(
-                                    "patch lineage extraction failed for run {}: {err}",
-                                    run.id
-                                ),
-                                "parse",
-                                &job,
-                                started.elapsed().as_millis(),
-                                &self.settings,
-                            );
-                        }
-                    };
-                    (message_chunk.len() as u64, extract_outcome)
+            let thread_chunk = match self
+                .pipeline
+                .query_ingest_window_thread_ids_chunk(
+                    run.mailing_list_id,
+                    window_from,
+                    window_to,
+                    cursor,
+                    batch_limit,
+                )
+                .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    return retryable_error(
+                        format!(
+                            "failed to query threads for lineage stage run {}: {err}",
+                            run.id
+                        ),
+                        "db",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
                 }
             };
+            if thread_chunk.is_empty() {
+                break;
+            }
+            cursor = *thread_chunk.last().unwrap_or(&cursor);
+
+            let extract_outcome = match process_patch_extract_threads(
+                &self.lineage,
+                run.mailing_list_id,
+                &thread_chunk,
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    return retryable_error(
+                        format!("patch lineage extraction failed for run {}: {err}", run.id),
+                        "parse",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
+                }
+            };
+            let chunk_work_items = thread_chunk.len() as u64;
 
             if !extract_outcome.patch_item_ids.is_empty() {
                 match process_patch_enrichment_batch(&self.lineage, &extract_outcome.patch_item_ids)

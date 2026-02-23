@@ -19,14 +19,6 @@ impl Phase0JobHandler {
                 }
             };
 
-        if !self.settings.embeddings.enabled {
-            return JobExecutionOutcome::Terminal {
-                reason: "meili bootstrap requires embeddings.enabled=true".to_string(),
-                kind: "payload".to_string(),
-                metrics: empty_metrics(started.elapsed().as_millis()),
-            };
-        }
-
         let mut run = match self
             .embeddings
             .get_meili_bootstrap_run(payload.run_id)

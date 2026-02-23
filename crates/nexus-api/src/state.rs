@@ -72,7 +72,7 @@ pub struct ApiState {
     pub lineage: LineageStore,
     pub pipeline: PipelineStore,
     pub embeddings: EmbeddingsStore,
-    pub embedding_client: Option<OpenAiEmbeddingsClient>,
+    pub embedding_client: OpenAiEmbeddingsClient,
     pub query_embedding_cache: QueryEmbeddingCache,
 }
 

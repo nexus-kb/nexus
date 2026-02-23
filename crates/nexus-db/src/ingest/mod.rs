@@ -150,7 +150,6 @@ pub(super) struct ExistingMessageIdRow {
 }
 
 mod batch_copy;
-mod batch_sql;
 mod helpers;
 mod message;
 #[cfg(test)]

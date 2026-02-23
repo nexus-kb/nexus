@@ -5,18 +5,12 @@ impl IngestStore {
         &self,
         repo: &MailingListRepo,
         rows: &[IngestCommitRow],
-        relaxed_durability: bool,
     ) -> Result<BatchWriteOutcome> {
         if rows.is_empty() {
             return Ok(BatchWriteOutcome::default());
         }
 
         let mut tx = self.pool.begin().await?;
-        if relaxed_durability {
-            sqlx::query("SET LOCAL synchronous_commit = off")
-                .execute(&mut *tx)
-                .await?;
-        }
 
         let mut unique_indexes = Vec::with_capacity(rows.len());
         let mut seen_commit_oids: HashSet<&str> = HashSet::new();

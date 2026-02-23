@@ -23,9 +23,6 @@ pub async fn search_embeddings_backfill(
     State(state): State<ApiState>,
     Query(query): Query<SearchEmbeddingsBackfillQuery>,
 ) -> Result<Json<SearchEmbeddingsBackfillResponse>, axum::http::StatusCode> {
-    if !state.settings.embeddings.enabled {
-        return Err(axum::http::StatusCode::UNPROCESSABLE_ENTITY);
-    }
     let scope =
         parse_embedding_scope(&query.scope).ok_or(axum::http::StatusCode::UNPROCESSABLE_ENTITY)?;
 

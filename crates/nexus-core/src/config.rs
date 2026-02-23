@@ -95,8 +95,6 @@ fn default_meili_upsert_batch_size() -> usize {
 
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct EmbeddingsConfig {
-    #[serde(default)]
-    pub enabled: bool,
     #[serde(default = "default_embeddings_base_url")]
     pub base_url: String,
     #[serde(default = "default_embeddings_api_key")]
@@ -157,22 +155,6 @@ fn default_embeddings_enqueue_batch_size() -> usize {
     100
 }
 
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum IngestWriteMode {
-    #[default]
-    Copy,
-    BatchedSql,
-}
-
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum LineageDiscoveryMode {
-    #[default]
-    ThreadFirst,
-    MessageLegacy,
-}
-
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct WorkerConfig {
     #[serde(default = "default_worker_poll_ms")]
@@ -191,22 +173,10 @@ pub struct WorkerConfig {
     pub max_backoff_ms: u64,
     #[serde(default = "default_worker_ingest_parse_concurrency")]
     pub ingest_parse_concurrency: usize,
-    #[serde(default = "default_worker_ingest_parse_cpu_ratio")]
-    pub ingest_parse_cpu_ratio: f64,
-    #[serde(default = "default_worker_ingest_parse_workers_min")]
-    pub ingest_parse_workers_min: usize,
-    #[serde(default = "default_worker_ingest_parse_workers_max")]
-    pub ingest_parse_workers_max: usize,
     #[serde(default = "default_worker_max_inflight_jobs")]
     pub max_inflight_jobs: usize,
-    #[serde(default = "default_worker_ingest_write_mode")]
-    pub ingest_write_mode: IngestWriteMode,
-    #[serde(default)]
-    pub lineage_discovery_mode: LineageDiscoveryMode,
     #[serde(default = "default_worker_progress_checkpoint_interval")]
     pub progress_checkpoint_interval: usize,
-    #[serde(default)]
-    pub db_relaxed_durability: bool,
 }
 
 fn default_worker_poll_ms() -> u64 {
@@ -241,24 +211,8 @@ fn default_worker_ingest_parse_concurrency() -> usize {
     8
 }
 
-fn default_worker_ingest_parse_cpu_ratio() -> f64 {
-    0.6
-}
-
-fn default_worker_ingest_parse_workers_min() -> usize {
-    2
-}
-
-fn default_worker_ingest_parse_workers_max() -> usize {
-    32
-}
-
 fn default_worker_max_inflight_jobs() -> usize {
     1
-}
-
-fn default_worker_ingest_write_mode() -> IngestWriteMode {
-    IngestWriteMode::Copy
 }
 
 fn default_worker_progress_checkpoint_interval() -> usize {
@@ -343,22 +297,20 @@ pub fn load() -> Result<Settings, crate::Error> {
     if settings.embeddings.enqueue_batch_size == 0 {
         settings.embeddings.enqueue_batch_size = default_embeddings_enqueue_batch_size();
     }
-    if settings.embeddings.enabled {
-        if settings.embeddings.api_key.trim().is_empty() {
-            return Err(crate::Error::Config(
-                "embeddings.enabled=true requires NEXUS__EMBEDDINGS__API_KEY".to_string(),
-            ));
-        }
-        if settings.embeddings.base_url.trim().is_empty() {
-            return Err(crate::Error::Config(
-                "embeddings.enabled=true requires NEXUS__EMBEDDINGS__BASE_URL".to_string(),
-            ));
-        }
-        if settings.embeddings.model.trim().is_empty() {
-            return Err(crate::Error::Config(
-                "embeddings.enabled=true requires NEXUS__EMBEDDINGS__MODEL".to_string(),
-            ));
-        }
+    if settings.embeddings.api_key.trim().is_empty() {
+        return Err(crate::Error::Config(
+            "embeddings requires NEXUS__EMBEDDINGS__API_KEY".to_string(),
+        ));
+    }
+    if settings.embeddings.base_url.trim().is_empty() {
+        return Err(crate::Error::Config(
+            "embeddings requires NEXUS__EMBEDDINGS__BASE_URL".to_string(),
+        ));
+    }
+    if settings.embeddings.model.trim().is_empty() {
+        return Err(crate::Error::Config(
+            "embeddings requires NEXUS__EMBEDDINGS__MODEL".to_string(),
+        ));
     }
     if settings.worker.poll_ms == 0 {
         settings.worker.poll_ms = default_worker_poll_ms();
@@ -383,21 +335,6 @@ pub fn load() -> Result<Settings, crate::Error> {
     }
     if settings.worker.ingest_parse_concurrency == 0 {
         settings.worker.ingest_parse_concurrency = default_worker_ingest_parse_concurrency();
-    }
-    if !settings.worker.ingest_parse_cpu_ratio.is_finite()
-        || settings.worker.ingest_parse_cpu_ratio <= 0.0
-        || settings.worker.ingest_parse_cpu_ratio > 1.0
-    {
-        settings.worker.ingest_parse_cpu_ratio = default_worker_ingest_parse_cpu_ratio();
-    }
-    if settings.worker.ingest_parse_workers_min == 0 {
-        settings.worker.ingest_parse_workers_min = default_worker_ingest_parse_workers_min();
-    }
-    if settings.worker.ingest_parse_workers_max == 0 {
-        settings.worker.ingest_parse_workers_max = default_worker_ingest_parse_workers_max();
-    }
-    if settings.worker.ingest_parse_workers_min > settings.worker.ingest_parse_workers_max {
-        settings.worker.ingest_parse_workers_min = settings.worker.ingest_parse_workers_max;
     }
     if settings.worker.max_inflight_jobs == 0 {
         settings.worker.max_inflight_jobs = default_worker_max_inflight_jobs();

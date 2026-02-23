@@ -35,11 +35,8 @@ impl EmbeddingsClientError {
 }
 
 impl OpenAiEmbeddingsClient {
-    pub fn from_settings(settings: &Settings) -> Option<Self> {
-        if !settings.embeddings.enabled {
-            return None;
-        }
-        Some(Self::from_config(&settings.embeddings))
+    pub fn from_settings(settings: &Settings) -> Self {
+        Self::from_config(&settings.embeddings)
     }
 
     pub fn from_config(cfg: &EmbeddingsConfig) -> Self {

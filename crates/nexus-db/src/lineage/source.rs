@@ -35,46 +35,6 @@ impl LineageStore {
         Ok(out)
     }
 
-    pub async fn load_messages_for_anchors(
-        &self,
-        mailing_list_id: i64,
-        anchor_message_pks: &[i64],
-    ) -> Result<Vec<LineageSourceMessage>> {
-        if anchor_message_pks.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut tx = self.pool.begin().await?;
-        // Avoid container /dev/shm pressure from parallel workers for large lineage windows.
-        sqlx::query("SET LOCAL max_parallel_workers_per_gather = 0")
-            .execute(&mut *tx)
-            .await?;
-
-        let thread_ids = sqlx::query_scalar::<_, i64>(
-            r#"SELECT DISTINCT tm.thread_id
-            FROM thread_messages tm
-            WHERE tm.mailing_list_id = $1
-              AND tm.message_pk = ANY($2)
-            ORDER BY tm.thread_id ASC"#,
-        )
-        .bind(mailing_list_id)
-        .bind(anchor_message_pks)
-        .fetch_all(&mut *tx)
-        .await?;
-
-        if thread_ids.is_empty() {
-            tx.commit().await?;
-            return Ok(Vec::new());
-        }
-
-        let out = self
-            .load_messages_for_thread_ids_in_tx(&mut tx, mailing_list_id, &thread_ids)
-            .await?;
-
-        tx.commit().await?;
-        Ok(out)
-    }
-
     async fn load_messages_for_thread_ids_in_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,

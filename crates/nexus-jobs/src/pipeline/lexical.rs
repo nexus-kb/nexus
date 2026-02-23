@@ -209,27 +209,19 @@ impl Phase0JobHandler {
         }
 
         let mut embedding_stage_enqueued = false;
-        if self.settings.embeddings.enabled {
-            match self
-                .enqueue_pipeline_embedding(
-                    run.id,
-                    &run.list_key,
-                    window_from,
-                    window_to,
-                    Some(job.id),
-                )
-                .await
-            {
-                Ok(true) => embedding_stage_enqueued = true,
-                Ok(false) => {}
-                Err(err) => {
-                    warn!(
-                        run_id = run.id,
-                        list_key = %run.list_key,
-                        error = %err,
-                        "failed to enqueue background embedding stage after lexical completion"
-                    );
-                }
+        match self
+            .enqueue_pipeline_embedding(run.id, &run.list_key, window_from, window_to, Some(job.id))
+            .await
+        {
+            Ok(true) => embedding_stage_enqueued = true,
+            Ok(false) => {}
+            Err(err) => {
+                warn!(
+                    run_id = run.id,
+                    list_key = %run.list_key,
+                    error = %err,
+                    "failed to enqueue background embedding stage after lexical completion"
+                );
             }
         }
 

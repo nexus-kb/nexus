@@ -383,33 +383,6 @@ impl PipelineStore {
 
     // ── Ingest window queries (replaces artifact tables) ───────────
 
-    /// Paginated message PKs within the ingest window for a mailing list.
-    pub async fn query_ingest_window_message_pks(
-        &self,
-        mailing_list_id: i64,
-        from: DateTime<Utc>,
-        to: DateTime<Utc>,
-        after_pk: i64,
-        limit: i64,
-    ) -> Result<Vec<i64>> {
-        sqlx::query_scalar::<_, i64>(
-            r#"SELECT message_pk
-            FROM list_message_instances
-            WHERE mailing_list_id = $1
-              AND seen_at >= $2 AND seen_at <= $3
-              AND message_pk > $4
-            ORDER BY message_pk ASC
-            LIMIT $5"#,
-        )
-        .bind(mailing_list_id)
-        .bind(from)
-        .bind(to)
-        .bind(after_pk)
-        .bind(limit.clamp(1, 50_000))
-        .fetch_all(&self.pool)
-        .await
-    }
-
     /// Message PKs in ingest window scoped to specific repo IDs.
     pub async fn query_ingest_window_message_pks_for_repo_ids(
         &self,

@@ -19,18 +19,6 @@ impl Phase0JobHandler {
                 }
             };
 
-        if !self.settings.embeddings.enabled {
-            return JobExecutionOutcome::Success {
-                result_json: serde_json::json!({
-                    "run_id": payload.run_id,
-                    "list_key": payload.list_key,
-                    "stage": STAGE_EMBEDDING,
-                    "skipped": "embeddings disabled",
-                }),
-                metrics: empty_metrics(started.elapsed().as_millis()),
-            };
-        }
-
         let list = match self.catalog.get_mailing_list(&payload.list_key).await {
             Ok(Some(value)) => value,
             Ok(None) => {
@@ -226,10 +214,6 @@ impl Phase0JobHandler {
         window_to: chrono::DateTime<Utc>,
         source_job_id: Option<i64>,
     ) -> Result<bool, sqlx::Error> {
-        if !self.settings.embeddings.enabled {
-            return Ok(false);
-        }
-
         let payload = PipelineEmbeddingPayload {
             run_id,
             list_key: list_key.to_string(),
@@ -378,20 +362,8 @@ impl Phase0JobHandler {
         &self,
         repo: &nexus_db::MailingListRepo,
         rows: &[IngestCommitRow],
-        relaxed_durability: bool,
     ) -> nexus_db::Result<nexus_db::BatchWriteOutcome> {
-        match self.settings.worker.ingest_write_mode {
-            IngestWriteMode::Copy => {
-                self.ingest
-                    .ingest_messages_copy_batch(repo, rows, relaxed_durability)
-                    .await
-            }
-            IngestWriteMode::BatchedSql => {
-                self.ingest
-                    .ingest_messages_batch(repo, rows, relaxed_durability)
-                    .await
-            }
-        }
+        self.ingest.ingest_messages_copy_batch(repo, rows).await
     }
 
     pub(super) async fn apply_threading_for_anchors(

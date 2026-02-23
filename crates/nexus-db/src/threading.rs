@@ -384,33 +384,6 @@ impl ThreadingStore {
         .await
     }
 
-    pub async fn list_message_pks_for_rebuild(
-        &self,
-        mailing_list_id: i64,
-        from_seen_at: Option<DateTime<Utc>>,
-        to_seen_at: Option<DateTime<Utc>>,
-        after_message_pk: i64,
-        limit: i64,
-    ) -> Result<Vec<i64>> {
-        sqlx::query_scalar::<_, i64>(
-            r#"SELECT DISTINCT lmi.message_pk
-            FROM list_message_instances lmi
-            WHERE lmi.mailing_list_id = $1
-              AND ($2::timestamptz IS NULL OR lmi.seen_at >= $2)
-              AND ($3::timestamptz IS NULL OR lmi.seen_at < $3)
-              AND lmi.message_pk > $4
-            ORDER BY lmi.message_pk ASC
-            LIMIT $5"#,
-        )
-        .bind(mailing_list_id)
-        .bind(from_seen_at)
-        .bind(to_seen_at)
-        .bind(after_message_pk)
-        .bind(limit.clamp(1, 10_000))
-        .fetch_all(&self.pool)
-        .await
-    }
-
     pub async fn list_repo_ids_for_rebuild(
         &self,
         mailing_list_id: i64,

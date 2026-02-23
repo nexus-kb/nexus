@@ -439,15 +439,8 @@ impl Phase0JobHandler {
             }
         };
 
-        let discovery_mode = self.settings.worker.lineage_discovery_mode;
-        let discovery_mode_label = match discovery_mode {
-            LineageDiscoveryMode::ThreadFirst => "thread_first",
-            LineageDiscoveryMode::MessageLegacy => "message_legacy",
-        };
-        let work_item_kind = match discovery_mode {
-            LineageDiscoveryMode::ThreadFirst => "threads",
-            LineageDiscoveryMode::MessageLegacy => "messages",
-        };
+        let discovery_mode_label = "thread_first";
+        let work_item_kind = "threads";
 
         let mut cursor = 0i64;
         let mut processed_chunks = 0u64;
@@ -486,100 +479,48 @@ impl Phase0JobHandler {
                 Err(err) => warn!(job_id = job.id, error = %err, "cancel check failed"),
             }
 
-            let (chunk_work_items, extract_outcome) = match discovery_mode {
-                LineageDiscoveryMode::ThreadFirst => {
-                    let thread_chunk = match self
-                        .threading
-                        .list_thread_ids_for_rebuild(
-                            list.id,
-                            payload.from_seen_at,
-                            payload.to_seen_at,
-                            cursor,
-                            batch_limit,
-                        )
-                        .await
-                    {
-                        Ok(v) => v,
-                        Err(err) => {
-                            return retryable_error(
-                                format!("failed to load lineage rebuild thread chunk: {err}"),
-                                "db",
-                                &job,
-                                started.elapsed().as_millis(),
-                                &self.settings,
-                            );
-                        }
-                    };
-
-                    if thread_chunk.is_empty() {
-                        break;
-                    }
-
-                    cursor = *thread_chunk.last().unwrap_or(&cursor);
-                    let extract_outcome =
-                        match process_patch_extract_threads(&self.lineage, list.id, &thread_chunk)
-                            .await
-                        {
-                            Ok(v) => v,
-                            Err(err) => {
-                                return retryable_error(
-                                    format!("patch lineage extraction failed: {err}"),
-                                    "parse",
-                                    &job,
-                                    started.elapsed().as_millis(),
-                                    &self.settings,
-                                );
-                            }
-                        };
-                    (thread_chunk.len() as u64, extract_outcome)
-                }
-                LineageDiscoveryMode::MessageLegacy => {
-                    let message_chunk = match self
-                        .threading
-                        .list_message_pks_for_rebuild(
-                            list.id,
-                            payload.from_seen_at,
-                            payload.to_seen_at,
-                            cursor,
-                            batch_limit,
-                        )
-                        .await
-                    {
-                        Ok(v) => v,
-                        Err(err) => {
-                            return retryable_error(
-                                format!("failed to load lineage rebuild message chunk: {err}"),
-                                "db",
-                                &job,
-                                started.elapsed().as_millis(),
-                                &self.settings,
-                            );
-                        }
-                    };
-
-                    if message_chunk.is_empty() {
-                        break;
-                    }
-
-                    cursor = *message_chunk.last().unwrap_or(&cursor);
-                    let extract_outcome =
-                        match process_patch_extract_window(&self.lineage, list.id, &message_chunk)
-                            .await
-                        {
-                            Ok(v) => v,
-                            Err(err) => {
-                                return retryable_error(
-                                    format!("patch lineage extraction failed: {err}"),
-                                    "parse",
-                                    &job,
-                                    started.elapsed().as_millis(),
-                                    &self.settings,
-                                );
-                            }
-                        };
-                    (message_chunk.len() as u64, extract_outcome)
+            let thread_chunk = match self
+                .threading
+                .list_thread_ids_for_rebuild(
+                    list.id,
+                    payload.from_seen_at,
+                    payload.to_seen_at,
+                    cursor,
+                    batch_limit,
+                )
+                .await
+            {
+                Ok(v) => v,
+                Err(err) => {
+                    return retryable_error(
+                        format!("failed to load lineage rebuild thread chunk: {err}"),
+                        "db",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
                 }
             };
+
+            if thread_chunk.is_empty() {
+                break;
+            }
+
+            cursor = *thread_chunk.last().unwrap_or(&cursor);
+            let extract_outcome =
+                match process_patch_extract_threads(&self.lineage, list.id, &thread_chunk).await {
+                    Ok(v) => v,
+                    Err(err) => {
+                        return retryable_error(
+                            format!("patch lineage extraction failed: {err}"),
+                            "parse",
+                            &job,
+                            started.elapsed().as_millis(),
+                            &self.settings,
+                        );
+                    }
+                };
+            let chunk_work_items = thread_chunk.len() as u64;
 
             if !extract_outcome.patch_item_ids.is_empty() {
                 match process_patch_enrichment_batch(&self.lineage, &extract_outcome.patch_item_ids)
