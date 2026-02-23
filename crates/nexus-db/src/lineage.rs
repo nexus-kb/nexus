@@ -285,8 +285,9 @@ pub struct ListThreadsParams {
     pub to_ts: Option<DateTime<Utc>>,
     pub author_email: Option<String>,
     pub has_diff: Option<bool>,
-    pub page: i64,
-    pub page_size: i64,
+    pub limit: i64,
+    pub cursor_ts: Option<DateTime<Utc>>,
+    pub cursor_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -1755,10 +1756,10 @@ impl LineageStore {
         );
         qb.push_bind(mailing_list_id);
 
-        let cursor_column = if params.sort == "date_desc" {
-            "t.created_at"
-        } else {
-            "t.last_activity_at"
+        let (cursor_column, descending) = match params.sort.as_str() {
+            "date_desc" => ("t.created_at", true),
+            "date_asc" => ("t.created_at", false),
+            _ => ("t.last_activity_at", true),
         };
 
         if let Some(from_ts) = params.from_ts {
@@ -1813,15 +1814,31 @@ impl LineageStore {
                 );
             }
         }
-        let page_size = params.page_size.clamp(1, 200);
-        let page = params.page.max(1);
-        let offset = (page - 1) * page_size;
+
+        if let (Some(cursor_ts), Some(cursor_id)) = (params.cursor_ts, params.cursor_id) {
+            qb.push(" AND (");
+            qb.push(cursor_column);
+            qb.push(", t.id) ");
+            if descending {
+                qb.push("< (");
+            } else {
+                qb.push("> (");
+            }
+            qb.push_bind(cursor_ts);
+            qb.push(", ");
+            qb.push_bind(cursor_id);
+            qb.push(")");
+        }
+
+        let limit = params.limit.clamp(1, 500);
         qb.push(" ORDER BY ");
         qb.push(cursor_column);
-        qb.push(" DESC, t.id DESC LIMIT ");
-        qb.push_bind(page_size);
-        qb.push(" OFFSET ");
-        qb.push_bind(offset);
+        if descending {
+            qb.push(" DESC, t.id DESC LIMIT ");
+        } else {
+            qb.push(" ASC, t.id ASC LIMIT ");
+        }
+        qb.push_bind(limit);
 
         qb.build_query_as::<ThreadListItemRecord>()
             .fetch_all(&self.pool)
@@ -1840,7 +1857,7 @@ impl LineageStore {
         );
         qb.push_bind(mailing_list_id);
 
-        let cursor_column = if params.sort == "date_desc" {
+        let cursor_column = if params.sort == "date_desc" || params.sort == "date_asc" {
             "t.created_at"
         } else {
             "t.last_activity_at"
@@ -1968,13 +1985,11 @@ impl LineageStore {
         &self,
         mailing_list_id: i64,
         thread_id: i64,
-        page: i64,
-        page_size: i64,
+        limit: i64,
+        cursor_sort_key: Option<&[u8]>,
+        cursor_message_pk: Option<i64>,
     ) -> Result<Vec<ThreadMessageRecord>> {
-        let page_size = page_size.max(1);
-        let page = page.max(1);
-        let offset = (page - 1) * page_size;
-        sqlx::query_as::<_, ThreadMessageRecord>(
+        let mut qb: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
             r#"SELECT
                 tm.message_pk,
                 tm.parent_message_pk,
@@ -2000,17 +2015,28 @@ impl LineageStore {
                 ORDER BY pi.id DESC
                 LIMIT 1
             ) patch_ref ON true
-            WHERE tm.mailing_list_id = $1
-              AND tm.thread_id = $2
-            ORDER BY tm.sort_key ASC
-            LIMIT $3 OFFSET $4"#,
-        )
-        .bind(mailing_list_id)
-        .bind(thread_id)
-        .bind(page_size)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await
+            WHERE tm.mailing_list_id = "#,
+        );
+        qb.push_bind(mailing_list_id);
+        qb.push(" AND tm.thread_id = ");
+        qb.push_bind(thread_id);
+
+        if let (Some(cursor_sort_key), Some(cursor_message_pk)) =
+            (cursor_sort_key, cursor_message_pk)
+        {
+            qb.push(" AND (tm.sort_key, tm.message_pk) > (");
+            qb.push_bind(cursor_sort_key.to_vec());
+            qb.push(", ");
+            qb.push_bind(cursor_message_pk);
+            qb.push(")");
+        }
+
+        qb.push(" ORDER BY tm.sort_key ASC, tm.message_pk ASC LIMIT ");
+        qb.push_bind(limit.clamp(1, 500));
+
+        qb.build_query_as::<ThreadMessageRecord>()
+            .fetch_all(&self.pool)
+            .await
     }
 
     pub async fn count_thread_messages(&self, mailing_list_id: i64, thread_id: i64) -> Result<i64> {
@@ -2061,9 +2087,12 @@ impl LineageStore {
     pub async fn list_series(
         &self,
         list_key: Option<&str>,
-        page: i64,
-        page_size: i64,
+        sort: &str,
+        limit: i64,
+        cursor_ts: Option<DateTime<Utc>>,
+        cursor_id: Option<i64>,
     ) -> Result<Vec<SeriesListItemRecord>> {
+        let descending = sort != "last_seen_asc";
         let mut qb: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
             r#"SELECT
                 ps.id AS series_id,
@@ -2100,13 +2129,25 @@ impl LineageStore {
             qb.push_bind(list_key);
         }
 
-        let page_size = page_size.clamp(1, 200);
-        let page = page.max(1);
-        let offset = (page - 1) * page_size;
-        qb.push(" ORDER BY ps.last_seen_at DESC, ps.id DESC LIMIT ");
-        qb.push_bind(page_size);
-        qb.push(" OFFSET ");
-        qb.push_bind(offset);
+        if let (Some(cursor_ts), Some(cursor_id)) = (cursor_ts, cursor_id) {
+            if descending {
+                qb.push(" AND (ps.last_seen_at, ps.id) < (");
+            } else {
+                qb.push(" AND (ps.last_seen_at, ps.id) > (");
+            }
+            qb.push_bind(cursor_ts);
+            qb.push(", ");
+            qb.push_bind(cursor_id);
+            qb.push(")");
+        }
+
+        qb.push(" ORDER BY ps.last_seen_at ");
+        if descending {
+            qb.push("DESC, ps.id DESC LIMIT ");
+        } else {
+            qb.push("ASC, ps.id ASC LIMIT ");
+        }
+        qb.push_bind(limit.clamp(1, 500));
 
         qb.build_query_as::<SeriesListItemRecord>()
             .fetch_all(&self.pool)

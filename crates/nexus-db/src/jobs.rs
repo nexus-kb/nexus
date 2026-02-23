@@ -172,18 +172,25 @@ impl JobStore {
             .await
     }
 
-    pub async fn list_attempts(&self, job_id: i64, limit: i64) -> Result<Vec<JobAttempt>> {
-        sqlx::query_as::<_, JobAttempt>(
+    pub async fn list_attempts(
+        &self,
+        job_id: i64,
+        limit: i64,
+        cursor: Option<i64>,
+    ) -> Result<Vec<JobAttempt>> {
+        let mut qb = QueryBuilder::new(
             r#"SELECT id, job_id, attempt, started_at, finished_at, status, error, metrics_json
             FROM job_attempts
-            WHERE job_id = $1
-            ORDER BY attempt DESC, id DESC
-            LIMIT $2"#,
-        )
-        .bind(job_id)
-        .bind(clamp_attempt_limit(limit))
-        .fetch_all(&self.pool)
-        .await
+            WHERE job_id = "#,
+        );
+        qb.push_bind(job_id);
+        if let Some(cursor) = cursor {
+            qb.push(" AND id < ").push_bind(cursor);
+        }
+        qb.push(" ORDER BY attempt DESC, id DESC LIMIT ")
+            .push_bind(clamp_attempt_limit(limit));
+
+        qb.build_query_as::<JobAttempt>().fetch_all(&self.pool).await
     }
 
     pub async fn list_state_counts(&self) -> Result<Vec<JobStateCount>> {

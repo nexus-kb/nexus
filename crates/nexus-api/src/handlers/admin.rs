@@ -19,6 +19,7 @@ use nexus_jobs::payloads::{
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::state::ApiState;
 
@@ -73,29 +74,87 @@ pub struct ListJobsQuery {
     #[serde(default = "default_limit")]
     pub limit: i64,
     #[serde(default)]
-    pub cursor: Option<i64>,
+    pub cursor: Option<String>,
 }
 
 fn default_limit() -> i64 {
     100
 }
 
+#[derive(Debug, Serialize)]
+pub struct CursorPageInfoResponse {
+    pub limit: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prev_cursor: Option<String>,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CursorPageResponse<T> {
+    pub items: Vec<T>,
+    pub page_info: CursorPageInfoResponse,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct IdCursorToken {
+    v: u8,
+    h: String,
+    id: i64,
+}
+
 pub async fn list_jobs(
     State(state): State<ApiState>,
     Query(query): Query<ListJobsQuery>,
-) -> Result<Json<Vec<Job>>, axum::http::StatusCode> {
-    let jobs = state
+) -> Result<Json<CursorPageResponse<Job>>, axum::http::StatusCode> {
+    let limit = normalize_limit(query.limit, 100, 200);
+    let cursor_hash = short_hash(&json!({
+        "endpoint": "jobs",
+        "state": query.state.as_ref().map(|value| format!("{value:?}")),
+        "job_type": query.job_type.as_deref().unwrap_or(""),
+    }));
+    let cursor_id = if let Some(raw_cursor) = query.cursor.as_deref() {
+        let token: IdCursorToken =
+            decode_cursor_token(raw_cursor).ok_or(axum::http::StatusCode::UNPROCESSABLE_ENTITY)?;
+        if token.v != 1 || token.h != cursor_hash {
+            return Err(axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        Some(token.id)
+    } else {
+        None
+    };
+
+    let mut jobs = state
         .jobs
         .list(ListJobsParams {
-            state: query.state,
-            job_type: query.job_type,
-            limit: query.limit,
-            cursor: query.cursor,
+            state: query.state.clone(),
+            job_type: query.job_type.clone(),
+            limit: limit + 1,
+            cursor: cursor_id,
         })
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    let has_more = jobs.len() > limit as usize;
+    if has_more {
+        jobs.truncate(limit as usize);
+    }
+    let next_cursor = if has_more {
+        jobs.last().and_then(|job| {
+            encode_cursor_token(&IdCursorToken {
+                v: 1,
+                h: cursor_hash.clone(),
+                id: job.id,
+            })
+        })
+    } else {
+        None
+    };
 
-    Ok(Json(jobs))
+    Ok(Json(CursorPageResponse {
+        items: jobs,
+        page_info: build_page_info(limit, next_cursor),
+    }))
 }
 
 pub async fn get_job(
@@ -117,6 +176,8 @@ pub async fn get_job(
 pub struct JobAttemptsQuery {
     #[serde(default = "default_attempts_limit")]
     pub limit: i64,
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 fn default_attempts_limit() -> i64 {
@@ -126,6 +187,7 @@ fn default_attempts_limit() -> i64 {
 #[derive(Debug, Serialize)]
 pub struct JobAttemptsResponse {
     pub items: Vec<nexus_db::JobAttempt>,
+    pub page_info: CursorPageInfoResponse,
 }
 
 pub async fn list_job_attempts(
@@ -143,12 +205,47 @@ pub async fn list_job_attempts(
         return Err(axum::http::StatusCode::NOT_FOUND);
     }
 
-    let attempts = state
+    let limit = normalize_limit(query.limit, 50, 200);
+    let cursor_hash = short_hash(&json!({
+        "endpoint": "job_attempts",
+        "job_id": job_id,
+    }));
+    let cursor_id = if let Some(raw_cursor) = query.cursor.as_deref() {
+        let token: IdCursorToken =
+            decode_cursor_token(raw_cursor).ok_or(axum::http::StatusCode::UNPROCESSABLE_ENTITY)?;
+        if token.v != 1 || token.h != cursor_hash {
+            return Err(axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        Some(token.id)
+    } else {
+        None
+    };
+
+    let mut attempts = state
         .jobs
-        .list_attempts(job_id, query.limit)
+        .list_attempts(job_id, limit + 1, cursor_id)
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(JobAttemptsResponse { items: attempts }))
+    let has_more = attempts.len() > limit as usize;
+    if has_more {
+        attempts.truncate(limit as usize);
+    }
+    let next_cursor = if has_more {
+        attempts.last().and_then(|attempt| {
+            encode_cursor_token(&IdCursorToken {
+                v: 1,
+                h: cursor_hash.clone(),
+                id: attempt.id,
+            })
+        })
+    } else {
+        None
+    };
+
+    Ok(Json(JobAttemptsResponse {
+        items: attempts,
+        page_info: build_page_info(limit, next_cursor),
+    }))
 }
 
 #[derive(Debug, Serialize)]
@@ -554,40 +651,65 @@ pub struct MeiliBootstrapRunsQuery {
     #[serde(default = "default_limit")]
     pub limit: i64,
     #[serde(default)]
-    pub cursor: Option<i64>,
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ListMeiliBootstrapRunsResponse {
     pub items: Vec<nexus_db::MeiliBootstrapRun>,
-    pub next_cursor: Option<i64>,
+    pub page_info: CursorPageInfoResponse,
 }
 
 pub async fn list_meili_bootstrap_runs(
     State(state): State<ApiState>,
     Query(query): Query<MeiliBootstrapRunsQuery>,
 ) -> Result<Json<ListMeiliBootstrapRunsResponse>, axum::http::StatusCode> {
-    let limit = query.limit.clamp(1, 200);
-    let runs = state
+    let limit = normalize_limit(query.limit, 100, 200);
+    let cursor_hash = short_hash(&json!({
+        "endpoint": "meili_bootstrap_runs",
+        "list_key": query.list_key.as_deref().unwrap_or(""),
+        "state": query.state.as_deref().unwrap_or(""),
+    }));
+    let cursor_id = if let Some(raw_cursor) = query.cursor.as_deref() {
+        let token: IdCursorToken =
+            decode_cursor_token(raw_cursor).ok_or(axum::http::StatusCode::UNPROCESSABLE_ENTITY)?;
+        if token.v != 1 || token.h != cursor_hash {
+            return Err(axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        Some(token.id)
+    } else {
+        None
+    };
+
+    let mut runs = state
         .embeddings
         .list_meili_bootstrap_runs(ListMeiliBootstrapRunsParams {
-            list_key: query.list_key,
-            state: query.state,
-            limit,
-            cursor: query.cursor,
+            list_key: query.list_key.clone(),
+            state: query.state.clone(),
+            limit: limit + 1,
+            cursor: cursor_id,
         })
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let next_cursor = if runs.len() >= limit as usize {
-        runs.last().map(|run| run.id)
+    let has_more = runs.len() > limit as usize;
+    if has_more {
+        runs.truncate(limit as usize);
+    }
+    let next_cursor = if has_more {
+        runs.last().and_then(|run| {
+            encode_cursor_token(&IdCursorToken {
+                v: 1,
+                h: cursor_hash.clone(),
+                id: run.id,
+            })
+        })
     } else {
         None
     };
 
     Ok(Json(ListMeiliBootstrapRunsResponse {
         items: runs,
-        next_cursor,
+        page_info: build_page_info(limit, next_cursor),
     }))
 }
 
@@ -1085,39 +1207,65 @@ pub struct PipelineRunsQuery {
     #[serde(default = "default_limit")]
     pub limit: i64,
     #[serde(default)]
-    pub cursor: Option<i64>,
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ListPipelineRunsResponse {
     pub items: Vec<nexus_db::PipelineRun>,
-    pub next_cursor: Option<i64>,
+    pub page_info: CursorPageInfoResponse,
 }
 
 pub async fn list_pipeline_runs(
     State(state): State<ApiState>,
     Query(query): Query<PipelineRunsQuery>,
 ) -> Result<Json<ListPipelineRunsResponse>, axum::http::StatusCode> {
-    let runs = state
+    let limit = normalize_limit(query.limit, 100, 200);
+    let cursor_hash = short_hash(&json!({
+        "endpoint": "pipeline_runs",
+        "list_key": query.list_key.as_deref().unwrap_or(""),
+        "state": query.state.as_deref().unwrap_or(""),
+    }));
+    let cursor_id = if let Some(raw_cursor) = query.cursor.as_deref() {
+        let token: IdCursorToken =
+            decode_cursor_token(raw_cursor).ok_or(axum::http::StatusCode::UNPROCESSABLE_ENTITY)?;
+        if token.v != 1 || token.h != cursor_hash {
+            return Err(axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        Some(token.id)
+    } else {
+        None
+    };
+
+    let mut runs = state
         .pipeline
         .list_runs(ListPipelineRunsParams {
-            list_key: query.list_key,
-            state: query.state,
-            limit: query.limit.clamp(1, 200),
-            cursor: query.cursor,
+            list_key: query.list_key.clone(),
+            state: query.state.clone(),
+            limit: limit + 1,
+            cursor: cursor_id,
         })
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let next_cursor = if runs.len() >= query.limit.clamp(1, 200) as usize {
-        runs.last().map(|run| run.id)
+    let has_more = runs.len() > limit as usize;
+    if has_more {
+        runs.truncate(limit as usize);
+    }
+    let next_cursor = if has_more {
+        runs.last().and_then(|run| {
+            encode_cursor_token(&IdCursorToken {
+                v: 1,
+                h: cursor_hash.clone(),
+                id: run.id,
+            })
+        })
     } else {
         None
     };
 
     Ok(Json(ListPipelineRunsResponse {
         items: runs,
-        next_cursor,
+        page_info: build_page_info(limit, next_cursor),
     }))
 }
 
@@ -1696,6 +1844,57 @@ async fn queue_list_ingest(
 
 fn looks_like_bare_repo(path: &Path) -> bool {
     path.join("objects").exists() && path.join("refs").exists()
+}
+
+fn normalize_limit(limit: i64, default: i64, max: i64) -> i64 {
+    let requested = if limit <= 0 { default } else { limit };
+    requested.clamp(1, max)
+}
+
+fn build_page_info(limit: i64, next_cursor: Option<String>) -> CursorPageInfoResponse {
+    CursorPageInfoResponse {
+        limit,
+        next_cursor: next_cursor.clone(),
+        prev_cursor: None,
+        has_more: next_cursor.is_some(),
+    }
+}
+
+fn short_hash(value: &Value) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(serde_json::to_vec(value).unwrap_or_default());
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(32);
+    for byte in digest.iter().take(16) {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+fn encode_cursor_token<T: Serialize>(token: &T) -> Option<String> {
+    let bytes = serde_json::to_vec(token).ok()?;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    Some(out)
+}
+
+fn decode_cursor_token<T: for<'de> Deserialize<'de>>(raw: &str) -> Option<T> {
+    if raw.len() % 2 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(raw.len() / 2);
+    let data = raw.as_bytes();
+    for idx in (0..raw.len()).step_by(2) {
+        let hi = data[idx] as char;
+        let lo = data[idx + 1] as char;
+        let value = hi.to_digit(16)? * 16 + lo.to_digit(16)?;
+        bytes.push(value as u8);
+    }
+    serde_json::from_slice(&bytes).ok()
 }
 
 fn parse_embedding_scope(raw: &str) -> Option<EmbeddingScope> {

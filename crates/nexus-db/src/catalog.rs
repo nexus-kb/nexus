@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use sqlx::PgPool;
+use sqlx::{PgPool, QueryBuilder};
 
 use crate::Result;
 
@@ -214,14 +214,11 @@ impl CatalogStore {
 
     pub async fn list_mailing_lists(
         &self,
-        page: i64,
-        page_size: i64,
+        limit: i64,
+        cursor_list_key: Option<&str>,
     ) -> Result<Vec<ListCatalogItemRecord>> {
-        let page_size = page_size.clamp(1, 200);
-        let page = page.max(1);
-        let offset = (page - 1) * page_size;
-
-        sqlx::query_as::<_, ListCatalogItemRecord>(
+        let limit = limit.clamp(1, 500);
+        let mut qb: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
             r#"SELECT
                 ml.list_key,
                 ml.description,
@@ -247,14 +244,20 @@ impl CatalogStore {
                 WHERE lmi.mailing_list_id = ml.id
                   AND lmi.seen_at >= now() - interval '30 days'
             ) m30 ON true
-            WHERE ml.active = true
-            ORDER BY ml.list_key ASC
-            LIMIT $1 OFFSET $2"#,
-        )
-        .bind(page_size)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await
+            WHERE ml.active = true"#,
+        );
+
+        if let Some(cursor_list_key) = cursor_list_key {
+            qb.push(" AND ml.list_key > ");
+            qb.push_bind(cursor_list_key);
+        }
+
+        qb.push(" ORDER BY ml.list_key ASC LIMIT ");
+        qb.push_bind(limit);
+
+        qb.build_query_as::<ListCatalogItemRecord>()
+            .fetch_all(&self.pool)
+            .await
     }
 
     pub async fn get_mailing_list_detail(
