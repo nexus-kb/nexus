@@ -6,7 +6,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
 use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
 use nexus_core::search::SearchScope;
-use nexus_db::{ListThreadsParams, PatchItemDetailRecord, SeriesLogicalCompareRow};
+use nexus_db::{ListThreadsParams, PatchItemDetailRecord, SearchStore, SeriesLogicalCompareRow};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -1812,6 +1812,43 @@ pub async fn search(
         .cloned()
         .unwrap_or_default();
 
+    let should_hydrate_thread_metadata = scope == SearchScope::Thread
+        && hits.iter().any(|hit| {
+            hit.get("message_count").is_none()
+                || hit.get("created_at").is_none()
+                || hit.get("last_activity_at").is_none()
+                || hit.get("starter_email").is_none()
+        });
+    let should_hydrate_series_metadata = scope == SearchScope::Series
+        && hits.iter().any(|hit| {
+            hit.get("latest_version_num").is_none() || hit.get("is_rfc_latest").is_none()
+        });
+
+    let fallback_docs_by_id: HashMap<i64, Value> =
+        if should_hydrate_thread_metadata || should_hydrate_series_metadata {
+            let hit_ids: Vec<i64> = hits
+                .iter()
+                .filter_map(|hit| hit.get("id").and_then(Value::as_i64))
+                .collect();
+            if hit_ids.is_empty() {
+                HashMap::new()
+            } else {
+                let search_store = SearchStore::new(state.db.pool().clone());
+                let docs = if should_hydrate_thread_metadata {
+                    search_store.build_thread_docs(&hit_ids).await
+                } else {
+                    search_store.build_patch_series_docs(&hit_ids).await
+                }
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+                docs.into_iter()
+                    .filter_map(|doc| doc.get("id").and_then(Value::as_i64).map(|id| (id, doc)))
+                    .collect()
+            }
+        } else {
+            HashMap::new()
+        };
+
     let mut items = Vec::with_capacity(hits.len());
     let mut highlights = BTreeMap::new();
     for hit in hits {
@@ -1862,11 +1899,44 @@ pub async fn search(
             "is_rfc",
             "latest_version_num",
             "latest_version_id",
+            "is_rfc_latest",
             "list_key",
+            "created_at",
+            "last_activity_at",
+            "message_count",
+            "starter_name",
+            "starter_email",
             "participants",
         ] {
             if let Some(value) = hit.get(key) {
                 metadata.insert(key.to_string(), value.clone());
+            }
+        }
+        if let Some(doc) = fallback_docs_by_id.get(&id) {
+            for key in [
+                "message_id_primary",
+                "patch_series_id",
+                "series_version_id",
+                "version_num",
+                "ordinal",
+                "is_rfc",
+                "latest_version_num",
+                "latest_version_id",
+                "is_rfc_latest",
+                "list_key",
+                "created_at",
+                "last_activity_at",
+                "message_count",
+                "starter_name",
+                "starter_email",
+                "participants",
+            ] {
+                if metadata.contains_key(key) {
+                    continue;
+                }
+                if let Some(value) = doc.get(key) {
+                    metadata.insert(key.to_string(), value.clone());
+                }
             }
         }
 

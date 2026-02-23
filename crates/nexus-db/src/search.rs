@@ -31,6 +31,7 @@ struct PatchSeriesDocRow {
     last_seen_at: DateTime<Utc>,
     latest_version_num: Option<i32>,
     latest_version_id: Option<i64>,
+    latest_version_is_rfc: Option<bool>,
     cover_body: Option<String>,
     has_diff: Option<bool>,
     patch_subjects: Vec<String>,
@@ -42,7 +43,11 @@ struct ThreadDocRow {
     id: i64,
     list_key: String,
     subject: String,
+    created_at: DateTime<Utc>,
     last_activity_at: DateTime<Utc>,
+    message_count: i32,
+    starter_name: Option<String>,
+    starter_email: Option<String>,
     participants: Vec<String>,
     snippet_corpus: Option<String>,
     has_diff: Option<bool>,
@@ -178,6 +183,7 @@ impl SearchStore {
                 ps.last_seen_at,
                 psv.version_num AS latest_version_num,
                 psv.id AS latest_version_id,
+                psv.is_rfc AS latest_version_is_rfc,
                 mb.body_text AS cover_body,
                 BOOL_OR(COALESCE(pi.has_diff, false)) AS has_diff,
                 COALESCE(
@@ -203,7 +209,7 @@ impl SearchStore {
               ON ml.id = psl.mailing_list_id
             WHERE ps.id = ANY($1)
             GROUP BY ps.id, ps.canonical_subject_norm, ps.author_email, ps.last_seen_at,
-                     psv.version_num, psv.id, mb.body_text
+                     psv.version_num, psv.id, psv.is_rfc, mb.body_text
             ORDER BY ps.id ASC"#,
         )
         .bind(ids)
@@ -237,6 +243,7 @@ impl SearchStore {
                     "has_diff": row.has_diff.unwrap_or(false),
                     "latest_version_num": row.latest_version_num.unwrap_or(1),
                     "latest_version_id": row.latest_version_id,
+                    "is_rfc_latest": row.latest_version_is_rfc.unwrap_or(false),
                     "cover_abstract": cover_abstract,
                     "patch_subjects_joined": limit_text(&patch_subjects_joined, 20_000),
                     "route": format!("/series/{}", row.id),
@@ -256,9 +263,21 @@ impl SearchStore {
                     t.id,
                     t.mailing_list_id,
                     t.subject_norm,
+                    t.created_at,
+                    t.root_message_pk,
+                    t.message_count,
                     t.last_activity_at
                 FROM threads t
                 WHERE t.id = ANY($1)
+            ),
+            starter AS (
+                SELECT
+                    t.id AS thread_id,
+                    m.from_name AS starter_name,
+                    m.from_email AS starter_email
+                FROM targets t
+                LEFT JOIN messages m
+                  ON m.id = t.root_message_pk
             ),
             participants AS (
                 SELECT
@@ -291,13 +310,19 @@ impl SearchStore {
                 t.id,
                 ml.list_key,
                 t.subject_norm AS subject,
+                t.created_at,
                 t.last_activity_at,
+                t.message_count,
+                st.starter_name,
+                st.starter_email,
                 COALESCE(p.participant_emails, ARRAY[]::text[]) AS participants,
                 s.snippet_corpus,
                 s.has_diff
             FROM targets t
             JOIN mailing_lists ml
               ON ml.id = t.mailing_list_id
+            LEFT JOIN starter st
+              ON st.thread_id = t.id
             LEFT JOIN participants p
               ON p.thread_id = t.id
             LEFT JOIN snippets s
@@ -329,6 +354,11 @@ impl SearchStore {
                     "date_ts": date_ts,
                     "year": year,
                     "month": month,
+                    "created_at": row.created_at.to_rfc3339(),
+                    "last_activity_at": row.last_activity_at.to_rfc3339(),
+                    "message_count": row.message_count,
+                    "starter_name": row.starter_name,
+                    "starter_email": row.starter_email,
                     "list_key": list_key.clone(),
                     "list_keys": vec![list_key.clone()],
                     "participants": participants.clone(),
