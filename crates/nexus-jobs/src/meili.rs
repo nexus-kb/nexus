@@ -27,16 +27,6 @@ pub enum MeiliClientError {
     Protocol(String),
 }
 
-impl MeiliClientError {
-    pub fn is_transient(&self) -> bool {
-        match self {
-            MeiliClientError::Http(_) => true,
-            MeiliClientError::Status { status, .. } => *status == 429 || *status >= 500,
-            MeiliClientError::Protocol(_) => false,
-        }
-    }
-}
-
 impl MeiliClient {
     pub fn from_settings(settings: &Settings) -> Self {
         Self {

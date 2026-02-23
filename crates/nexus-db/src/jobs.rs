@@ -190,7 +190,9 @@ impl JobStore {
         qb.push(" ORDER BY attempt DESC, id DESC LIMIT ")
             .push_bind(clamp_attempt_limit(limit));
 
-        qb.build_query_as::<JobAttempt>().fetch_all(&self.pool).await
+        qb.build_query_as::<JobAttempt>()
+            .fetch_all(&self.pool)
+            .await
     }
 
     pub async fn list_state_counts(&self) -> Result<Vec<JobStateCount>> {

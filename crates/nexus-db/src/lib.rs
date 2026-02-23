@@ -18,7 +18,8 @@ pub use crate::catalog::{
 };
 pub use crate::db::Db;
 pub use crate::embeddings::{
-    EmbeddingInputRow, EmbeddingVectorUpsert, EmbeddingsStore, ListMeiliBootstrapRunsParams,
+    BackfillProgressUpdate, EmbeddingInputRow, EmbeddingVectorUpsert, EmbeddingsStore,
+    ListMeiliBootstrapRunsParams,
 };
 pub use crate::ingest::{
     BatchWriteOutcome, IngestCommitRow, IngestStore, ParsedBodyInput, ParsedMessageInput,

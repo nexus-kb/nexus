@@ -20,6 +20,16 @@ pub struct EmbeddingVectorUpsert {
     pub source_hash: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
+pub struct BackfillProgressUpdate {
+    pub cursor_id: i64,
+    pub processed_count: i64,
+    pub embedded_count: i64,
+    pub failed_count: i64,
+    pub total_candidates: i64,
+    pub progress_json: serde_json::Value,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ListMeiliBootstrapRunsParams {
     pub list_key: Option<String>,
@@ -101,12 +111,7 @@ impl EmbeddingsStore {
     pub async fn update_backfill_progress(
         &self,
         run_id: i64,
-        cursor_id: i64,
-        processed_count: i64,
-        embedded_count: i64,
-        failed_count: i64,
-        total_candidates: i64,
-        progress_json: serde_json::Value,
+        progress: BackfillProgressUpdate,
     ) -> Result<()> {
         sqlx::query(
             r#"UPDATE embedding_backfill_runs
@@ -120,12 +125,12 @@ impl EmbeddingsStore {
                WHERE id = $1"#,
         )
         .bind(run_id)
-        .bind(cursor_id)
-        .bind(processed_count)
-        .bind(embedded_count)
-        .bind(failed_count)
-        .bind(total_candidates)
-        .bind(progress_json)
+        .bind(progress.cursor_id)
+        .bind(progress.processed_count)
+        .bind(progress.embedded_count)
+        .bind(progress.failed_count)
+        .bind(progress.total_candidates)
+        .bind(progress.progress_json)
         .execute(&self.pool)
         .await?;
         Ok(())
