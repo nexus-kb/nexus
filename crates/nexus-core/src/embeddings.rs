@@ -106,7 +106,9 @@ impl OpenAiEmbeddingsClient {
                     "embedding entry missing index".to_string(),
                 ));
             };
-            let idx = index as usize;
+            let idx = usize::try_from(index).map_err(|_| {
+                EmbeddingsClientError::Protocol(format!("embedding index {index} out of range"))
+            })?;
             if idx >= inputs.len() {
                 return Err(EmbeddingsClientError::Protocol(format!(
                     "embedding index {idx} out of bounds for {} inputs",

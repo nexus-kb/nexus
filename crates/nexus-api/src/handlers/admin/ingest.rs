@@ -215,7 +215,7 @@ pub async fn ingest_grokmirror(
                 .jobs
                 .enqueue(EnqueueJobParams {
                     job_type: "pipeline_ingest".to_string(),
-                    payload_json: serde_json::to_value(payload).unwrap_or_default(),
+                    payload_json: json!({ "run_id": payload.run_id }),
                     priority: 20,
                     dedupe_scope: Some(format!("pipeline:run:{}", activated.id)),
                     dedupe_key: Some("ingest".to_string()),
