@@ -1,6 +1,7 @@
 use super::*;
+use utoipa::ToSchema;
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone, ToSchema)]
 pub struct PageInfoResponse {
     pub limit: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -10,7 +11,7 @@ pub struct PageInfoResponse {
     pub has_more: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CursorQuery {
     #[serde(default)]
     pub limit: Option<i64>,
@@ -18,7 +19,7 @@ pub struct CursorQuery {
     pub cursor: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ListSummaryResponse {
     pub list_key: String,
     pub description: Option<String>,
@@ -28,33 +29,33 @@ pub struct ListSummaryResponse {
     pub message_count_30d: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ListCatalogResponse {
     pub items: Vec<ListSummaryResponse>,
     pub page_info: PageInfoResponse,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ListMirrorStateResponse {
     pub active_repos: i64,
     pub total_repos: i64,
     pub latest_repo_watermark_updated_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ListCountsResponse {
     pub messages: i64,
     pub threads: i64,
     pub patch_series: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ListFacetsHintResponse {
     pub default_scope: String,
     pub available_scopes: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ListDetailResponse {
     pub list_key: String,
     pub description: Option<String>,
@@ -64,27 +65,27 @@ pub struct ListDetailResponse {
     pub facets_hint: ListFacetsHintResponse,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct ListStatsQuery {
     #[serde(default)]
     pub window: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ListTopAuthorResponse {
     pub from_email: String,
     pub from_name: Option<String>,
     pub message_count: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ListActivityByDayResponse {
     pub day_utc: DateTime<Utc>,
     pub messages: i64,
     pub threads: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ListStatsResponse {
     pub messages: i64,
     pub threads: i64,
@@ -93,7 +94,7 @@ pub struct ListStatsResponse {
     pub activity_by_day: Vec<ListActivityByDayResponse>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct PatchItemResponse {
     pub patch_item_id: i64,
     pub series_id: i64,
@@ -115,7 +116,7 @@ pub struct PatchItemResponse {
     pub hunks: i32,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct PatchItemFileResponse {
     pub patch_item_id: i64,
     pub path: String,
@@ -129,26 +130,31 @@ pub struct PatchItemFileResponse {
     pub diff_end: i32,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PatchItemFilesResponse {
+    pub items: Vec<PatchItemFileResponse>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
 pub struct PatchItemDiffResponse {
     pub patch_item_id: i64,
     pub diff_text: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct PatchItemFileDiffResponse {
     pub patch_item_id: i64,
     pub path: String,
     pub diff_text: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct PatchItemFileDiffPath {
     pub patch_item_id: i64,
     pub path: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct MessageBodyQuery {
     #[serde(default)]
     pub include_diff: Option<bool>,
@@ -156,7 +162,7 @@ pub struct MessageBodyQuery {
     pub strip_quotes: Option<bool>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct MessageBodyResponse {
     pub message_id: i64,
     pub subject: String,
@@ -167,7 +173,7 @@ pub struct MessageBodyResponse {
     pub has_attachments: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct MessageResponse {
     pub message_id: i64,
     pub message_id_primary: String,
@@ -183,18 +189,18 @@ pub struct MessageResponse {
     pub has_attachments: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct MessageIdPath {
     pub msgid: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ThreadMessageParticipant {
     pub name: Option<String>,
     pub email: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ThreadMessageEntry {
     pub message_id: i64,
     pub parent_message_id: Option<i64>,
@@ -211,7 +217,7 @@ pub struct ThreadMessageEntry {
     pub body_text: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ThreadDetailResponse {
     pub thread_id: i64,
     pub list_key: String,
@@ -221,7 +227,7 @@ pub struct ThreadDetailResponse {
     pub messages: Vec<ThreadMessageEntry>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ThreadListItemResponse {
     pub thread_id: i64,
     pub subject: String,
@@ -235,13 +241,13 @@ pub struct ThreadListItemResponse {
     pub has_diff: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ThreadListResponse {
     pub items: Vec<ThreadListItemResponse>,
     pub page_info: PageInfoResponse,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct ThreadListQuery {
     #[serde(default)]
     pub sort: Option<String>,
@@ -259,7 +265,7 @@ pub struct ThreadListQuery {
     pub has_diff: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct ThreadMessagesQuery {
     #[serde(default)]
     pub view: Option<String>,
@@ -269,7 +275,7 @@ pub struct ThreadMessagesQuery {
     pub cursor: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ThreadMessagesResponse {
     pub thread_id: i64,
     pub list_key: String,
@@ -278,19 +284,19 @@ pub struct ThreadMessagesResponse {
     pub page_info: PageInfoResponse,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct ThreadPath {
     pub list_key: String,
     pub thread_id: i64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct SeriesVersionPath {
     pub series_id: i64,
     pub series_version_id: i64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct SeriesListQuery {
     #[serde(default)]
     pub list_key: Option<String>,
@@ -302,7 +308,7 @@ pub struct SeriesListQuery {
     pub cursor: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SeriesListItemResponse {
     pub series_id: i64,
     pub canonical_subject: String,
@@ -315,25 +321,25 @@ pub struct SeriesListItemResponse {
     pub is_rfc_latest: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SeriesListResponse {
     pub items: Vec<SeriesListItemResponse>,
     pub page_info: PageInfoResponse,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SeriesAuthorResponse {
     pub name: Option<String>,
     pub email: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SeriesThreadRefResponse {
     pub list_key: String,
     pub thread_id: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SeriesVersionSummaryResponse {
     pub series_version_id: i64,
     pub version_num: i32,
@@ -346,7 +352,7 @@ pub struct SeriesVersionSummaryResponse {
     pub is_partial_reroll: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SeriesDetailResponse {
     pub series_id: i64,
     pub canonical_subject: String,
@@ -358,13 +364,13 @@ pub struct SeriesDetailResponse {
     pub latest_version_id: Option<i64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct SeriesVersionQuery {
     #[serde(default)]
     pub assembled: Option<bool>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SeriesVersionPatchItemResponse {
     pub patch_item_id: i64,
     pub ordinal: i32,
@@ -386,7 +392,7 @@ pub struct SeriesVersionPatchItemResponse {
     pub inherited_from_version_num: Option<i32>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SeriesVersionResponse {
     pub series_id: i64,
     pub series_version_id: i64,
@@ -403,7 +409,7 @@ pub struct SeriesVersionResponse {
     pub patch_items: Vec<SeriesVersionPatchItemResponse>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct SeriesCompareQuery {
     pub v1: i64,
     pub v2: i64,
@@ -411,7 +417,7 @@ pub struct SeriesCompareQuery {
     pub mode: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SeriesCompareSummary {
     pub v1_patch_count: i64,
     pub v2_patch_count: i64,
@@ -421,7 +427,7 @@ pub struct SeriesCompareSummary {
     pub removed: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SeriesComparePatchRow {
     pub slot: i32,
     pub title_norm: String,
@@ -434,7 +440,7 @@ pub struct SeriesComparePatchRow {
     pub v2_subject: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SeriesCompareFileRow {
     pub path: String,
     pub status: String,
@@ -443,7 +449,7 @@ pub struct SeriesCompareFileRow {
     pub hunks_delta: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SeriesCompareResponse {
     pub series_id: i64,
     pub v1: i64,
@@ -456,7 +462,7 @@ pub struct SeriesCompareResponse {
     pub files: Option<Vec<SeriesCompareFileRow>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct SearchQuery {
     pub q: String,
     #[serde(default)]
@@ -483,7 +489,7 @@ pub struct SearchQuery {
     pub semantic_ratio: Option<f32>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SearchItemResponse {
     pub scope: String,
     pub id: i64,
@@ -500,7 +506,7 @@ pub struct SearchItemResponse {
     pub metadata: Value,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SearchResponse {
     pub items: Vec<SearchItemResponse>,
     pub facets: Value,
@@ -508,13 +514,13 @@ pub struct SearchResponse {
     pub page_info: PageInfoResponse,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub(super) struct ListCatalogCursorToken {
     pub(super) v: u8,
     pub(super) list_key: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub(super) struct ThreadListCursorToken {
     pub(super) v: u8,
     pub(super) h: String,
@@ -522,7 +528,7 @@ pub(super) struct ThreadListCursorToken {
     pub(super) id: i64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub(super) struct ThreadMessagesCursorToken {
     pub(super) v: u8,
     pub(super) h: String,
@@ -530,7 +536,7 @@ pub(super) struct ThreadMessagesCursorToken {
     pub(super) message_id: i64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub(super) struct SeriesListCursorToken {
     pub(super) v: u8,
     pub(super) h: String,

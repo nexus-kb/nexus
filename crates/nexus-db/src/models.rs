@@ -1,7 +1,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, sqlx::Type, ToSchema)]
 #[sqlx(type_name = "job_state", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum JobState {
@@ -14,7 +15,7 @@ pub enum JobState {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, ToSchema)]
 pub struct Job {
     pub id: i64,
     pub job_type: String,
@@ -36,7 +37,7 @@ pub struct Job {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, ToSchema)]
 pub struct PipelineRun {
     pub id: i64,
     pub mailing_list_id: i64,
@@ -56,7 +57,7 @@ pub struct PipelineRun {
     pub batch_position: Option<i32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, ToSchema)]
 pub struct EmbeddingBackfillRun {
     pub id: i64,
     pub scope: String,
@@ -79,7 +80,7 @@ pub struct EmbeddingBackfillRun {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, ToSchema)]
 pub struct MeiliBootstrapRun {
     pub id: i64,
     pub scope: String,

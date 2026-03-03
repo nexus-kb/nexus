@@ -1,6 +1,6 @@
 use super::*;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct PipelineRunsQuery {
     #[serde(default)]
     pub list_key: Option<String>,
@@ -12,7 +12,7 @@ pub struct PipelineRunsQuery {
     pub cursor: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ListPipelineRunsResponse {
     pub items: Vec<nexus_db::PipelineRun>,
     pub page_info: CursorPageInfoResponse,
@@ -21,7 +21,7 @@ pub struct ListPipelineRunsResponse {
 pub async fn list_pipeline_runs(
     State(state): State<ApiState>,
     Query(query): Query<PipelineRunsQuery>,
-) -> Result<Json<ListPipelineRunsResponse>, axum::http::StatusCode> {
+) -> HandlerResult<Json<ListPipelineRunsResponse>> {
     let limit = normalize_limit(query.limit, 100, 200);
     let cursor_hash = short_hash(&json!({
         "endpoint": "pipeline_runs",
@@ -32,7 +32,7 @@ pub async fn list_pipeline_runs(
         let token: IdCursorToken =
             decode_cursor_token(raw_cursor).ok_or(axum::http::StatusCode::UNPROCESSABLE_ENTITY)?;
         if token.v != 1 || token.h != cursor_hash {
-            return Err(axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+            return Err(axum::http::StatusCode::UNPROCESSABLE_ENTITY.into());
         }
         Some(token.id)
     } else {
@@ -75,14 +75,14 @@ pub async fn list_pipeline_runs(
 pub async fn get_pipeline_run(
     State(state): State<ApiState>,
     AxumPath(run_id): AxumPath<i64>,
-) -> Result<Json<nexus_db::PipelineRun>, axum::http::StatusCode> {
+) -> HandlerResult<Json<nexus_db::PipelineRun>> {
     let Some(run) = state
         .pipeline
         .get_run(run_id)
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?
     else {
-        return Err(axum::http::StatusCode::NOT_FOUND);
+        return Err(axum::http::StatusCode::NOT_FOUND.into());
     };
 
     Ok(Json(run))

@@ -4,12 +4,12 @@ pub async fn series_list(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Query(query): Query<SeriesListQuery>,
-) -> Result<Response, StatusCode> {
+) -> HandlerResult<Response> {
     let limit = normalize_limit(query.limit, 30, 200);
     let fetch_limit = limit + 1;
     let sort = query.sort.as_deref().unwrap_or("last_seen_desc");
     if sort != "last_seen_desc" && sort != "last_seen_asc" {
-        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+        return Err(StatusCode::UNPROCESSABLE_ENTITY.into());
     }
 
     let cursor_hash = short_hash(&json!({
@@ -20,7 +20,7 @@ pub async fn series_list(
         let token: SeriesListCursorToken =
             decode_cursor_token(raw_cursor).ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
         if token.v != 1 || token.h != cursor_hash {
-            return Err(StatusCode::UNPROCESSABLE_ENTITY);
+            return Err(StatusCode::UNPROCESSABLE_ENTITY.into());
         }
         let cursor_ts = Utc
             .timestamp_millis_opt(token.ts)
@@ -88,14 +88,14 @@ pub async fn series_detail(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Path(series_id): Path<i64>,
-) -> Result<Response, StatusCode> {
+) -> HandlerResult<Response> {
     let Some(series) = state
         .lineage
         .get_series_by_id(series_id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     else {
-        return Err(StatusCode::NOT_FOUND);
+        return Err(StatusCode::NOT_FOUND.into());
     };
 
     let lists = state
@@ -167,7 +167,7 @@ pub async fn series_version(
     headers: HeaderMap,
     Path(path): Path<SeriesVersionPath>,
     Query(query): Query<SeriesVersionQuery>,
-) -> Result<Response, StatusCode> {
+) -> HandlerResult<Response> {
     let assembled = query.assembled.unwrap_or(true);
     let Some(version) = state
         .lineage
@@ -175,7 +175,7 @@ pub async fn series_version(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     else {
-        return Err(StatusCode::NOT_FOUND);
+        return Err(StatusCode::NOT_FOUND.into());
     };
 
     let patch_items = state
@@ -232,10 +232,10 @@ pub async fn series_compare(
     headers: HeaderMap,
     Path(series_id): Path<i64>,
     Query(query): Query<SeriesCompareQuery>,
-) -> Result<Response, StatusCode> {
+) -> HandlerResult<Response> {
     let mode = query.mode.as_deref().unwrap_or("summary");
     if mode != "summary" && mode != "per_patch" && mode != "per_file" {
-        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+        return Err(StatusCode::UNPROCESSABLE_ENTITY.into());
     }
 
     let Some(v1) = state
@@ -244,7 +244,7 @@ pub async fn series_compare(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     else {
-        return Err(StatusCode::NOT_FOUND);
+        return Err(StatusCode::NOT_FOUND.into());
     };
     let Some(v2) = state
         .lineage
@@ -252,7 +252,7 @@ pub async fn series_compare(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     else {
-        return Err(StatusCode::NOT_FOUND);
+        return Err(StatusCode::NOT_FOUND.into());
     };
 
     let logical_rows = state

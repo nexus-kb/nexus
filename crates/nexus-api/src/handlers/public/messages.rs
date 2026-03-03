@@ -5,7 +5,7 @@ pub async fn message_body(
     headers: HeaderMap,
     Path(message_id): Path<i64>,
     Query(query): Query<MessageBodyQuery>,
-) -> Result<Response, StatusCode> {
+) -> HandlerResult<Response> {
     let include_diff = query.include_diff.unwrap_or(false);
     let strip_quotes = query.strip_quotes.unwrap_or(false);
 
@@ -15,7 +15,7 @@ pub async fn message_body(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     else {
-        return Err(StatusCode::NOT_FOUND);
+        return Err(StatusCode::NOT_FOUND.into());
     };
 
     let body_text = record
@@ -42,14 +42,14 @@ pub async fn message_detail(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Path(message_id): Path<i64>,
-) -> Result<Response, StatusCode> {
+) -> HandlerResult<Response> {
     let Some(record) = state
         .lineage
         .get_message_detail(message_id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     else {
-        return Err(StatusCode::NOT_FOUND);
+        return Err(StatusCode::NOT_FOUND.into());
     };
 
     json_response_with_cache(
@@ -79,7 +79,7 @@ pub async fn message_detail(
 pub async fn message_id_redirect(
     State(state): State<ApiState>,
     Path(path): Path<MessageIdPath>,
-) -> Result<Response, StatusCode> {
+) -> HandlerResult<Response> {
     let mut candidates = vec![path.msgid.clone()];
     if !path.msgid.starts_with('<') && !path.msgid.ends_with('>') {
         candidates.push(format!("<{}>", path.msgid));
@@ -96,5 +96,5 @@ pub async fn message_id_redirect(
         }
     }
 
-    Err(StatusCode::NOT_FOUND)
+    Err(StatusCode::NOT_FOUND.into())
 }

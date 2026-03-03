@@ -1,6 +1,6 @@
 use super::*;
 
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Serialize, Default, ToSchema)]
 pub struct QueueStateCountsResponse {
     pub scheduled: i64,
     pub queued: i64,
@@ -11,7 +11,7 @@ pub struct QueueStateCountsResponse {
     pub cancelled: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct QueueDiagnosticsResponse {
     pub generated_at: DateTime<Utc>,
     pub counts_by_state: QueueStateCountsResponse,
@@ -21,7 +21,7 @@ pub struct QueueDiagnosticsResponse {
 
 pub async fn diagnostics_queue(
     State(state): State<ApiState>,
-) -> Result<Json<QueueDiagnosticsResponse>, axum::http::StatusCode> {
+) -> HandlerResult<Json<QueueDiagnosticsResponse>> {
     let state_counts = state
         .jobs
         .list_state_counts()
@@ -46,7 +46,7 @@ pub async fn diagnostics_queue(
     }))
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct StorageDbTotalsResponse {
     pub mailing_lists: i64,
     pub messages: i64,
@@ -58,13 +58,13 @@ pub struct StorageDbTotalsResponse {
     pub embedding_vectors: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct StorageDbListRepoCountsResponse {
     pub active: i64,
     pub total: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct StorageDbListCountsResponse {
     pub messages: i64,
     pub threads: i64,
@@ -72,34 +72,34 @@ pub struct StorageDbListCountsResponse {
     pub patch_items: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct StorageDbListResponse {
     pub list_key: String,
     pub repos: StorageDbListRepoCountsResponse,
     pub counts: StorageDbListCountsResponse,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct StorageDbResponse {
     pub totals: StorageDbTotalsResponse,
     pub lists: Vec<StorageDbListResponse>,
 }
 
-#[derive(Debug, Serialize, Clone, Default)]
+#[derive(Debug, Serialize, Clone, Default, ToSchema)]
 pub struct StorageMeiliIndexResponse {
     pub documents: i64,
     pub is_indexing: bool,
     pub embedded_documents: i64,
 }
 
-#[derive(Debug, Serialize, Clone, Default)]
+#[derive(Debug, Serialize, Clone, Default, ToSchema)]
 pub struct StorageMeiliIndexesResponse {
     pub thread_docs: StorageMeiliIndexResponse,
     pub patch_series_docs: StorageMeiliIndexResponse,
     pub patch_item_docs: StorageMeiliIndexResponse,
 }
 
-#[derive(Debug, Serialize, Clone, Default)]
+#[derive(Debug, Serialize, Clone, Default, ToSchema)]
 pub struct StorageMeiliTotalsResponse {
     pub database_size_bytes: Option<u64>,
     pub used_database_size_bytes: Option<u64>,
@@ -107,7 +107,7 @@ pub struct StorageMeiliTotalsResponse {
     pub indexes: StorageMeiliIndexesResponse,
 }
 
-#[derive(Debug, Serialize, Clone, Default)]
+#[derive(Debug, Serialize, Clone, Default, ToSchema)]
 pub struct StorageMeiliListResponse {
     pub list_key: String,
     pub thread_docs: i64,
@@ -115,7 +115,7 @@ pub struct StorageMeiliListResponse {
     pub patch_item_docs: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct StorageMeiliResponse {
     pub ok: bool,
     pub error: Option<String>,
@@ -123,7 +123,7 @@ pub struct StorageMeiliResponse {
     pub lists: Vec<StorageMeiliListResponse>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct StorageDriftResponse {
     pub list_key: String,
     pub threads_db: i64,
@@ -137,7 +137,7 @@ pub struct StorageDriftResponse {
     pub patch_items_delta: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct StorageDiagnosticsResponse {
     pub generated_at: DateTime<Utc>,
     pub db: StorageDbResponse,
@@ -147,7 +147,7 @@ pub struct StorageDiagnosticsResponse {
 
 pub async fn diagnostics_storage(
     State(state): State<ApiState>,
-) -> Result<Json<StorageDiagnosticsResponse>, axum::http::StatusCode> {
+) -> HandlerResult<Json<StorageDiagnosticsResponse>> {
     let db_totals = state
         .catalog
         .get_db_storage_totals()

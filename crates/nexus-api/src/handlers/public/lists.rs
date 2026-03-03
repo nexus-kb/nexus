@@ -4,13 +4,13 @@ pub async fn list_catalog(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Query(query): Query<CursorQuery>,
-) -> Result<Response, StatusCode> {
+) -> HandlerResult<Response> {
     let limit = normalize_limit(query.limit, 50, 200);
     let cursor_list_key = if let Some(raw) = query.cursor.as_deref() {
         let token: ListCatalogCursorToken =
             decode_cursor_token(raw).ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
         if token.v != 1 {
-            return Err(StatusCode::UNPROCESSABLE_ENTITY);
+            return Err(StatusCode::UNPROCESSABLE_ENTITY.into());
         }
         Some(token.list_key)
     } else {
@@ -60,14 +60,14 @@ pub async fn list_detail(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Path(list_key): Path<String>,
-) -> Result<Response, StatusCode> {
+) -> HandlerResult<Response> {
     let Some(record) = state
         .catalog
         .get_mailing_list_detail(&list_key)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     else {
-        return Err(StatusCode::NOT_FOUND);
+        return Err(StatusCode::NOT_FOUND.into());
     };
 
     let response = ListDetailResponse {
@@ -98,14 +98,14 @@ pub async fn list_stats(
     headers: HeaderMap,
     Path(list_key): Path<String>,
     Query(query): Query<ListStatsQuery>,
-) -> Result<Response, StatusCode> {
+) -> HandlerResult<Response> {
     let Some(list) = state
         .catalog
         .get_mailing_list(&list_key)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     else {
-        return Err(StatusCode::NOT_FOUND);
+        return Err(StatusCode::NOT_FOUND.into());
     };
 
     let window_days =

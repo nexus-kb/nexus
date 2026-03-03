@@ -1,30 +1,41 @@
 use axum::Json;
 use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use serde::Serialize;
+use utoipa::ToSchema;
 
 use crate::state::ApiState;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct HealthResponse {
+    /// Service liveness flag.
     pub ok: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ReadyResponse {
+    /// Readiness flag computed from dependency checks.
     pub ok: bool,
+    /// Per-dependency readiness state.
     pub deps: ReadyDeps,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ReadyDeps {
+    /// Postgres readiness (`ok` or `error:<reason>`).
     pub postgres: String,
+    /// Meilisearch readiness (`ok` or `error:<reason>`).
     pub meili: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct VersionResponse {
+    /// Git commit SHA embedded at build time.
     pub git_sha: String,
+    /// Build timestamp embedded at build time.
     pub build_time: String,
+    /// Schema/version marker for API compatibility checks.
     pub schema_version: String,
 }
 
@@ -32,7 +43,7 @@ pub async fn healthz() -> Json<HealthResponse> {
     Json(HealthResponse { ok: true })
 }
 
-pub async fn readyz(State(state): State<ApiState>) -> Json<ReadyResponse> {
+pub async fn readyz(State(state): State<ApiState>) -> impl IntoResponse {
     let postgres = match sqlx::query_scalar::<_, i32>("SELECT 1")
         .fetch_one(state.db.pool())
         .await
@@ -58,10 +69,19 @@ pub async fn readyz(State(state): State<ApiState>) -> Json<ReadyResponse> {
 
     let ok = postgres == "ok" && meili == "ok";
 
-    Json(ReadyResponse {
-        ok,
-        deps: ReadyDeps { postgres, meili },
-    })
+    let status = if ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    (
+        status,
+        Json(ReadyResponse {
+            ok,
+            deps: ReadyDeps { postgres, meili },
+        }),
+    )
 }
 
 pub async fn version(State(state): State<ApiState>) -> Json<VersionResponse> {

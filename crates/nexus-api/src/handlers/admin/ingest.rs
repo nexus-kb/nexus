@@ -1,37 +1,60 @@
 use super::*;
 
-#[derive(Debug, Deserialize)]
-pub struct IngestSyncQuery {
+/// JSON body for `POST /admin/v1/ingest/sync`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct IngestSyncRequest {
+    /// Mailing list key to ingest from on-disk mirror repositories.
     pub list_key: String,
 }
 
-#[derive(Debug, Serialize)]
+/// Response payload for ingest sync enqueue.
+#[derive(Debug, Serialize, ToSchema)]
 pub struct IngestSyncResponse {
+    /// Number of jobs enqueued by this request.
     pub queued: usize,
+    /// Relative mirror repository paths used for this ingest.
     pub repos: Vec<String>,
+    /// Pipeline mode (`queued`/`pending`/`running`).
     pub mode: String,
+    /// Pipeline run id if one exists or was created.
     pub pipeline_run_id: Option<i64>,
+    /// Current stage for pipeline run, when available.
     pub current_stage: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+/// Response payload for grokmirror-wide ingest sync.
+#[derive(Debug, Serialize, ToSchema)]
 pub struct IngestGrokmirrorResponse {
+    /// Absolute mirror root scanned for list repositories.
     pub mirror_root: String,
+    /// Execution mode for this batch.
     pub mode: String,
+    /// Number of candidate lists discovered from mirror layout.
     pub discovered_lists: usize,
+    /// Number of lists accepted for queueing or already active.
     pub queued_lists: usize,
+    /// Number of jobs enqueued.
     pub queued_jobs: usize,
+    /// Per-list result breakdown.
     pub results: Vec<IngestGrokmirrorListResult>,
 }
 
-#[derive(Debug, Serialize)]
+/// Per-list result entry for grokmirror ingest sync.
+#[derive(Debug, Serialize, ToSchema)]
 pub struct IngestGrokmirrorListResult {
+    /// Mailing list key.
     pub list_key: String,
+    /// Result state (`queued`, `pending`, `running`, `error`, ...).
     pub status: String,
+    /// Number of jobs queued for this list.
     pub queued: usize,
+    /// Relative mirror repository paths used for this list.
     pub repos: Vec<String>,
+    /// Pipeline run id if known.
     pub pipeline_run_id: Option<i64>,
+    /// Current pipeline stage if known.
     pub current_stage: Option<String>,
+    /// Error message when status is `error`.
     pub error: Option<String>,
 }
 
@@ -55,6 +78,10 @@ impl IngestQueueError {
             message: message.into(),
         }
     }
+
+    pub(super) fn into_api_error(self) -> ApiError {
+        ApiError::from(self.status).with_detail(self.message)
+    }
 }
 
 #[derive(Debug)]
@@ -65,25 +92,36 @@ pub(super) struct MirrorListCandidate {
 
 pub async fn ingest_sync(
     State(state): State<ApiState>,
-    Query(query): Query<IngestSyncQuery>,
-) -> Result<Json<IngestSyncResponse>, axum::http::StatusCode> {
-    let list_root = Path::new(&state.settings.mail.mirror_root).join(&query.list_key);
-    let repos =
-        discover_repo_relpaths(&list_root).map_err(|_| axum::http::StatusCode::BAD_REQUEST)?;
-
-    if repos.is_empty() {
-        return Err(axum::http::StatusCode::BAD_REQUEST);
+    Json(body): Json<IngestSyncRequest>,
+) -> HandlerResult<Json<IngestSyncResponse>> {
+    if body.list_key.trim().is_empty() {
+        return Err(ApiError::bad_request("list_key must not be empty")
+            .with_invalid_param("list_key", "expected non-empty string"));
     }
 
-    queue_list_ingest(&state, &query.list_key, repos, "admin_ingest_sync")
+    let list_root = Path::new(&state.settings.mail.mirror_root).join(&body.list_key);
+    let repos = discover_repo_relpaths(&list_root)
+        .map_err(|_| ApiError::bad_request("failed to discover repos for list"))?;
+
+    if repos.is_empty() {
+        return Err(
+            ApiError::bad_request("no mirrored repositories found for list_key")
+                .with_invalid_param(
+                    "list_key",
+                    "list does not contain all.git, git/*.git, or bare-repo layout",
+                ),
+        );
+    }
+
+    queue_list_ingest(&state, &body.list_key, repos, "admin_ingest_sync")
         .await
         .map(Json)
-        .map_err(|err| err.status)
+        .map_err(IngestQueueError::into_api_error)
 }
 
 pub async fn ingest_grokmirror(
     State(state): State<ApiState>,
-) -> Result<Json<IngestGrokmirrorResponse>, axum::http::StatusCode> {
+) -> HandlerResult<Json<IngestGrokmirrorResponse>> {
     let mirror_root = Path::new(&state.settings.mail.mirror_root);
     let candidates = discover_mirror_lists(mirror_root)
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -303,24 +341,33 @@ pub async fn ingest_grokmirror(
     }))
 }
 
-#[derive(Debug, Deserialize)]
-pub struct ResetWatermarkQuery {
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ResetWatermarkRequest {
     pub list_key: String,
     pub repo_key: String,
 }
 
 pub async fn reset_watermark(
     State(state): State<ApiState>,
-    Query(query): Query<ResetWatermarkQuery>,
-) -> Result<Json<ActionResponse>, axum::http::StatusCode> {
+    Json(body): Json<ResetWatermarkRequest>,
+) -> HandlerResult<Json<ActionResponse>> {
+    if body.list_key.trim().is_empty() {
+        return Err(ApiError::bad_request("list_key must not be empty")
+            .with_invalid_param("list_key", "expected non-empty string"));
+    }
+    if body.repo_key.trim().is_empty() {
+        return Err(ApiError::bad_request("repo_key must not be empty")
+            .with_invalid_param("repo_key", "expected non-empty string"));
+    }
+
     let changed = state
         .catalog
-        .reset_watermark(&query.list_key, &query.repo_key)
+        .reset_watermark(&body.list_key, &body.repo_key)
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
 
     if !changed {
-        return Err(axum::http::StatusCode::NOT_FOUND);
+        return Err(axum::http::StatusCode::NOT_FOUND.into());
     }
 
     Ok(Json(ActionResponse { ok: true }))

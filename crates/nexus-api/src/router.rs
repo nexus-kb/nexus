@@ -12,6 +12,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/readyz", get(health::readyz))
         .route("/version", get(health::version))
         .route("/openapi.json", get(public::openapi_json))
+        .route("/docs", get(public::openapi_docs))
         .route("/lists", get(public::list_catalog))
         .route("/lists/{list_key}", get(public::list_detail))
         .route("/lists/{list_key}/stats", get(public::list_stats))
@@ -51,6 +52,8 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/{*path}", options(preflight_options));
 
     let admin_routes = Router::new()
+        .route("/openapi.json", get(admin::openapi_json))
+        .route("/docs", get(admin::openapi_docs))
         .route("/jobs/enqueue", post(admin::enqueue_job))
         .route("/jobs", get(admin::list_jobs))
         .route("/jobs/{job_id}", get(admin::get_job))

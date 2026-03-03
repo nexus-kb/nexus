@@ -5,19 +5,19 @@ pub async fn list_threads(
     headers: HeaderMap,
     Path(list_key): Path<String>,
     Query(query): Query<ThreadListQuery>,
-) -> Result<Response, StatusCode> {
+) -> HandlerResult<Response> {
     let Some(list) = state
         .catalog
         .get_mailing_list(&list_key)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     else {
-        return Err(StatusCode::NOT_FOUND);
+        return Err(StatusCode::NOT_FOUND.into());
     };
 
     let sort = query.sort.as_deref().unwrap_or("activity_desc");
     if sort != "activity_desc" && sort != "date_desc" && sort != "date_asc" {
-        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+        return Err(StatusCode::UNPROCESSABLE_ENTITY.into());
     }
 
     let limit = normalize_limit(query.limit, 50, 200);
@@ -43,7 +43,7 @@ pub async fn list_threads(
         let token: ThreadListCursorToken =
             decode_cursor_token(raw_cursor).ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
         if token.v != 1 || token.h != cursor_hash {
-            return Err(StatusCode::UNPROCESSABLE_ENTITY);
+            return Err(StatusCode::UNPROCESSABLE_ENTITY.into());
         }
         let cursor_ts = Utc
             .timestamp_millis_opt(token.ts)
@@ -145,14 +145,14 @@ pub async fn list_thread_detail(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Path(path): Path<ThreadPath>,
-) -> Result<Response, StatusCode> {
+) -> HandlerResult<Response> {
     let Some(list) = state
         .catalog
         .get_mailing_list(&path.list_key)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     else {
-        return Err(StatusCode::NOT_FOUND);
+        return Err(StatusCode::NOT_FOUND.into());
     };
 
     let Some(summary) = state
@@ -161,7 +161,7 @@ pub async fn list_thread_detail(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     else {
-        return Err(StatusCode::NOT_FOUND);
+        return Err(StatusCode::NOT_FOUND.into());
     };
 
     let messages = state
@@ -209,21 +209,21 @@ pub async fn thread_messages(
     headers: HeaderMap,
     Path(path): Path<ThreadPath>,
     Query(query): Query<ThreadMessagesQuery>,
-) -> Result<Response, StatusCode> {
+) -> HandlerResult<Response> {
     let Some(list) = state
         .catalog
         .get_mailing_list(&path.list_key)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     else {
-        return Err(StatusCode::NOT_FOUND);
+        return Err(StatusCode::NOT_FOUND.into());
     };
 
     let view = query.view.as_deref().unwrap_or("snippets");
     let include_body = match view {
         "full" => true,
         "snippets" => false,
-        _ => return Err(StatusCode::UNPROCESSABLE_ENTITY),
+        _ => return Err(StatusCode::UNPROCESSABLE_ENTITY.into()),
     };
     let limit = normalize_limit(query.limit, 50, 200);
     let fetch_limit = limit + 1;
@@ -235,7 +235,7 @@ pub async fn thread_messages(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .is_some();
     if !exists {
-        return Err(StatusCode::NOT_FOUND);
+        return Err(StatusCode::NOT_FOUND.into());
     }
 
     let cursor_hash = short_hash(&json!({
@@ -248,7 +248,7 @@ pub async fn thread_messages(
             let token: ThreadMessagesCursorToken =
                 decode_cursor_token(raw_cursor).ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
             if token.v != 1 || token.h != cursor_hash {
-                return Err(StatusCode::UNPROCESSABLE_ENTITY);
+                return Err(StatusCode::UNPROCESSABLE_ENTITY.into());
             }
             let sort_key = hex_decode(&token.sort_key).ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
             (Some(sort_key), Some(token.message_id))

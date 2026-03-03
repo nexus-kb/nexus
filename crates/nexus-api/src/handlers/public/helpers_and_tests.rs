@@ -225,24 +225,12 @@ pub(super) fn hybrid_query_prompt(scope: SearchScope, query: &str) -> String {
     }
 }
 
-pub(super) fn json_error_response(
-    status: StatusCode,
-    payload: Value,
-) -> Result<Response, StatusCode> {
-    let body = serde_json::to_vec(&payload).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Response::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(body))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-}
-
 pub(super) fn json_response_with_cache<T: Serialize>(
     headers: &HeaderMap,
     payload: &T,
     cache_control: &str,
     etag_override: Option<String>,
-) -> Result<Response, StatusCode> {
+) -> HandlerResult<Response> {
     let body = serde_json::to_vec(payload).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let etag = etag_override.unwrap_or_else(|| strong_etag(&body));
 
@@ -250,25 +238,22 @@ pub(super) fn json_response_with_cache<T: Serialize>(
         return not_modified_response(cache_control, &etag);
     }
 
-    Response::builder()
+    Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::CACHE_CONTROL, cache_control)
         .header(header::ETAG, etag)
         .body(Body::from(body))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?)
 }
 
-pub(super) fn not_modified_response(
-    cache_control: &str,
-    etag: &str,
-) -> Result<Response, StatusCode> {
-    Response::builder()
+pub(super) fn not_modified_response(cache_control: &str, etag: &str) -> HandlerResult<Response> {
+    Ok(Response::builder()
         .status(StatusCode::NOT_MODIFIED)
         .header(header::CACHE_CONTROL, cache_control)
         .header(header::ETAG, etag)
         .body(Body::empty())
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?)
 }
 
 pub(super) fn if_none_match_matches(headers: &HeaderMap, etag: &str) -> bool {
@@ -295,14 +280,14 @@ pub(super) fn strong_etag(body: &[u8]) -> String {
     format!("\"{:x}\"", hasher.finalize())
 }
 
-pub(super) fn redirect_response(location: &str) -> Result<Response, StatusCode> {
+pub(super) fn redirect_response(location: &str) -> HandlerResult<Response> {
     let location =
         HeaderValue::from_str(location).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Response::builder()
+    Ok(Response::builder()
         .status(StatusCode::FOUND)
         .header(header::LOCATION, location)
         .body(Body::empty())
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?)
 }
 
 pub(super) fn normalize_limit(limit: Option<i64>, default: i64, max: i64) -> i64 {

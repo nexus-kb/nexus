@@ -1,4 +1,6 @@
+mod api_docs;
 mod auth;
+mod error;
 mod handlers;
 mod logging;
 mod router;
@@ -88,6 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = ApiState::new(settings.clone(), db);
     let app = build_router(state)
+        .layer(middleware::from_fn(error::problem_details_middleware))
         .layer(build_cors())
         .layer(middleware::from_fn(logging::common_log_middleware));
 

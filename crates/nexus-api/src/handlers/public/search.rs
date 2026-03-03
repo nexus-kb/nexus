@@ -4,34 +4,31 @@ pub async fn search(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Query(query): Query<SearchQuery>,
-) -> Result<Response, StatusCode> {
+) -> HandlerResult<Response> {
     let q = query.q.trim();
     if q.is_empty() {
-        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+        return Err(ApiError::validation("q must not be empty")
+            .with_invalid_param("q", "expected non-empty search query"));
     }
 
     let scope = match query.scope.as_deref() {
-        Some(raw) => SearchScope::parse(raw).ok_or(StatusCode::UNPROCESSABLE_ENTITY)?,
+        Some("thread") => SearchScope::Thread,
+        Some("series") => SearchScope::Series,
+        Some(_) => {
+            return Err(ApiError::validation("scope must be one of: thread, series")
+                .with_invalid_param("scope", "unsupported search scope"));
+        }
         None => SearchScope::Thread,
     };
-    if matches!(scope, SearchScope::PatchItem) {
-        return json_error_response(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            json!({ "error": "patch_item search is temporarily disabled" }),
-        );
-    }
     let spec = scope.index_kind().spec();
 
     let hybrid_enabled = hybrid_requested(query.hybrid, query.semantic_ratio);
     let semantic_ratio = if hybrid_enabled {
         let semantic_ratio = query.semantic_ratio.unwrap_or(0.35);
         if !(0.0..=1.0).contains(&semantic_ratio) {
-            return Err(StatusCode::UNPROCESSABLE_ENTITY);
-        }
-        if !matches!(scope, SearchScope::Thread | SearchScope::Series) {
-            return json_error_response(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                json!({ "error": "hybrid is only available for thread and series scopes" }),
+            return Err(
+                ApiError::validation("semantic_ratio must be between 0.0 and 1.0")
+                    .with_invalid_param("semantic_ratio", "expected inclusive range [0.0, 1.0]"),
             );
         }
         Some(semantic_ratio)
@@ -41,15 +38,24 @@ pub async fn search(
 
     let sort = query.sort.as_deref().unwrap_or("relevance");
     if sort != "relevance" && sort != "date_desc" {
-        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+        return Err(
+            ApiError::validation("sort must be one of: relevance, date_desc")
+                .with_invalid_param("sort", "unsupported sort value"),
+        );
     }
 
     let from_ts = match query.from.as_deref() {
-        Some(raw) => Some(parse_timestamp(raw).ok_or(StatusCode::UNPROCESSABLE_ENTITY)?),
+        Some(raw) => Some(parse_timestamp(raw).ok_or_else(|| {
+            ApiError::validation("invalid from timestamp")
+                .with_invalid_param("from", "expected RFC3339 or YYYY-MM-DD")
+        })?),
         None => None,
     };
     let to_ts = match query.to.as_deref() {
-        Some(raw) => Some(parse_timestamp(raw).ok_or(StatusCode::UNPROCESSABLE_ENTITY)?),
+        Some(raw) => Some(parse_timestamp(raw).ok_or_else(|| {
+            ApiError::validation("invalid to timestamp")
+                .with_invalid_param("to", "expected RFC3339 or YYYY-MM-DD")
+        })?),
         None => None,
     };
 
@@ -74,10 +80,15 @@ pub async fn search(
         },
     });
     let offset = if let Some(cursor) = query.cursor.as_deref() {
-        let (offset, cursor_hash) =
-            parse_search_cursor(cursor).ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+        let (offset, cursor_hash) = parse_search_cursor(cursor).ok_or_else(|| {
+            ApiError::validation("invalid cursor format")
+                .with_invalid_param("cursor", "expected opaque search cursor token")
+        })?;
         if cursor_hash != request_hash {
-            return Err(StatusCode::UNPROCESSABLE_ENTITY);
+            return Err(
+                ApiError::validation("cursor does not match request filters")
+                    .with_invalid_param("cursor", "cursor must be used with unchanged query shape"),
+            );
         }
         offset
     } else {
@@ -127,9 +138,7 @@ pub async fn search(
     if hybrid_enabled {
         let vector = match compute_or_get_query_embedding(&state, scope, q).await {
             Ok(value) => value,
-            Err(message) => {
-                return json_error_response(StatusCode::BAD_GATEWAY, json!({ "error": message }));
-            }
+            Err(message) => return Err(ApiError::upstream(message)),
         };
         request_body["hybrid"] = json!({
             "embedder": state.settings.embeddings.embedder_name.clone(),
@@ -149,19 +158,23 @@ pub async fn search(
         .json(&request_body)
         .send()
         .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        .map_err(|_| ApiError::upstream("search backend request failed"))?;
 
     if !search_response.status().is_success() {
         return match search_response.status().as_u16() {
-            400 | 401 | 403 | 404 | 422 => Err(StatusCode::UNPROCESSABLE_ENTITY),
-            _ => Err(StatusCode::BAD_GATEWAY),
+            400 | 401 | 403 | 404 | 422 => Err(ApiError::validation(
+                "search backend rejected request parameters",
+            )),
+            _ => Err(ApiError::upstream(
+                "search backend returned an unexpected error",
+            )),
         };
     }
 
     let payload: Value = search_response
         .json()
         .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        .map_err(|_| ApiError::upstream("failed to parse search backend response"))?;
     let total_hits = payload
         .get("estimatedTotalHits")
         .and_then(Value::as_u64)
@@ -202,7 +215,7 @@ pub async fn search(
                 } else {
                     search_store.build_patch_series_docs(&hit_ids).await
                 }
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                .map_err(|_| ApiError::internal("failed to hydrate fallback search metadata"))?;
 
                 docs.into_iter()
                     .filter_map(|doc| doc.get("id").and_then(Value::as_i64).map(|id| (id, doc)))

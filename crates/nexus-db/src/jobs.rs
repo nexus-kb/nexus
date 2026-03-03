@@ -1,6 +1,7 @@
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use sqlx::{PgPool, QueryBuilder};
+use utoipa::ToSchema;
 
 use crate::{Job, JobState, Result};
 
@@ -23,7 +24,7 @@ pub struct ListJobsParams {
     pub cursor: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, sqlx::FromRow, ToSchema)]
 pub struct JobAttempt {
     pub id: i64,
     pub job_id: i64,
@@ -35,13 +36,13 @@ pub struct JobAttempt {
     pub metrics_json: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, sqlx::FromRow, ToSchema)]
 pub struct JobStateCount {
     pub state: JobState,
     pub count: i64,
 }
 
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, sqlx::FromRow, ToSchema)]
 pub struct JobTypeStateCount {
     pub job_type: String,
     pub total: i64,
@@ -54,7 +55,7 @@ pub struct JobTypeStateCount {
     pub cancelled: i64,
 }
 
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, sqlx::FromRow, ToSchema)]
 pub struct RunningJobSnapshot {
     pub id: i64,
     pub job_type: String,
@@ -65,7 +66,7 @@ pub struct RunningJobSnapshot {
     pub is_stuck: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct JobStoreMetrics {
     pub duration_ms: u128,
     pub rows_written: u64,

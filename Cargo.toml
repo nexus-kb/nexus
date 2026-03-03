@@ -45,3 +45,5 @@ sqlx = { version = "0.8", default-features = false, features = [
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors", "set-header"] }
+utoipa = { version = "5", features = ["chrono"] }
+utoipa-rapidoc = "6"

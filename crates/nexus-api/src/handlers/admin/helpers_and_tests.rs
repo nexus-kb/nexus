@@ -555,18 +555,6 @@ pub(super) fn parse_optional_timestamp_query(raw: Option<&str>) -> Option<Option
     parse_timestamp(trimmed).map(Some)
 }
 
-pub(super) fn deserialize_optional_datetime_query<'de, D>(
-    deserializer: D,
-) -> Result<Option<DateTime<Utc>>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let raw = Option::<String>::deserialize(deserializer)?;
-    parse_optional_timestamp_query(raw.as_deref()).ok_or_else(|| {
-        de::Error::custom("invalid datetime: expected RFC3339 timestamp or YYYY-MM-DD")
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};

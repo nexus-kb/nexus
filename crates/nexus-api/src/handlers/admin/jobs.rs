@@ -1,6 +1,6 @@
 use super::*;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct EnqueueRequest {
     pub job_type: String,
     pub payload: serde_json::Value,
@@ -16,7 +16,7 @@ pub struct EnqueueRequest {
     pub max_attempts: Option<i32>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct EnqueueResponse {
     pub job_id: i64,
 }
@@ -24,7 +24,7 @@ pub struct EnqueueResponse {
 pub async fn enqueue_job(
     State(state): State<ApiState>,
     Json(body): Json<EnqueueRequest>,
-) -> Result<Json<EnqueueResponse>, axum::http::StatusCode> {
+) -> HandlerResult<Json<EnqueueResponse>> {
     let job = state
         .jobs
         .enqueue(EnqueueJobParams {
@@ -42,7 +42,7 @@ pub async fn enqueue_job(
     Ok(Json(EnqueueResponse { job_id: job.id }))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct ListJobsQuery {
     #[serde(default)]
     pub state: Option<JobState>,
@@ -58,7 +58,7 @@ pub(super) fn default_limit() -> i64 {
     100
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct CursorPageInfoResponse {
     pub limit: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -68,13 +68,13 @@ pub struct CursorPageInfoResponse {
     pub has_more: bool,
 }
 
-#[derive(Debug, Serialize)]
-pub struct CursorPageResponse<T> {
-    pub items: Vec<T>,
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ListJobsResponse {
+    pub items: Vec<Job>,
     pub page_info: CursorPageInfoResponse,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub(super) struct IdCursorToken {
     pub(super) v: u8,
     pub(super) h: String,
@@ -84,7 +84,7 @@ pub(super) struct IdCursorToken {
 pub async fn list_jobs(
     State(state): State<ApiState>,
     Query(query): Query<ListJobsQuery>,
-) -> Result<Json<CursorPageResponse<Job>>, axum::http::StatusCode> {
+) -> HandlerResult<Json<ListJobsResponse>> {
     let limit = normalize_limit(query.limit, 100, 200);
     let cursor_hash = short_hash(&json!({
         "endpoint": "jobs",
@@ -95,7 +95,7 @@ pub async fn list_jobs(
         let token: IdCursorToken =
             decode_cursor_token(raw_cursor).ok_or(axum::http::StatusCode::UNPROCESSABLE_ENTITY)?;
         if token.v != 1 || token.h != cursor_hash {
-            return Err(axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+            return Err(axum::http::StatusCode::UNPROCESSABLE_ENTITY.into());
         }
         Some(token.id)
     } else {
@@ -129,7 +129,7 @@ pub async fn list_jobs(
         None
     };
 
-    Ok(Json(CursorPageResponse {
+    Ok(Json(ListJobsResponse {
         items: jobs,
         page_info: build_page_info(limit, next_cursor),
     }))
@@ -138,7 +138,7 @@ pub async fn list_jobs(
 pub async fn get_job(
     State(state): State<ApiState>,
     AxumPath(job_id): AxumPath<i64>,
-) -> Result<Json<Job>, axum::http::StatusCode> {
+) -> HandlerResult<Json<Job>> {
     match state
         .jobs
         .get(job_id)
@@ -146,11 +146,11 @@ pub async fn get_job(
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?
     {
         Some(job) => Ok(Json(job)),
-        None => Err(axum::http::StatusCode::NOT_FOUND),
+        None => Err(axum::http::StatusCode::NOT_FOUND.into()),
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct JobAttemptsQuery {
     #[serde(default = "default_attempts_limit")]
     pub limit: i64,
@@ -162,7 +162,7 @@ fn default_attempts_limit() -> i64 {
     50
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct JobAttemptsResponse {
     pub items: Vec<nexus_db::JobAttempt>,
     pub page_info: CursorPageInfoResponse,
@@ -172,7 +172,7 @@ pub async fn list_job_attempts(
     State(state): State<ApiState>,
     AxumPath(job_id): AxumPath<i64>,
     Query(query): Query<JobAttemptsQuery>,
-) -> Result<Json<JobAttemptsResponse>, axum::http::StatusCode> {
+) -> HandlerResult<Json<JobAttemptsResponse>> {
     let exists = state
         .jobs
         .get(job_id)
@@ -180,7 +180,7 @@ pub async fn list_job_attempts(
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?
         .is_some();
     if !exists {
-        return Err(axum::http::StatusCode::NOT_FOUND);
+        return Err(axum::http::StatusCode::NOT_FOUND.into());
     }
 
     let limit = normalize_limit(query.limit, 50, 200);
@@ -192,7 +192,7 @@ pub async fn list_job_attempts(
         let token: IdCursorToken =
             decode_cursor_token(raw_cursor).ok_or(axum::http::StatusCode::UNPROCESSABLE_ENTITY)?;
         if token.v != 1 || token.h != cursor_hash {
-            return Err(axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+            return Err(axum::http::StatusCode::UNPROCESSABLE_ENTITY.into());
         }
         Some(token.id)
     } else {
@@ -227,7 +227,7 @@ pub async fn list_job_attempts(
     }))
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ActionResponse {
     pub ok: bool,
 }
@@ -235,7 +235,7 @@ pub struct ActionResponse {
 pub async fn cancel_job(
     State(state): State<ApiState>,
     AxumPath(job_id): AxumPath<i64>,
-) -> Result<Json<ActionResponse>, axum::http::StatusCode> {
+) -> HandlerResult<Json<ActionResponse>> {
     let changed = state
         .jobs
         .request_cancel(job_id)
@@ -244,7 +244,7 @@ pub async fn cancel_job(
         .is_some();
 
     if !changed {
-        return Err(axum::http::StatusCode::NOT_FOUND);
+        return Err(axum::http::StatusCode::NOT_FOUND.into());
     }
 
     Ok(Json(ActionResponse { ok: true }))
@@ -253,7 +253,7 @@ pub async fn cancel_job(
 pub async fn retry_job(
     State(state): State<ApiState>,
     AxumPath(job_id): AxumPath<i64>,
-) -> Result<Json<ActionResponse>, axum::http::StatusCode> {
+) -> HandlerResult<Json<ActionResponse>> {
     let changed = state
         .jobs
         .retry(job_id, Utc::now())
@@ -262,7 +262,7 @@ pub async fn retry_job(
         .is_some();
 
     if !changed {
-        return Err(axum::http::StatusCode::NOT_FOUND);
+        return Err(axum::http::StatusCode::NOT_FOUND.into());
     }
 
     Ok(Json(ActionResponse { ok: true }))
