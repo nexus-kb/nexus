@@ -152,6 +152,26 @@ pub(super) enum ParseCommitResult {
     },
 }
 
+pub(super) fn usize_to_i64(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+pub(super) fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+pub(super) fn u64_to_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+pub(super) fn i64_to_u64(value: i64) -> u64 {
+    u64::try_from(value).unwrap_or(0)
+}
+
+pub(super) fn u128_to_u64(value: u128) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
 pub(super) async fn parse_commit_rows(
     repo_path: PathBuf,
     commit_oids: Vec<String>,
@@ -246,7 +266,7 @@ pub(super) fn parse_commit_partition(
             }
         };
 
-        outcome.bytes_read += raw_mail.len() as u64;
+        outcome.bytes_read += usize_to_u64(raw_mail.len());
         let raw_commit = RawCommitMail {
             index: commit.index,
             commit_oid: commit.commit_oid,
@@ -469,7 +489,7 @@ pub(super) fn retryable_error(
     JobExecutionOutcome::Retryable {
         reason,
         kind: kind.to_string(),
-        backoff_ms: backoff.num_milliseconds().max(1) as u64,
+        backoff_ms: i64_to_u64(backoff.num_milliseconds().max(1)),
         metrics: empty_metrics(duration_ms),
     }
 }

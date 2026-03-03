@@ -141,7 +141,7 @@ impl Phase0JobHandler {
             }
         }
 
-        let chunk_limit = self.settings.embeddings.enqueue_batch_size.max(1) as i64;
+        let chunk_limit = usize_to_i64(self.settings.embeddings.enqueue_batch_size.max(1));
         let list_key = run.list_key.clone();
         let total_candidates_thread = match self
             .embeddings
@@ -229,10 +229,10 @@ impl Phase0JobHandler {
                         reason: "cancel requested".to_string(),
                         metrics: JobStoreMetrics {
                             duration_ms: started.elapsed().as_millis(),
-                            rows_written: docs_upserted as u64,
+                            rows_written: i64_to_u64(docs_upserted),
                             bytes_read: 0,
-                            commit_count: (processed_thread + processed_series) as u64,
-                            parse_errors: failed_batches as u64,
+                            commit_count: i64_to_u64(processed_thread + processed_series),
+                            parse_errors: i64_to_u64(failed_batches),
                         },
                     };
                 }
@@ -301,10 +301,10 @@ impl Phase0JobHandler {
                 .await
             {
                 Ok((rows, vectors, placeholders)) => {
-                    docs_upserted += rows as i64;
+                    docs_upserted += u64_to_i64(rows);
                     vectors_attached += vectors;
                     placeholders_written += placeholders;
-                    processed_thread += ids.len() as i64;
+                    processed_thread += usize_to_i64(ids.len());
                     if let Some(last_id) = ids.last() {
                         thread_cursor_id = *last_id;
                     }
@@ -403,10 +403,10 @@ impl Phase0JobHandler {
                         reason: "cancel requested".to_string(),
                         metrics: JobStoreMetrics {
                             duration_ms: started.elapsed().as_millis(),
-                            rows_written: docs_upserted as u64,
+                            rows_written: i64_to_u64(docs_upserted),
                             bytes_read: 0,
-                            commit_count: (processed_thread + processed_series) as u64,
-                            parse_errors: failed_batches as u64,
+                            commit_count: i64_to_u64(processed_thread + processed_series),
+                            parse_errors: i64_to_u64(failed_batches),
                         },
                     };
                 }
@@ -475,10 +475,10 @@ impl Phase0JobHandler {
                 .await
             {
                 Ok((rows, vectors, placeholders)) => {
-                    docs_upserted += rows as i64;
+                    docs_upserted += u64_to_i64(rows);
                     vectors_attached += vectors;
                     placeholders_written += placeholders;
-                    processed_series += ids.len() as i64;
+                    processed_series += usize_to_i64(ids.len());
                     if let Some(last_id) = ids.last() {
                         series_cursor_id = *last_id;
                     }
@@ -647,10 +647,10 @@ impl Phase0JobHandler {
             result_json,
             metrics: JobStoreMetrics {
                 duration_ms: started.elapsed().as_millis(),
-                rows_written: docs_upserted as u64,
+                rows_written: i64_to_u64(docs_upserted),
                 bytes_read: 0,
-                commit_count: (processed_thread + processed_series) as u64,
-                parse_errors: failed_batches as u64,
+                commit_count: i64_to_u64(processed_thread + processed_series),
+                parse_errors: i64_to_u64(failed_batches),
             },
         }
     }

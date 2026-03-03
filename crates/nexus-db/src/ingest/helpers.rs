@@ -1,5 +1,10 @@
 use super::*;
 
+fn usize_to_i64(value: usize, field_name: &str) -> Result<i64> {
+    i64::try_from(value)
+        .map_err(|_| protocol_error(format!("{field_name} exceeds i64::MAX: {value}")))
+}
+
 pub(super) async fn reserve_ids(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     sequence_name: &str,
@@ -13,7 +18,7 @@ pub(super) async fn reserve_ids(
         "SELECT nextval($1::regclass)::bigint FROM generate_series(1, $2::bigint)",
     )
     .bind(sequence_name)
-    .bind(count as i64)
+    .bind(usize_to_i64(count, "reserve_ids count")?)
     .fetch_all(&mut **tx)
     .await
 }
@@ -260,7 +265,10 @@ pub(super) async fn run_text_integrity_probe(
         LIMIT $2"#,
     )
     .bind(message_pks)
-    .bind(message_pks.len() as i64)
+    .bind(usize_to_i64(
+        message_pks.len(),
+        "text_integrity_probe sample size",
+    )?)
     .fetch_all(&mut **tx)
     .await;
 

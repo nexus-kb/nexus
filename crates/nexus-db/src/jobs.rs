@@ -504,9 +504,14 @@ impl JobStore {
     }
 
     pub fn compute_backoff(base_ms: u64, max_ms: u64, attempt: i32) -> Duration {
-        let exponent = (attempt.max(1) as u32).saturating_sub(1);
+        let exponent = u32::try_from(attempt.max(1))
+            .unwrap_or(u32::MAX)
+            .saturating_sub(1);
         let raw = base_ms.saturating_mul(2u64.saturating_pow(exponent));
-        Duration::milliseconds(raw.min(max_ms) as i64)
+        let max_i64_ms = u64::try_from(i64::MAX).unwrap_or(u64::MAX);
+        let bounded_ms = raw.min(max_ms).min(max_i64_ms);
+        let millis = i64::try_from(bounded_ms).unwrap_or(i64::MAX);
+        Duration::milliseconds(millis)
     }
 }
 

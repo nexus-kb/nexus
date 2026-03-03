@@ -181,11 +181,8 @@ impl Phase0Worker {
 
     async fn drain_once(&self) -> Result<(), sqlx::Error> {
         self.jobs.promote_ready_jobs().await?;
-        let claim_limit = self
-            .cfg
-            .claim_batch
-            .max(1)
-            .min(self.cfg.max_inflight_jobs as i64);
+        let max_inflight_i64 = i64::try_from(self.cfg.max_inflight_jobs).unwrap_or(i64::MAX);
+        let claim_limit = self.cfg.claim_batch.max(1).min(max_inflight_i64);
         let claimed = self
             .jobs
             .claim_jobs(claim_limit, &self.worker_id, self.cfg.lease_ms)

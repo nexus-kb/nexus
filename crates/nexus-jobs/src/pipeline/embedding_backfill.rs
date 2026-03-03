@@ -59,7 +59,7 @@ impl Phase0JobHandler {
                 metrics: empty_metrics(started.elapsed().as_millis()),
             };
         };
-        let chunk_limit = self.settings.embeddings.enqueue_batch_size.max(1) as i64;
+        let chunk_limit = usize_to_i64(self.settings.embeddings.enqueue_batch_size.max(1));
         let list_key = run.list_key.clone().unwrap_or_else(|| "global".to_string());
         let total_candidates = match self
             .embeddings
@@ -106,7 +106,7 @@ impl Phase0JobHandler {
                             duration_ms: started.elapsed().as_millis(),
                             rows_written: 0,
                             bytes_read: 0,
-                            commit_count: processed as u64,
+                            commit_count: i64_to_u64(processed),
                             parse_errors: 0,
                         },
                     };
@@ -149,7 +149,7 @@ impl Phase0JobHandler {
                 break;
             }
             cursor = *ids.last().unwrap_or(&cursor);
-            processed += ids.len() as i64;
+            processed += usize_to_i64(ids.len());
 
             match self
                 .enqueue_embedding_generate_batch(
@@ -251,9 +251,9 @@ impl Phase0JobHandler {
             }),
             metrics: JobStoreMetrics {
                 duration_ms: started.elapsed().as_millis(),
-                rows_written: jobs_enqueued as u64,
+                rows_written: i64_to_u64(jobs_enqueued),
                 bytes_read: 0,
-                commit_count: processed as u64,
+                commit_count: i64_to_u64(processed),
                 parse_errors: 0,
             },
         }

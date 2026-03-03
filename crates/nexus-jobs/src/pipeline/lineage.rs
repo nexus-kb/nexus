@@ -60,8 +60,9 @@ impl Phase0JobHandler {
             }
         };
 
-        let batch_limit = self.settings.mail.commit_batch_size.max(1) as i64;
-        let checkpoint_interval = self.settings.worker.progress_checkpoint_interval.max(1) as u64;
+        let batch_limit = usize_to_i64(self.settings.mail.commit_batch_size.max(1));
+        let checkpoint_interval =
+            usize_to_u64(self.settings.worker.progress_checkpoint_interval.max(1));
         let discovery_mode_label = "thread_first";
         let work_item_kind = "threads";
 
@@ -148,7 +149,7 @@ impl Phase0JobHandler {
                     );
                 }
             };
-            let chunk_work_items = thread_chunk.len() as u64;
+            let chunk_work_items = usize_to_u64(thread_chunk.len());
 
             if !extract_outcome.patch_item_ids.is_empty() {
                 match process_patch_enrichment_batch(&self.lineage, &extract_outcome.patch_item_ids)
@@ -210,7 +211,7 @@ impl Phase0JobHandler {
                     items_processed = work_items_processed,
                     messages_processed,
                     threads_scanned,
-                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    elapsed_ms = u128_to_u64(started.elapsed().as_millis()),
                     "pipeline checkpoint"
                 );
             }

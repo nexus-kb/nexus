@@ -15,7 +15,7 @@ impl QueryEmbeddingCache {
         Self {
             inner: Cache::builder()
                 .time_to_live(ttl)
-                .max_capacity(max_entries.max(1) as u64)
+                .max_capacity(u64::try_from(max_entries.max(1)).unwrap_or(u64::MAX))
                 .build(),
         }
     }

@@ -143,7 +143,7 @@ impl Phase0JobHandler {
             }
         };
 
-        let epoch_windows_total = windows.len() as u64;
+        let epoch_windows_total = usize_to_u64(windows.len());
         let mut epoch_windows_done = 0u64;
         let mut processed_chunks = 0u64;
         let mut processed_messages = 0u64;
@@ -454,7 +454,7 @@ impl Phase0JobHandler {
         let mut patch_items_fallback_patch_id = 0u64;
         let mut patch_items_fallback_diff_parse = 0u64;
         let mut last_progress_log = Instant::now();
-        let batch_limit = self.settings.mail.commit_batch_size.max(1) as i64;
+        let batch_limit = usize_to_i64(self.settings.mail.commit_batch_size.max(1));
 
         loop {
             if let Err(err) = ctx.heartbeat().await {
@@ -520,7 +520,7 @@ impl Phase0JobHandler {
                         );
                     }
                 };
-            let chunk_work_items = thread_chunk.len() as u64;
+            let chunk_work_items = usize_to_u64(thread_chunk.len());
 
             if !extract_outcome.patch_item_ids.is_empty() {
                 match process_patch_enrichment_batch(&self.lineage, &extract_outcome.patch_item_ids)

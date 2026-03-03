@@ -248,8 +248,8 @@ pub(super) async fn finalize_job(
                 )
                 .await?;
             } else {
-                let run_after =
-                    Utc::now() + chrono::Duration::milliseconds((*backoff_ms as i64).max(1));
+                let backoff_ms_i64 = i64::try_from((*backoff_ms).max(1)).unwrap_or(i64::MAX);
+                let run_after = Utc::now() + chrono::Duration::milliseconds(backoff_ms_i64);
 
                 jobs.mark_retryable(
                     job.id,
