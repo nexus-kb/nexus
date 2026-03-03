@@ -69,9 +69,10 @@ pub async fn list_threads(
         .list_threads(list.id, &params)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let has_more = items.len() > limit as usize;
+    let limit_usize = limit_to_usize(limit);
+    let has_more = items.len() > limit_usize;
     if has_more {
-        items.truncate(limit as usize);
+        items.truncate(limit_usize);
     }
     let next_cursor = if has_more {
         items.last().and_then(|item| {
@@ -266,9 +267,10 @@ pub async fn thread_messages(
         )
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let has_more = message_rows.len() > limit as usize;
+    let limit_usize = limit_to_usize(limit);
+    let has_more = message_rows.len() > limit_usize;
     if has_more {
-        message_rows.truncate(limit as usize);
+        message_rows.truncate(limit_usize);
     }
     let next_cursor = if has_more {
         message_rows.last().and_then(|msg| {

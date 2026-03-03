@@ -42,9 +42,10 @@ pub async fn series_list(
         )
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let has_more = items.len() > limit as usize;
+    let limit_usize = limit_to_usize(limit);
+    let has_more = items.len() > limit_usize;
     if has_more {
-        items.truncate(limit as usize);
+        items.truncate(limit_usize);
     }
     let next_cursor = if has_more {
         items.last().and_then(|item| {
@@ -263,23 +264,28 @@ pub async fn series_compare(
     let changed = patch_rows
         .iter()
         .filter(|row| row.status == "changed")
-        .count() as i64;
+        .count();
     let added = patch_rows
         .iter()
         .filter(|row| row.status == "added")
-        .count() as i64;
+        .count();
     let removed = patch_rows
         .iter()
         .filter(|row| row.status == "removed")
-        .count() as i64;
+        .count();
     let v1_patch_count = patch_rows
         .iter()
         .filter(|row| row.v1_patch_item_id.is_some())
-        .count() as i64;
+        .count();
     let v2_patch_count = patch_rows
         .iter()
         .filter(|row| row.v2_patch_item_id.is_some())
-        .count() as i64;
+        .count();
+    let changed = usize_to_i64(changed);
+    let added = usize_to_i64(added);
+    let removed = usize_to_i64(removed);
+    let v1_patch_count = usize_to_i64(v1_patch_count);
+    let v2_patch_count = usize_to_i64(v2_patch_count);
 
     let summary = SeriesCompareSummary {
         v1_patch_count,

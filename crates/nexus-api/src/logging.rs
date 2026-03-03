@@ -59,9 +59,9 @@ fn cloudflare_client_host(headers: &HeaderMap) -> Option<String> {
 
     if let Some(ip) = cf_connecting_ip {
         if is_cloudflare_pseudo_ipv4(&ip)
-            && let Some(ipv6) = cf_connecting_ipv6.clone()
+            && let Some(ipv6) = cf_connecting_ipv6.as_deref()
         {
-            return Some(ipv6);
+            return Some(ipv6.to_string());
         }
         return Some(ip);
     }
@@ -99,10 +99,7 @@ fn header_single_value(headers: &HeaderMap, key: &str) -> Option<String> {
 }
 
 fn render_request_line(method: &Method, uri: &Uri, version: Version) -> String {
-    let path = uri
-        .path_and_query()
-        .map(|value| value.as_str())
-        .unwrap_or("/");
+    let path = uri.path_and_query().map_or("/", |value| value.as_str());
     let normalized_path = if path.is_empty() { "/" } else { path };
     format!(
         "{} {} {}",

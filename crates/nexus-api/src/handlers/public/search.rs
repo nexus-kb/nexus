@@ -53,7 +53,8 @@ pub async fn search(
         None => None,
     };
 
-    let limit = query.limit.unwrap_or(20).clamp(1, 100) as usize;
+    let limit = normalize_limit(query.limit, 20, 100);
+    let limit_usize = limit_to_usize(limit);
     let request_hash = search_request_hash(SearchRequestHashInput {
         q,
         scope,
@@ -63,7 +64,7 @@ pub async fn search(
         to_ts,
         has_diff: query.has_diff,
         sort,
-        limit,
+        limit: limit_usize,
         hybrid: hybrid_enabled,
         semantic_ratio,
         model_key: if hybrid_enabled {
@@ -114,8 +115,8 @@ pub async fn search(
         "cropLength": spec.crop_length
     });
     if !filters.is_empty() {
-        if filters.len() == 1 {
-            request_body["filter"] = Value::String(filters[0].clone());
+        if let Some(filter) = filters.first() {
+            request_body["filter"] = Value::String(filter.clone());
         } else {
             request_body["filter"] = json!(filters);
         }
@@ -137,7 +138,8 @@ pub async fn search(
         request_body["vector"] = json!(vector);
     }
 
-    let search_response = reqwest::Client::new()
+    let search_response = state
+        .http_client
         .post(format!(
             "{}/indexes/{}/search",
             state.settings.meili.url.trim_end_matches('/'),
@@ -164,7 +166,8 @@ pub async fn search(
         .get("estimatedTotalHits")
         .and_then(Value::as_u64)
         .or_else(|| payload.get("totalHits").and_then(Value::as_u64))
-        .unwrap_or(0) as usize;
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(0);
 
     let hits = payload
         .get("hits")
@@ -331,8 +334,9 @@ pub async fn search(
             .unwrap_or_else(|| json!({})),
         spec.author_filter_field,
     );
-    let next_cursor = if !items.is_empty() && offset + items.len() < total_hits {
-        Some(encode_search_cursor(offset + items.len(), &request_hash))
+    let next_offset = offset.saturating_add(items.len());
+    let next_cursor = if !items.is_empty() && next_offset < total_hits {
+        Some(encode_search_cursor(next_offset, &request_hash))
     } else {
         None
     };
@@ -343,7 +347,7 @@ pub async fn search(
             items,
             facets,
             highlights,
-            page_info: build_page_info(limit as i64, next_cursor),
+            page_info: build_page_info(limit, next_cursor),
         },
         CACHE_SEARCH,
         None,

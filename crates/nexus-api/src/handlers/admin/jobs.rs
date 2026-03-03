@@ -112,9 +112,10 @@ pub async fn list_jobs(
         })
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-    let has_more = jobs.len() > limit as usize;
+    let limit_usize = limit_to_usize(limit);
+    let has_more = jobs.len() > limit_usize;
     if has_more {
-        jobs.truncate(limit as usize);
+        jobs.truncate(limit_usize);
     }
     let next_cursor = if has_more {
         jobs.last().and_then(|job| {
@@ -203,9 +204,10 @@ pub async fn list_job_attempts(
         .list_attempts(job_id, limit + 1, cursor_id)
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-    let has_more = attempts.len() > limit as usize;
+    let limit_usize = limit_to_usize(limit);
+    let has_more = attempts.len() > limit_usize;
     if has_more {
-        attempts.truncate(limit as usize);
+        attempts.truncate(limit_usize);
     }
     let next_cursor = if has_more {
         attempts.last().and_then(|attempt| {

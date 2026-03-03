@@ -41,7 +41,8 @@ pub async fn readyz(State(state): State<ApiState>) -> Json<ReadyResponse> {
         Err(err) => format!("error:{err}"),
     };
 
-    let meili = match reqwest::Client::new()
+    let meili = match state
+        .http_client
         .get(format!(
             "{}/health",
             state.settings.meili.url.trim_end_matches('/')

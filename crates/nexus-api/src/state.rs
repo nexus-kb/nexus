@@ -39,6 +39,7 @@ pub struct ApiState {
     pub pipeline: PipelineStore,
     pub embeddings: EmbeddingsStore,
     pub embedding_client: OpenAiEmbeddingsClient,
+    pub http_client: reqwest::Client,
     pub query_embedding_cache: QueryEmbeddingCache,
 }
 
@@ -50,6 +51,7 @@ impl ApiState {
         let pipeline = PipelineStore::new(db.pool().clone());
         let embeddings = EmbeddingsStore::new(db.pool().clone());
         let embedding_client = OpenAiEmbeddingsClient::from_settings(&settings);
+        let http_client = reqwest::Client::new();
         let query_embedding_cache = QueryEmbeddingCache::new(
             Duration::from_secs(settings.embeddings.query_cache_ttl_secs),
             settings.embeddings.query_cache_max_entries,
@@ -63,6 +65,7 @@ impl ApiState {
             pipeline,
             embeddings,
             embedding_client,
+            http_client,
             query_embedding_cache,
         }
     }

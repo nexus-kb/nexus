@@ -226,9 +226,10 @@ pub async fn list_meili_bootstrap_runs(
         })
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-    let has_more = runs.len() > limit as usize;
+    let limit_usize = limit_to_usize(limit);
+    let has_more = runs.len() > limit_usize;
     if has_more {
-        runs.truncate(limit as usize);
+        runs.truncate(limit_usize);
     }
     let next_cursor = if has_more {
         runs.last().and_then(|run| {

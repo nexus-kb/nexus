@@ -22,9 +22,10 @@ pub async fn list_catalog(
         .list_mailing_lists(limit + 1, cursor_list_key.as_deref())
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let has_more = rows.len() > limit as usize;
+    let limit_usize = limit_to_usize(limit);
+    let has_more = rows.len() > limit_usize;
     if has_more {
-        rows.truncate(limit as usize);
+        rows.truncate(limit_usize);
     }
     let next_cursor = if has_more {
         rows.last().and_then(|row| {

@@ -83,7 +83,7 @@ pub(super) async fn fetch_meili_storage(state: &ApiState) -> MeiliStoragePayload
     };
     let mut list_counts: BTreeMap<String, StorageMeiliListResponse> = BTreeMap::new();
 
-    let client = reqwest::Client::new();
+    let client = &state.http_client;
     let base_url = state.settings.meili.url.trim_end_matches('/');
     let stats_result = client
         .get(format!("{base_url}/stats"))
@@ -130,7 +130,7 @@ pub(super) async fn fetch_meili_storage(state: &ApiState) -> MeiliStoragePayload
         MeiliIndexKind::PatchSeriesDocs,
         MeiliIndexKind::PatchItemDocs,
     ] {
-        match fetch_meili_list_counts(&client, state, index_kind).await {
+        match fetch_meili_list_counts(client, state, index_kind).await {
             Ok(counts) => merge_meili_list_counts(index_kind, counts, &mut list_counts),
             Err(err) => {
                 response.ok = false;
@@ -146,6 +146,10 @@ pub(super) async fn fetch_meili_storage(state: &ApiState) -> MeiliStoragePayload
         response,
         list_counts,
     }
+}
+
+fn maybe_u64_to_i64(value: u64) -> Option<i64> {
+    i64::try_from(value).ok()
 }
 
 pub(super) fn parse_meili_totals(raw: &Value) -> StorageMeiliTotalsResponse {
@@ -177,7 +181,7 @@ pub(super) fn parse_meili_index(raw: Option<&Value>) -> StorageMeiliIndexRespons
             .or_else(|| {
                 raw.get("numberOfDocuments")
                     .and_then(Value::as_u64)
-                    .map(|value| value as i64)
+                    .and_then(maybe_u64_to_i64)
             })
             .unwrap_or(0),
         is_indexing: raw
@@ -190,12 +194,12 @@ pub(super) fn parse_meili_index(raw: Option<&Value>) -> StorageMeiliIndexRespons
             .or_else(|| {
                 raw.get("numberOfEmbeddedDocuments")
                     .and_then(Value::as_u64)
-                    .map(|value| value as i64)
+                    .and_then(maybe_u64_to_i64)
             })
             .or_else(|| {
                 raw.get("numberOfEmbeddings")
                     .and_then(Value::as_u64)
-                    .map(|value| value as i64)
+                    .and_then(maybe_u64_to_i64)
             })
             .unwrap_or(0),
     }
@@ -249,7 +253,7 @@ pub(super) fn parse_meili_facet_counts(payload: &Value) -> BTreeMap<String, i64>
     for (list_key, count_value) in by_list {
         if let Some(count) = count_value
             .as_i64()
-            .or_else(|| count_value.as_u64().map(|value| value as i64))
+            .or_else(|| count_value.as_u64().and_then(maybe_u64_to_i64))
         {
             out.insert(list_key.clone(), count);
         }
@@ -465,18 +469,23 @@ pub(super) fn normalize_limit(limit: i64, default: i64, max: i64) -> i64 {
     requested.clamp(1, max)
 }
 
+pub(super) fn limit_to_usize(limit: i64) -> usize {
+    usize::try_from(limit).unwrap_or(usize::MAX)
+}
+
 pub(super) fn build_page_info(limit: i64, next_cursor: Option<String>) -> CursorPageInfoResponse {
+    let has_more = next_cursor.is_some();
     CursorPageInfoResponse {
         limit,
-        next_cursor: next_cursor.clone(),
+        next_cursor,
         prev_cursor: None,
-        has_more: next_cursor.is_some(),
+        has_more,
     }
 }
 
 pub(super) fn short_hash(value: &Value) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(serde_json::to_vec(value).unwrap_or_default());
+    hasher.update(value.to_string().as_bytes());
     let digest = hasher.finalize();
     let mut out = String::with_capacity(32);
     for byte in digest.iter().take(16) {

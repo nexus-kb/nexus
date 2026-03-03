@@ -86,7 +86,7 @@ pub(super) fn search_request_hash(input: SearchRequestHashInput<'_>) -> String {
         "model_key": input.model_key.unwrap_or(""),
     });
     let mut hasher = Sha256::new();
-    hasher.update(serde_json::to_vec(&normalized).unwrap_or_default());
+    hasher.update(normalized.to_string().as_bytes());
     let digest = hasher.finalize();
     hex_encode(&digest[..16])
 }
@@ -310,12 +310,21 @@ pub(super) fn normalize_limit(limit: Option<i64>, default: i64, max: i64) -> i64
 }
 
 pub(super) fn build_page_info(limit: i64, next_cursor: Option<String>) -> PageInfoResponse {
+    let has_more = next_cursor.is_some();
     PageInfoResponse {
         limit,
-        next_cursor: next_cursor.clone(),
+        next_cursor,
         prev_cursor: None,
-        has_more: next_cursor.is_some(),
+        has_more,
     }
+}
+
+pub(super) fn limit_to_usize(limit: i64) -> usize {
+    usize::try_from(limit).unwrap_or(usize::MAX)
+}
+
+pub(super) fn usize_to_i64(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 pub(super) fn parse_window_days(window: Option<&str>) -> Option<i64> {
@@ -341,8 +350,8 @@ pub(super) fn slice_by_offsets(text: &str, start: i32, end: i32) -> Option<Strin
     if start < 0 || end < 0 || end < start {
         return None;
     }
-    let start = start as usize;
-    let end = end as usize;
+    let start = usize::try_from(start).ok()?;
+    let end = usize::try_from(end).ok()?;
     let bytes = text.as_bytes();
     if start > bytes.len() || end > bytes.len() {
         return None;
@@ -412,7 +421,7 @@ pub(super) fn hex_decode(raw: &str) -> Option<Vec<u8>> {
 
 pub(super) fn short_hash(value: &Value) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(serde_json::to_vec(value).unwrap_or_default());
+    hasher.update(value.to_string().as_bytes());
     let digest = hasher.finalize();
     hex_encode(&digest[..16])
 }
