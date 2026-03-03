@@ -423,6 +423,155 @@ impl JobStore {
         Ok(())
     }
 
+    pub async fn finalize_succeeded_attempt(
+        &self,
+        job_id: i64,
+        attempt_id: i64,
+        result_json: Option<serde_json::Value>,
+        metrics_json: Option<serde_json::Value>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"WITH updated_job AS (
+                UPDATE jobs
+                SET state = 'succeeded',
+                    result_json = $3,
+                    claimed_by = NULL,
+                    lease_until = NULL,
+                    cancel_requested = false,
+                    updated_at = now()
+                WHERE id = $1
+                RETURNING id
+            )
+            UPDATE job_attempts ja
+            SET finished_at = now(),
+                status = 'succeeded',
+                error = NULL,
+                metrics_json = $4
+            WHERE ja.id = $2
+              AND ja.job_id IN (SELECT id FROM updated_job)"#,
+        )
+        .bind(job_id)
+        .bind(attempt_id)
+        .bind(result_json)
+        .bind(metrics_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn finalize_cancelled_attempt(
+        &self,
+        job_id: i64,
+        attempt_id: i64,
+        reason: &str,
+        metrics_json: Option<serde_json::Value>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"WITH updated_job AS (
+                UPDATE jobs
+                SET state = 'cancelled',
+                    claimed_by = NULL,
+                    lease_until = NULL,
+                    updated_at = now(),
+                    last_error = $3,
+                    last_error_kind = 'cancelled'
+                WHERE id = $1
+                RETURNING id
+            )
+            UPDATE job_attempts ja
+            SET finished_at = now(),
+                status = 'cancelled',
+                error = $3,
+                metrics_json = $4
+            WHERE ja.id = $2
+              AND ja.job_id IN (SELECT id FROM updated_job)"#,
+        )
+        .bind(job_id)
+        .bind(attempt_id)
+        .bind(reason)
+        .bind(metrics_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn finalize_terminal_attempt(
+        &self,
+        job_id: i64,
+        attempt_id: i64,
+        reason: &str,
+        kind: &str,
+        metrics_json: Option<serde_json::Value>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"WITH updated_job AS (
+                UPDATE jobs
+                SET state = 'failed_terminal',
+                    claimed_by = NULL,
+                    lease_until = NULL,
+                    updated_at = now(),
+                    last_error = $3,
+                    last_error_kind = $4
+                WHERE id = $1
+                RETURNING id
+            )
+            UPDATE job_attempts ja
+            SET finished_at = now(),
+                status = 'failed',
+                error = $3,
+                metrics_json = $5
+            WHERE ja.id = $2
+              AND ja.job_id IN (SELECT id FROM updated_job)"#,
+        )
+        .bind(job_id)
+        .bind(attempt_id)
+        .bind(reason)
+        .bind(kind)
+        .bind(metrics_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn finalize_retryable_attempt(
+        &self,
+        job_id: i64,
+        attempt_id: i64,
+        retry: RetryDecision,
+        metrics_json: Option<serde_json::Value>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"WITH updated_job AS (
+                UPDATE jobs
+                SET state = 'failed_retryable',
+                    run_after = $3,
+                    claimed_by = NULL,
+                    lease_until = NULL,
+                    updated_at = now(),
+                    last_error = $4,
+                    last_error_kind = $5
+                WHERE id = $1
+                RETURNING id
+            )
+            UPDATE job_attempts ja
+            SET finished_at = now(),
+                status = 'failed',
+                error = $4,
+                metrics_json = $6
+            WHERE ja.id = $2
+              AND ja.job_id IN (SELECT id FROM updated_job)"#,
+        )
+        .bind(job_id)
+        .bind(attempt_id)
+        .bind(retry.run_after)
+        .bind(retry.reason)
+        .bind(retry.kind)
+        .bind(metrics_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn mark_succeeded(
         &self,
         job_id: i64,

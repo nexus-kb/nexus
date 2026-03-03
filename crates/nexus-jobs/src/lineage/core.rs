@@ -99,6 +99,7 @@ async fn process_patch_extract_source_messages(
                 version_num: candidate.version_num,
                 is_rfc: candidate.is_rfc,
                 is_resend: candidate.is_resend,
+                thread_mailing_list_id: Some(mailing_list_id),
                 thread_id: Some(candidate.thread_id),
                 cover_message_pk: candidate.cover_message_pk,
                 first_patch_message_pk: candidate.first_patch_message_pk,

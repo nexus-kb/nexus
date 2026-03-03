@@ -59,7 +59,22 @@ impl Phase0JobHandler {
                     .await;
                 let failing_source = if matches!(payload.scope, EmbeddingScope::Thread) {
                     if let Some(thread_id) = failing_doc_id {
-                        match self.embeddings.lookup_thread_message_body(thread_id).await {
+                        let scoped_list_id = if let Some(list_key) = payload.list_key.as_deref() {
+                            match self.catalog.get_mailing_list(list_key).await {
+                                Ok(Some(list)) => Some(list.id),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        let lookup = if let Some(mailing_list_id) = scoped_list_id {
+                            self.embeddings
+                                .lookup_thread_message_body_in_list(mailing_list_id, thread_id)
+                                .await
+                        } else {
+                            self.embeddings.lookup_thread_message_body(thread_id).await
+                        };
+                        match lookup {
                             Ok(value) => value.map(|(message_pk, body_id)| {
                                 format!("message_pk={message_pk} body_id={body_id}")
                             }),

@@ -240,20 +240,20 @@ impl Phase0Worker {
             };
             if let Err(err) = self
                 .jobs
-                .mark_cancelled(job.id, "cancel requested before execution")
-                .await
-            {
-                error!(job_id = job.id, error = %err, "failed to mark cancelled");
-            }
-            let _ = self
-                .jobs
-                .finish_attempt(
+                .finalize_cancelled_attempt(
+                    job.id,
                     attempt.id,
-                    "cancelled",
-                    Some("cancel requested before execution"),
+                    "cancel requested before execution",
                     Some(metrics_to_json(cancel_metrics.clone())),
                 )
-                .await;
+                .await
+            {
+                error!(
+                    job_id = job.id,
+                    error = %err,
+                    "failed to finalize pre-execution cancellation"
+                );
+            }
             let outcome = JobExecutionOutcome::Cancelled {
                 reason: "cancel requested before execution".to_string(),
                 metrics: cancel_metrics,

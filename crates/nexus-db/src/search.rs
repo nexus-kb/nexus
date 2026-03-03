@@ -281,6 +281,7 @@ impl SearchStore {
             ),
             participants AS (
                 SELECT
+                    tm.mailing_list_id,
                     tm.thread_id,
                     COALESCE(ARRAY_REMOVE(ARRAY_AGG(DISTINCT m.from_email), NULL), ARRAY[]::text[]) AS participant_emails
                 FROM thread_messages tm
@@ -289,10 +290,11 @@ impl SearchStore {
                  AND t.mailing_list_id = tm.mailing_list_id
                 JOIN messages m
                   ON m.id = tm.message_pk
-                GROUP BY tm.thread_id
+                GROUP BY tm.mailing_list_id, tm.thread_id
             ),
             snippets AS (
                 SELECT
+                    tm.mailing_list_id,
                     tm.thread_id,
                     STRING_AGG(nexus_safe_prefix(mb.search_text, 400), ' ' ORDER BY tm.sort_key) AS snippet_corpus,
                     BOOL_OR(mb.has_diff) AS has_diff
@@ -304,7 +306,7 @@ impl SearchStore {
                   ON m.id = tm.message_pk
                 JOIN message_bodies mb
                   ON mb.id = m.body_id
-                GROUP BY tm.thread_id
+                GROUP BY tm.mailing_list_id, tm.thread_id
             )
             SELECT
                 t.id,
@@ -324,9 +326,11 @@ impl SearchStore {
             LEFT JOIN starter st
               ON st.thread_id = t.id
             LEFT JOIN participants p
-              ON p.thread_id = t.id
+              ON p.mailing_list_id = t.mailing_list_id
+             AND p.thread_id = t.id
             LEFT JOIN snippets s
-              ON s.thread_id = t.id
+              ON s.mailing_list_id = t.mailing_list_id
+             AND s.thread_id = t.id
             ORDER BY t.id ASC"#,
         )
         .bind(ids)

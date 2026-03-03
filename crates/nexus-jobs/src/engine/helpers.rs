@@ -198,22 +198,19 @@ pub(super) async fn finalize_job(
             result_json,
             metrics,
         } => {
-            jobs.mark_succeeded(job.id, Some(result_json.clone()))
-                .await?;
-            jobs.finish_attempt(
+            jobs.finalize_succeeded_attempt(
+                job.id,
                 attempt_id,
-                "succeeded",
-                None,
+                Some(result_json.clone()),
                 Some(metrics_to_json(metrics.clone())),
             )
             .await?;
         }
         JobExecutionOutcome::Cancelled { reason, metrics } => {
-            jobs.mark_cancelled(job.id, reason).await?;
-            jobs.finish_attempt(
+            jobs.finalize_cancelled_attempt(
+                job.id,
                 attempt_id,
-                "cancelled",
-                Some(reason),
+                reason,
                 Some(metrics_to_json(metrics.clone())),
             )
             .await?;
@@ -223,11 +220,11 @@ pub(super) async fn finalize_job(
             kind,
             metrics,
         } => {
-            jobs.mark_terminal(job.id, reason, kind).await?;
-            jobs.finish_attempt(
+            jobs.finalize_terminal_attempt(
+                job.id,
                 attempt_id,
-                "failed",
-                Some(reason),
+                reason,
+                kind,
                 Some(metrics_to_json(metrics.clone())),
             )
             .await?;
@@ -239,11 +236,11 @@ pub(super) async fn finalize_job(
             metrics,
         } => {
             if attempt >= max_attempts {
-                jobs.mark_terminal(job.id, reason, kind).await?;
-                jobs.finish_attempt(
+                jobs.finalize_terminal_attempt(
+                    job.id,
                     attempt_id,
-                    "failed",
-                    Some(reason),
+                    reason,
+                    kind,
                     Some(metrics_to_json(metrics.clone())),
                 )
                 .await?;
@@ -251,19 +248,14 @@ pub(super) async fn finalize_job(
                 let backoff_ms_i64 = i64::try_from((*backoff_ms).max(1)).unwrap_or(i64::MAX);
                 let run_after = Utc::now() + chrono::Duration::milliseconds(backoff_ms_i64);
 
-                jobs.mark_retryable(
+                jobs.finalize_retryable_attempt(
                     job.id,
+                    attempt_id,
                     RetryDecision {
                         reason: reason.clone(),
                         kind: kind.clone(),
                         run_after,
                     },
-                )
-                .await?;
-                jobs.finish_attempt(
-                    attempt_id,
-                    "failed",
-                    Some(reason),
                     Some(metrics_to_json(metrics.clone())),
                 )
                 .await?;

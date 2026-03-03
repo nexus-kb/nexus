@@ -112,10 +112,10 @@ pub async fn series_detail(
 
     let mut version_items = Vec::with_capacity(versions.len());
     for version in versions {
-        let thread_refs = match version.thread_id {
-            Some(thread_id) => state
+        let thread_refs = match (version.thread_mailing_list_id, version.thread_id) {
+            (Some(mailing_list_id), Some(thread_id)) => state
                 .lineage
-                .get_thread_ref(thread_id)
+                .get_thread_ref(mailing_list_id, thread_id)
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
                 .map(|thread| {
@@ -125,7 +125,8 @@ pub async fn series_detail(
                     }]
                 })
                 .unwrap_or_default(),
-            None => Vec::new(),
+            (None, None) => Vec::new(),
+            _ => Vec::new(),
         };
 
         version_items.push(SeriesVersionSummaryResponse {

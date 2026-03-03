@@ -595,9 +595,34 @@ impl EmbeddingsStore {
                JOIN messages m
                  ON m.id = tm.message_pk
                WHERE tm.thread_id = $1
+               ORDER BY tm.mailing_list_id, tm.sort_key, tm.message_pk
+               LIMIT 1"#,
+        )
+        .bind(thread_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|value| (value.message_pk, value.body_id)))
+    }
+
+    pub async fn lookup_thread_message_body_in_list(
+        &self,
+        mailing_list_id: i64,
+        thread_id: i64,
+    ) -> Result<Option<(i64, i64)>> {
+        let row = sqlx::query_as::<_, ThreadSourceRow>(
+            r#"SELECT
+                   tm.message_pk,
+                   m.body_id
+               FROM thread_messages tm
+               JOIN messages m
+                 ON m.id = tm.message_pk
+               WHERE tm.mailing_list_id = $1
+                 AND tm.thread_id = $2
                ORDER BY tm.sort_key, tm.message_pk
                LIMIT 1"#,
         )
+        .bind(mailing_list_id)
         .bind(thread_id)
         .fetch_optional(&self.pool)
         .await?;
@@ -614,7 +639,8 @@ impl EmbeddingsStore {
                ),
                participants AS (
                    SELECT
-                       tm.thread_id AS thread_id,
+                       tm.mailing_list_id,
+                       tm.thread_id,
                        COALESCE(ARRAY_REMOVE(ARRAY_AGG(DISTINCT m.from_email), NULL), ARRAY[]::text[]) AS participant_emails
                    FROM thread_messages tm
                    JOIN targets t
@@ -622,11 +648,12 @@ impl EmbeddingsStore {
                     AND t.mailing_list_id = tm.mailing_list_id
                    JOIN messages m
                      ON m.id = tm.message_pk
-                   GROUP BY tm.thread_id
+                   GROUP BY tm.mailing_list_id, tm.thread_id
                ),
                bodies AS (
                    SELECT
-                       tm.thread_id AS thread_id,
+                       tm.mailing_list_id,
+                       tm.thread_id,
                        STRING_AGG(nexus_safe_prefix(mb.search_text, 1000), ' ' ORDER BY tm.sort_key) AS body_corpus
                    FROM thread_messages tm
                    JOIN targets t
@@ -636,7 +663,7 @@ impl EmbeddingsStore {
                      ON m.id = tm.message_pk
                    JOIN message_bodies mb
                      ON mb.id = m.body_id
-                   GROUP BY tm.thread_id
+                   GROUP BY tm.mailing_list_id, tm.thread_id
                )
                SELECT
                    t.id AS doc_id,
@@ -645,9 +672,11 @@ impl EmbeddingsStore {
                    b.body_corpus
                FROM targets t
                LEFT JOIN participants p
-                 ON p.thread_id = t.id
+                 ON p.mailing_list_id = t.mailing_list_id
+                AND p.thread_id = t.id
                LEFT JOIN bodies b
-                 ON b.thread_id = t.id
+                 ON b.mailing_list_id = t.mailing_list_id
+                AND b.thread_id = t.id
                ORDER BY t.id ASC"#,
         )
         .bind(ids)

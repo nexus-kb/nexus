@@ -116,15 +116,16 @@ impl LineageStore {
     ) -> Result<PatchSeriesVersionRecord> {
         sqlx::query_as::<_, PatchSeriesVersionRecord>(
             r#"INSERT INTO patch_series_versions
-            (patch_series_id, version_num, is_rfc, is_resend, thread_id,
+            (patch_series_id, version_num, is_rfc, is_resend, thread_mailing_list_id, thread_id,
              cover_message_pk, first_patch_message_pk, sent_at,
              subject_raw, subject_norm, base_commit, version_fingerprint)
-            VALUES ($1, $2, $3, $4, $5,
-                    $6, $7, $8,
-                    $9, $10, $11, $12)
+            VALUES ($1, $2, $3, $4, $5, $6,
+                    $7, $8, $9,
+                    $10, $11, $12, $13)
             ON CONFLICT (patch_series_id, version_num, version_fingerprint)
             DO UPDATE SET is_rfc = EXCLUDED.is_rfc,
                           is_resend = EXCLUDED.is_resend,
+                          thread_mailing_list_id = COALESCE(EXCLUDED.thread_mailing_list_id, patch_series_versions.thread_mailing_list_id),
                           thread_id = COALESCE(EXCLUDED.thread_id, patch_series_versions.thread_id),
                           cover_message_pk = COALESCE(EXCLUDED.cover_message_pk, patch_series_versions.cover_message_pk),
                           first_patch_message_pk = COALESCE(EXCLUDED.first_patch_message_pk, patch_series_versions.first_patch_message_pk),
@@ -138,6 +139,7 @@ impl LineageStore {
                       is_rfc,
                       is_resend,
                       is_partial_reroll,
+                      thread_mailing_list_id,
                       thread_id,
                       cover_message_pk,
                       first_patch_message_pk,
@@ -151,6 +153,7 @@ impl LineageStore {
         .bind(input.version_num)
         .bind(input.is_rfc)
         .bind(input.is_resend)
+        .bind(input.thread_mailing_list_id)
         .bind(input.thread_id)
         .bind(input.cover_message_pk)
         .bind(input.first_patch_message_pk)

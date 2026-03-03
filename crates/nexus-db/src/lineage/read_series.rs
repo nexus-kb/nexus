@@ -14,6 +14,7 @@ impl LineageStore {
                 is_rfc,
                 is_resend,
                 is_partial_reroll,
+                thread_mailing_list_id,
                 thread_id,
                 cover_message_pk,
                 first_patch_message_pk,
@@ -147,6 +148,7 @@ impl LineageStore {
                 psv.is_rfc,
                 psv.is_resend,
                 psv.is_partial_reroll,
+                psv.thread_mailing_list_id,
                 psv.thread_id,
                 psv.cover_message_pk,
                 psv.first_patch_message_pk,
@@ -165,6 +167,7 @@ impl LineageStore {
                 psv.is_rfc,
                 psv.is_resend,
                 psv.is_partial_reroll,
+                psv.thread_mailing_list_id,
                 psv.thread_id,
                 psv.cover_message_pk,
                 psv.first_patch_message_pk,
@@ -178,7 +181,11 @@ impl LineageStore {
         .await
     }
 
-    pub async fn get_thread_ref(&self, thread_id: i64) -> Result<Option<ThreadRefRecord>> {
+    pub async fn get_thread_ref(
+        &self,
+        mailing_list_id: i64,
+        thread_id: i64,
+    ) -> Result<Option<ThreadRefRecord>> {
         sqlx::query_as::<_, ThreadRefRecord>(
             r#"SELECT
                 t.id AS thread_id,
@@ -186,9 +193,11 @@ impl LineageStore {
             FROM threads t
             JOIN mailing_lists ml
               ON ml.id = t.mailing_list_id
-            WHERE t.id = $1
+            WHERE t.mailing_list_id = $1
+              AND t.id = $2
             LIMIT 1"#,
         )
+        .bind(mailing_list_id)
         .bind(thread_id)
         .fetch_optional(&self.pool)
         .await
