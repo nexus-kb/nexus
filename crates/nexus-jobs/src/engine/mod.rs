@@ -3,8 +3,8 @@ use std::time::Duration;
 use chrono::Utc;
 use nexus_core::config::Settings;
 use nexus_db::{
-    CatalogStore, Db, EmbeddingsStore, EnqueueJobParams, IngestStore, Job, JobState, JobStore,
-    JobStoreMetrics, LineageStore, PipelineStore, RetryDecision, SearchStore, ThreadingStore,
+    CatalogStore, Db, EmbeddingsStore, IngestStore, Job, JobState, JobStore, JobStoreMetrics,
+    LineageStore, PipelineStore, RetryDecision, SearchStore, ThreadingStore,
 };
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
@@ -12,7 +12,6 @@ use tokio::time::{MissedTickBehavior, interval};
 use tracing::{error, info, warn};
 
 use crate::JobExecutionOutcome;
-use crate::payloads::PipelineIngestPayload;
 use crate::pipeline::Phase0JobHandler;
 
 const MAX_LOG_REASON_CHARS: usize = 180;
@@ -171,7 +170,7 @@ impl Phase0Worker {
         // Recovery path for orphaned pending pipeline runs (for example after overlapping
         // webhook triggers): if no run is currently active, kick one pending run.
         if self.pipeline.get_any_active_run().await?.is_none() {
-            let activated = self.activate_and_enqueue_next_list_global().await?;
+            let activated = self.handler.activate_and_enqueue_next_list_global().await?;
             if activated {
                 info!("activated pending pipeline run from global queue during maintenance");
             }
@@ -388,7 +387,9 @@ impl Phase0Worker {
             .mark_run_failed(run.id, &failure_reason)
             .await?;
         if let Some(batch_id) = run.batch_id {
-            self.activate_and_enqueue_next_list(batch_id).await?;
+            self.handler
+                .activate_and_enqueue_next_list(batch_id)
+                .await?;
         }
         Ok(())
     }
@@ -404,117 +405,11 @@ impl Phase0Worker {
             .mark_run_cancelled(run.id, &cancel_reason)
             .await?;
         if let Some(batch_id) = run.batch_id {
-            self.activate_and_enqueue_next_list(batch_id).await?;
+            self.handler
+                .activate_and_enqueue_next_list(batch_id)
+                .await?;
         }
         Ok(())
-    }
-
-    async fn activate_and_enqueue_next_list(&self, batch_id: i64) -> Result<(), sqlx::Error> {
-        if self
-            .activate_and_enqueue_next_list_in_batch(batch_id)
-            .await?
-        {
-            return Ok(());
-        }
-        let _ = self.activate_and_enqueue_next_list_global().await?;
-        Ok(())
-    }
-
-    async fn activate_and_enqueue_next_list_in_batch(
-        &self,
-        batch_id: i64,
-    ) -> Result<bool, sqlx::Error> {
-        loop {
-            let Some(next_run) = self.pipeline.activate_next_pending_run(batch_id).await? else {
-                return Ok(false);
-            };
-
-            let payload = PipelineIngestPayload {
-                run_id: next_run.id,
-            };
-            match self
-                .jobs
-                .enqueue(EnqueueJobParams {
-                    job_type: "pipeline_ingest".to_string(),
-                    payload_json: serde_json::to_value(payload)
-                        .unwrap_or_else(|_| serde_json::json!({})),
-                    priority: 20,
-                    dedupe_scope: Some(format!("pipeline:run:{}", next_run.id)),
-                    dedupe_key: Some("ingest".to_string()),
-                    run_after: None,
-                    max_attempts: Some(8),
-                })
-                .await
-            {
-                Ok(_) => {
-                    info!(
-                        run_id = next_run.id,
-                        list_key = %next_run.list_key,
-                        batch_id,
-                        "activated next pending list in batch"
-                    );
-                    return Ok(true);
-                }
-                Err(err) => {
-                    let reason =
-                        format!("failed to enqueue pipeline_ingest after activation: {err}");
-                    warn!(
-                        run_id = next_run.id,
-                        list_key = %next_run.list_key,
-                        batch_id,
-                        error = %err,
-                        "marking activated run failed and trying next pending run"
-                    );
-                    self.pipeline.mark_run_failed(next_run.id, &reason).await?;
-                }
-            }
-        }
-    }
-
-    async fn activate_and_enqueue_next_list_global(&self) -> Result<bool, sqlx::Error> {
-        loop {
-            let Some(next_run) = self.pipeline.activate_next_pending_run_any().await? else {
-                return Ok(false);
-            };
-
-            let payload = PipelineIngestPayload {
-                run_id: next_run.id,
-            };
-            match self
-                .jobs
-                .enqueue(EnqueueJobParams {
-                    job_type: "pipeline_ingest".to_string(),
-                    payload_json: serde_json::to_value(payload)
-                        .unwrap_or_else(|_| serde_json::json!({})),
-                    priority: 20,
-                    dedupe_scope: Some(format!("pipeline:run:{}", next_run.id)),
-                    dedupe_key: Some("ingest".to_string()),
-                    run_after: None,
-                    max_attempts: Some(8),
-                })
-                .await
-            {
-                Ok(_) => {
-                    info!(
-                        run_id = next_run.id,
-                        list_key = %next_run.list_key,
-                        "activated next pending list from global queue"
-                    );
-                    return Ok(true);
-                }
-                Err(err) => {
-                    let reason =
-                        format!("failed to enqueue pipeline_ingest after activation: {err}");
-                    warn!(
-                        run_id = next_run.id,
-                        list_key = %next_run.list_key,
-                        error = %err,
-                        "marking globally activated run failed and trying next pending run"
-                    );
-                    self.pipeline.mark_run_failed(next_run.id, &reason).await?;
-                }
-            }
-        }
     }
 }
 

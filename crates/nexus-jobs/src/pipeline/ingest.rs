@@ -154,7 +154,9 @@ impl Phase0JobHandler {
                 &repo_path,
                 since_commit_oid.as_deref(),
                 batch_size,
-            ) {
+            )
+            .await
+            {
                 Ok(value) => value,
                 Err(err) => {
                     return retryable_error(
@@ -188,7 +190,7 @@ impl Phase0JobHandler {
                     Err(err) => warn!(job_id = job.id, error = %err, "cancel check failed"),
                 }
 
-                let chunk = match stream.next_chunk() {
+                let chunk = match stream.next_chunk().await {
                     Ok(Some(value)) => value,
                     Ok(None) => break,
                     Err(err) => {

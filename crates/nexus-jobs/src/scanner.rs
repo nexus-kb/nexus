@@ -1,6 +1,7 @@
-use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
-use std::process::{Child, ChildStdout, Command, Stdio};
+
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::process::{Child, ChildStdout, Command};
 
 pub struct CommitOidChunkStream {
     child: Child,
@@ -10,7 +11,7 @@ pub struct CommitOidChunkStream {
 }
 
 impl CommitOidChunkStream {
-    pub fn next_chunk(&mut self) -> anyhow::Result<Option<Vec<String>>> {
+    pub async fn next_chunk(&mut self) -> anyhow::Result<Option<Vec<String>>> {
         if self.finished {
             return Ok(None);
         }
@@ -18,7 +19,7 @@ impl CommitOidChunkStream {
         let mut chunk = Vec::with_capacity(self.chunk_size);
         while chunk.len() < self.chunk_size {
             let mut line = String::new();
-            let read = self.stdout.read_line(&mut line)?;
+            let read = self.stdout.read_line(&mut line).await?;
             if read == 0 {
                 break;
             }
@@ -34,14 +35,17 @@ impl CommitOidChunkStream {
         }
 
         self.finished = true;
-        let status = self.child.wait()?;
+        let status = self.child.wait().await?;
         if status.success() {
             return Ok(None);
         }
 
         let mut stderr = String::new();
         if let Some(mut stderr_pipe) = self.child.stderr.take() {
-            let _ = stderr_pipe.read_to_string(&mut stderr);
+            let mut bytes = Vec::new();
+            if stderr_pipe.read_to_end(&mut bytes).await.is_ok() {
+                stderr = String::from_utf8_lossy(&bytes).to_string();
+            }
         }
 
         anyhow::bail!("git rev-list failed: {}", stderr.trim());
@@ -51,13 +55,12 @@ impl CommitOidChunkStream {
 impl Drop for CommitOidChunkStream {
     fn drop(&mut self) {
         if !self.finished {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+            let _ = self.child.start_kill();
         }
     }
 }
 
-pub fn stream_new_commit_oid_chunks(
+pub async fn stream_new_commit_oid_chunks(
     repo_path: &Path,
     since_commit_oid: Option<&str>,
     chunk_size: usize,
@@ -67,11 +70,12 @@ pub fn stream_new_commit_oid_chunks(
     }
 
     let incremental_since = match since_commit_oid {
-        Some(oid) if commit_exists(repo_path, oid)? => Some(oid),
+        Some(oid) if commit_exists(repo_path, oid).await? => Some(oid),
         _ => None,
     };
 
     let mut cmd = Command::new("git");
+    cmd.kill_on_drop(true);
     cmd.arg("-C")
         .arg(repo_path)
         .arg("rev-list")
@@ -85,7 +89,8 @@ pub fn stream_new_commit_oid_chunks(
         cmd.arg(format!("^{since}"));
     }
 
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     let mut child = cmd.spawn()?;
     let stdout = child
         .stdout
@@ -118,16 +123,17 @@ pub fn chunk_commit_oids(commits: &[String], chunk_size: usize) -> Vec<Vec<Strin
     chunks
 }
 
-fn commit_exists(repo_path: &Path, commit_oid: &str) -> anyhow::Result<bool> {
+async fn commit_exists(repo_path: &Path, commit_oid: &str) -> anyhow::Result<bool> {
     let status = Command::new("git")
         .arg("-C")
         .arg(repo_path)
         .arg("cat-file")
         .arg("-e")
         .arg(format!("{commit_oid}^{{commit}}"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await?;
     Ok(status.success())
 }
 

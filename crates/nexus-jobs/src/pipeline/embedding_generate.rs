@@ -113,13 +113,41 @@ impl Phase0JobHandler {
             if let Err(err) = ctx.heartbeat().await {
                 warn!(job_id = job.id, error = %err, "heartbeat update failed");
             }
+            match ctx.is_cancel_requested().await {
+                Ok(true) => {
+                    return JobExecutionOutcome::Cancelled {
+                        reason: "cancel requested".to_string(),
+                        metrics: JobStoreMetrics {
+                            duration_ms: started.elapsed().as_millis(),
+                            rows_written: upserts.len() as u64,
+                            bytes_read,
+                            commit_count: ids.len() as u64,
+                            parse_errors: 0,
+                        },
+                    };
+                }
+                Ok(false) => {}
+                Err(err) => warn!(job_id = job.id, error = %err, "cancel check failed"),
+            }
             let text_batch = chunk
                 .iter()
                 .map(|row| row.text.clone())
                 .collect::<Vec<String>>();
-            let vectors = match self.embed_text_batch_with_retry(&text_batch).await {
+            let vectors = match self.embed_text_batch_with_retry(&text_batch, &ctx).await {
                 Ok(value) => value,
                 Err(err) => {
+                    if err.to_string().contains("cancel requested") {
+                        return JobExecutionOutcome::Cancelled {
+                            reason: "cancel requested".to_string(),
+                            metrics: JobStoreMetrics {
+                                duration_ms: started.elapsed().as_millis(),
+                                rows_written: upserts.len() as u64,
+                                bytes_read,
+                                commit_count: ids.len() as u64,
+                                parse_errors: 0,
+                            },
+                        };
+                    }
                     if err.is_transient() {
                         return retryable_error(
                             format!(
@@ -218,6 +246,18 @@ impl Phase0JobHandler {
         {
             Ok(n) => n,
             Err(err) => {
+                if err.to_string().contains("cancel requested") {
+                    return JobExecutionOutcome::Cancelled {
+                        reason: "cancel requested".to_string(),
+                        metrics: JobStoreMetrics {
+                            duration_ms: started.elapsed().as_millis(),
+                            rows_written,
+                            bytes_read,
+                            commit_count: ids.len() as u64,
+                            parse_errors: 0,
+                        },
+                    };
+                }
                 return retryable_error(
                     format!("failed to upsert meili docs after embeddings: {err}"),
                     "meili",
@@ -339,6 +379,15 @@ impl Phase0JobHandler {
         ctx: &ExecutionContext,
     ) -> Result<(), MeiliClientError> {
         loop {
+            match ctx.is_cancel_requested().await {
+                Ok(true) => {
+                    return Err(MeiliClientError::Protocol("cancel requested".to_string()));
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    warn!(error = %err, task_uid, "cancel check failed while waiting for meili task");
+                }
+            }
             let _ = ctx.heartbeat().await;
             let task = self.meili.get_task(task_uid).await?;
             match task.status.as_str() {
@@ -530,8 +579,13 @@ impl Phase0JobHandler {
         self.jobs
             .enqueue(EnqueueJobParams {
                 job_type: "embedding_generate_batch".to_string(),
-                payload_json: serde_json::to_value(payload)
-                    .unwrap_or_else(|_| serde_json::json!({})),
+                payload_json: serde_json::json!({
+                    "scope": payload.scope.as_str(),
+                    "list_key": payload.list_key,
+                    "ids": payload.ids,
+                    "model_key": payload.model_key,
+                    "source_job_id": payload.source_job_id
+                }),
                 priority,
                 dedupe_scope: Some(format!("list:{list_key}:embeddings")),
                 dedupe_key: Some(dedupe_key),
@@ -545,10 +599,22 @@ impl Phase0JobHandler {
     pub(super) async fn embed_text_batch_with_retry(
         &self,
         texts: &[String],
+        ctx: &ExecutionContext,
     ) -> Result<Vec<Vec<f32>>, EmbeddingsClientError> {
         let mut backoff_ms = self.settings.worker.base_backoff_ms.max(250);
         let mut attempts = 0u8;
         loop {
+            match ctx.is_cancel_requested().await {
+                Ok(true) => {
+                    return Err(EmbeddingsClientError::Protocol(
+                        "cancel requested".to_string(),
+                    ));
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    warn!(error = %err, "cancel check failed during embedding retry loop");
+                }
+            }
             attempts = attempts.saturating_add(1);
             match self.embedding_client.embed_texts(texts).await {
                 Ok(vectors) => return Ok(vectors),

@@ -1,65 +1,31 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use moka::future::Cache;
 use nexus_core::config::Settings;
 use nexus_core::embeddings::OpenAiEmbeddingsClient;
 use nexus_db::{CatalogStore, Db, EmbeddingsStore, JobStore, LineageStore, PipelineStore};
-use tokio::sync::Mutex;
 
 #[derive(Clone)]
 pub struct QueryEmbeddingCache {
-    inner: Arc<Mutex<HashMap<String, QueryEmbeddingCacheEntry>>>,
-    ttl: Duration,
-    max_entries: usize,
-}
-
-#[derive(Clone)]
-struct QueryEmbeddingCacheEntry {
-    vector: Vec<f32>,
-    inserted_at: Instant,
+    inner: Cache<String, Vec<f32>>,
 }
 
 impl QueryEmbeddingCache {
     pub fn new(ttl: Duration, max_entries: usize) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(HashMap::new())),
-            ttl,
-            max_entries: max_entries.max(1),
+            inner: Cache::builder()
+                .time_to_live(ttl)
+                .max_capacity(max_entries.max(1) as u64)
+                .build(),
         }
     }
 
     pub async fn get(&self, key: &str) -> Option<Vec<f32>> {
-        let mut guard = self.inner.lock().await;
-        let now = Instant::now();
-        guard.retain(|_, entry| now.duration_since(entry.inserted_at) <= self.ttl);
-        guard.get(key).map(|entry| entry.vector.clone())
+        self.inner.get(key).await
     }
 
     pub async fn insert(&self, key: String, vector: Vec<f32>) {
-        let mut guard = self.inner.lock().await;
-        let now = Instant::now();
-        guard.retain(|_, entry| now.duration_since(entry.inserted_at) <= self.ttl);
-        if guard.len() >= self.max_entries {
-            let mut oldest_key: Option<String> = None;
-            let mut oldest_ts = now;
-            for (entry_key, entry) in guard.iter() {
-                if entry.inserted_at <= oldest_ts {
-                    oldest_ts = entry.inserted_at;
-                    oldest_key = Some(entry_key.clone());
-                }
-            }
-            if let Some(oldest_key) = oldest_key {
-                guard.remove(&oldest_key);
-            }
-        }
-        guard.insert(
-            key,
-            QueryEmbeddingCacheEntry {
-                vector,
-                inserted_at: now,
-            },
-        );
+        self.inner.insert(key, vector).await;
     }
 }
 

@@ -173,20 +173,17 @@ impl Phase0JobHandler {
         let (job_type, payload_json, priority) = match stage {
             STAGE_THREADING => (
                 "pipeline_threading",
-                serde_json::to_value(PipelineThreadingPayload { run_id })
-                    .unwrap_or_else(|_| serde_json::json!({})),
+                serde_json::json!({ "run_id": run_id }),
                 PRIORITY_THREADING,
             ),
             STAGE_LINEAGE => (
                 "pipeline_lineage",
-                serde_json::to_value(PipelineLineagePayload { run_id })
-                    .unwrap_or_else(|_| serde_json::json!({})),
+                serde_json::json!({ "run_id": run_id }),
                 PRIORITY_LINEAGE,
             ),
             STAGE_LEXICAL => (
                 "pipeline_lexical",
-                serde_json::to_value(PipelineLexicalPayload { run_id })
-                    .unwrap_or_else(|_| serde_json::json!({})),
+                serde_json::json!({ "run_id": run_id }),
                 PRIORITY_LEXICAL,
             ),
             _ => return Ok(()),
@@ -232,8 +229,12 @@ impl Phase0JobHandler {
         self.jobs
             .enqueue(EnqueueJobParams {
                 job_type: "pipeline_embedding".to_string(),
-                payload_json: serde_json::to_value(payload)
-                    .unwrap_or_else(|_| serde_json::json!({})),
+                payload_json: serde_json::json!({
+                    "run_id": payload.run_id,
+                    "list_key": payload.list_key,
+                    "window_from": payload.window_from,
+                    "window_to": payload.window_to
+                }),
                 priority: PRIORITY_PIPELINE_EMBEDDING,
                 dedupe_scope: Some(format!("list:{list_key}:pipeline")),
                 dedupe_key: Some(dedupe_key),
@@ -245,7 +246,7 @@ impl Phase0JobHandler {
     }
 
     /// Activate the next pending run in the same batch, then fall back to the global pending queue.
-    pub(super) async fn activate_and_enqueue_next_list(
+    pub(crate) async fn activate_and_enqueue_next_list(
         &self,
         batch_id: i64,
     ) -> Result<(), sqlx::Error> {
@@ -259,7 +260,7 @@ impl Phase0JobHandler {
         Ok(())
     }
 
-    pub(super) async fn activate_and_enqueue_next_list_in_batch(
+    pub(crate) async fn activate_and_enqueue_next_list_in_batch(
         &self,
         batch_id: i64,
     ) -> Result<bool, sqlx::Error> {
@@ -275,8 +276,7 @@ impl Phase0JobHandler {
                 .jobs
                 .enqueue(EnqueueJobParams {
                     job_type: "pipeline_ingest".to_string(),
-                    payload_json: serde_json::to_value(payload)
-                        .unwrap_or_else(|_| serde_json::json!({})),
+                    payload_json: serde_json::json!({ "run_id": payload.run_id }),
                     priority: PRIORITY_INGEST,
                     dedupe_scope: Some(format!("pipeline:run:{}", next_run.id)),
                     dedupe_key: Some("ingest".to_string()),
@@ -310,7 +310,7 @@ impl Phase0JobHandler {
         }
     }
 
-    pub(super) async fn activate_and_enqueue_next_list_global(&self) -> Result<bool, sqlx::Error> {
+    pub(crate) async fn activate_and_enqueue_next_list_global(&self) -> Result<bool, sqlx::Error> {
         loop {
             let Some(next_run) = self.pipeline.activate_next_pending_run_any().await? else {
                 return Ok(false);
@@ -323,8 +323,7 @@ impl Phase0JobHandler {
                 .jobs
                 .enqueue(EnqueueJobParams {
                     job_type: "pipeline_ingest".to_string(),
-                    payload_json: serde_json::to_value(payload)
-                        .unwrap_or_else(|_| serde_json::json!({})),
+                    payload_json: serde_json::json!({ "run_id": payload.run_id }),
                     priority: PRIORITY_INGEST,
                     dedupe_scope: Some(format!("pipeline:run:{}", next_run.id)),
                     dedupe_key: Some("ingest".to_string()),

@@ -66,12 +66,41 @@ impl Phase0JobHandler {
         let chunk_limit = self.settings.meili.upsert_batch_size.max(1);
 
         for index in [MeiliIndexKind::ThreadDocs, MeiliIndexKind::PatchSeriesDocs] {
+            match ctx.is_cancel_requested().await {
+                Ok(true) => {
+                    return JobExecutionOutcome::Cancelled {
+                        reason: "cancel requested".to_string(),
+                        metrics: JobStoreMetrics {
+                            duration_ms: started.elapsed().as_millis(),
+                            rows_written: total_docs_upserted,
+                            bytes_read: 0,
+                            commit_count: total_ids_seen,
+                            parse_errors: 0,
+                        },
+                    };
+                }
+                Ok(false) => {}
+                Err(err) => warn!(job_id = job.id, error = %err, "cancel check failed"),
+            }
+
             let index_spec = index.spec();
             let settings = self.meili_index_settings(index);
             if let Err(err) = self
                 .ensure_index_settings(index_spec, &settings, &ctx)
                 .await
             {
+                if err.to_string().contains("cancel requested") {
+                    return JobExecutionOutcome::Cancelled {
+                        reason: "cancel requested".to_string(),
+                        metrics: JobStoreMetrics {
+                            duration_ms: started.elapsed().as_millis(),
+                            rows_written: total_docs_upserted,
+                            bytes_read: 0,
+                            commit_count: total_ids_seen,
+                            parse_errors: 0,
+                        },
+                    };
+                }
                 return retryable_error(
                     format!("failed to prepare index {}: {err}", index.uid()),
                     "meili",
@@ -118,6 +147,22 @@ impl Phase0JobHandler {
                 if let Err(err) = ctx.heartbeat().await {
                     warn!(job_id = job.id, error = %err, "heartbeat update failed");
                 }
+                match ctx.is_cancel_requested().await {
+                    Ok(true) => {
+                        return JobExecutionOutcome::Cancelled {
+                            reason: "cancel requested".to_string(),
+                            metrics: JobStoreMetrics {
+                                duration_ms: started.elapsed().as_millis(),
+                                rows_written: total_docs_upserted,
+                                bytes_read: 0,
+                                commit_count: total_ids_seen,
+                                parse_errors: 0,
+                            },
+                        };
+                    }
+                    Ok(false) => {}
+                    Err(err) => warn!(job_id = job.id, error = %err, "cancel check failed"),
+                }
 
                 chunks_done += 1;
 
@@ -153,6 +198,18 @@ impl Phase0JobHandler {
                     }
                 };
                 if let Err(err) = self.wait_for_task(task_uid, &ctx).await {
+                    if err.to_string().contains("cancel requested") {
+                        return JobExecutionOutcome::Cancelled {
+                            reason: "cancel requested".to_string(),
+                            metrics: JobStoreMetrics {
+                                duration_ms: started.elapsed().as_millis(),
+                                rows_written: total_docs_upserted,
+                                bytes_read: 0,
+                                commit_count: total_ids_seen,
+                                parse_errors: 0,
+                            },
+                        };
+                    }
                     return retryable_error(
                         format!("meili task {} failed for {}: {err}", task_uid, index.uid()),
                         "meili",
