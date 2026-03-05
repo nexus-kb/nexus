@@ -53,6 +53,25 @@ struct ThreadDocRow {
     has_diff: Option<bool>,
 }
 
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct ThreadMetadataDocRow {
+    id: i64,
+    list_key: String,
+    created_at: DateTime<Utc>,
+    last_activity_at: DateTime<Utc>,
+    message_count: i32,
+    starter_name: Option<String>,
+    starter_email: Option<String>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct PatchSeriesMetadataDocRow {
+    id: i64,
+    latest_version_num: Option<i32>,
+    latest_version_id: Option<i64>,
+    latest_version_is_rfc: Option<bool>,
+}
+
 #[derive(Clone)]
 pub struct SearchStore {
     pool: PgPool,
@@ -145,6 +164,7 @@ impl SearchStore {
                 json!({
                     "id": row.id,
                     "scope": "patch_item",
+                    "schema_rev": 2,
                     "title": subject.clone(),
                     "subject": subject,
                     "snippet": snippet,
@@ -231,6 +251,7 @@ impl SearchStore {
                 json!({
                     "id": row.id,
                     "scope": "series",
+                    "schema_rev": 2,
                     "title": canonical_subject.clone(),
                     "canonical_subject": canonical_subject,
                     "snippet": snippet,
@@ -244,8 +265,8 @@ impl SearchStore {
                     "latest_version_num": row.latest_version_num.unwrap_or(1),
                     "latest_version_id": row.latest_version_id,
                     "is_rfc_latest": row.latest_version_is_rfc.unwrap_or(false),
-                    "cover_abstract": cover_abstract,
-                    "patch_subjects_joined": limit_text(&patch_subjects_joined, 20_000),
+                    "cover_abstract": limit_text(&cover_abstract, 2_000),
+                    "patch_subjects_joined": limit_text(&patch_subjects_joined, 8_000),
                     "route": format!("/series/{}", row.id),
                 })
             })
@@ -296,7 +317,7 @@ impl SearchStore {
                 SELECT
                     tm.mailing_list_id,
                     tm.thread_id,
-                    STRING_AGG(nexus_safe_prefix(mb.search_text, 400), ' ' ORDER BY tm.sort_key) AS snippet_corpus,
+                    STRING_AGG(nexus_safe_prefix(mb.search_text, 160), ' ' ORDER BY tm.sort_key) AS snippet_corpus,
                     BOOL_OR(mb.has_diff) AS has_diff
                 FROM thread_messages tm
                 JOIN targets t
@@ -345,12 +366,12 @@ impl SearchStore {
                 let participants = row.participants;
                 let (date_utc, date_ts, year, month) = split_date(Some(row.last_activity_at));
                 let participants_joined = participants.join(" ");
-                let snippet_corpus =
-                    limit_text(row.snippet_corpus.as_deref().unwrap_or(""), 24_000);
+                let snippet_corpus = limit_text(row.snippet_corpus.as_deref().unwrap_or(""), 8_000);
                 let snippet = snippet_from_text(Some(snippet_corpus.as_str()), 320);
                 json!({
                     "id": row.id,
                     "scope": "thread",
+                    "schema_rev": 2,
                     "title": subject.clone(),
                     "subject": subject,
                     "snippet": snippet,
@@ -371,6 +392,85 @@ impl SearchStore {
                     "snippet_corpus": snippet_corpus,
                     "has_diff": row.has_diff.unwrap_or(false),
                     "route": format!("/lists/{list_key}/threads/{}", row.id),
+                })
+            })
+            .collect())
+    }
+
+    pub async fn build_patch_series_metadata_docs(
+        &self,
+        ids: &[i64],
+    ) -> Result<Vec<serde_json::Value>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let rows = sqlx::query_as::<_, PatchSeriesMetadataDocRow>(
+            r#"SELECT
+                ps.id,
+                psv.version_num AS latest_version_num,
+                psv.id AS latest_version_id,
+                psv.is_rfc AS latest_version_is_rfc
+            FROM patch_series ps
+            LEFT JOIN patch_series_versions psv
+              ON psv.id = ps.latest_version_id
+            WHERE ps.id = ANY($1)
+            ORDER BY ps.id ASC"#,
+        )
+        .bind(ids)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                json!({
+                    "id": row.id,
+                    "latest_version_num": row.latest_version_num.unwrap_or(1),
+                    "latest_version_id": row.latest_version_id,
+                    "is_rfc_latest": row.latest_version_is_rfc.unwrap_or(false),
+                })
+            })
+            .collect())
+    }
+
+    pub async fn build_thread_metadata_docs(&self, ids: &[i64]) -> Result<Vec<serde_json::Value>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let rows = sqlx::query_as::<_, ThreadMetadataDocRow>(
+            r#"SELECT
+                t.id,
+                ml.list_key,
+                t.created_at,
+                t.last_activity_at,
+                t.message_count,
+                starter_msg.from_name AS starter_name,
+                starter_msg.from_email AS starter_email
+            FROM threads t
+            JOIN mailing_lists ml
+              ON ml.id = t.mailing_list_id
+            LEFT JOIN messages starter_msg
+              ON starter_msg.id = t.root_message_pk
+            WHERE t.id = ANY($1)
+            ORDER BY t.id ASC"#,
+        )
+        .bind(ids)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                json!({
+                    "id": row.id,
+                    "list_key": row.list_key,
+                    "created_at": row.created_at.to_rfc3339(),
+                    "last_activity_at": row.last_activity_at.to_rfc3339(),
+                    "message_count": row.message_count,
+                    "starter_name": row.starter_name,
+                    "starter_email": row.starter_email,
                 })
             })
             .collect())

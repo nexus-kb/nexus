@@ -20,7 +20,11 @@ impl Db {
                 Box::pin(async move {
                     // Most worker queries are short-lived and high-frequency; disabling JIT avoids
                     // paying compile overhead repeatedly for large, parameterized plans.
-                    sqlx::query("SET jit = off").execute(conn).await?;
+                    sqlx::query("SET jit = off").execute(&mut *conn).await?;
+                    // Pin session timezone so date bucketing and timestamp casts are always UTC.
+                    sqlx::query("SET TIME ZONE 'UTC'")
+                        .execute(&mut *conn)
+                        .await?;
                     Ok(())
                 })
             })

@@ -99,11 +99,21 @@ const RANKING_RULES_DEFAULT: &[&str] = &[
     "exactness",
 ];
 
+const RANKING_RULES_SORT_FIRST: &[&str] = &[
+    "sort",
+    "words",
+    "typo",
+    "proximity",
+    "attribute",
+    "exactness",
+];
+
 const PATCH_ITEM_DOCS_SPEC: MeiliIndexSpec = MeiliIndexSpec {
     uid: "patch_item_docs",
     primary_key: "id",
     searchable_attributes: &["subject", "commit_subject", "file_paths", "diff_search"],
     filterable_attributes: &[
+        "id",
         "list_keys",
         "author_email",
         "has_diff",
@@ -115,7 +125,7 @@ const PATCH_ITEM_DOCS_SPEC: MeiliIndexSpec = MeiliIndexSpec {
         "year",
         "month",
     ],
-    sortable_attributes: &["date_ts", "ordinal"],
+    sortable_attributes: &["date_ts", "id", "ordinal"],
     displayed_attributes: &[
         "id",
         "scope",
@@ -153,6 +163,7 @@ const PATCH_SERIES_DOCS_SPEC: MeiliIndexSpec = MeiliIndexSpec {
         "patch_subjects_joined",
     ],
     filterable_attributes: &[
+        "id",
         "list_keys",
         "author_email",
         "has_diff",
@@ -161,7 +172,7 @@ const PATCH_SERIES_DOCS_SPEC: MeiliIndexSpec = MeiliIndexSpec {
         "year",
         "month",
     ],
-    sortable_attributes: &["date_ts"],
+    sortable_attributes: &["date_ts", "id"],
     displayed_attributes: &[
         "id",
         "scope",
@@ -178,7 +189,7 @@ const PATCH_SERIES_DOCS_SPEC: MeiliIndexSpec = MeiliIndexSpec {
         "is_rfc_latest",
         "route",
     ],
-    ranking_rules: RANKING_RULES_DEFAULT,
+    ranking_rules: RANKING_RULES_SORT_FIRST,
     default_facets: &["list_keys", "author_email", "has_diff"],
     highlight_attributes: &[
         "canonical_subject",
@@ -195,6 +206,7 @@ const THREAD_DOCS_SPEC: MeiliIndexSpec = MeiliIndexSpec {
     primary_key: "id",
     searchable_attributes: &["subject", "participants_joined", "snippet_corpus"],
     filterable_attributes: &[
+        "id",
         "list_keys",
         "author_emails",
         "has_diff",
@@ -202,7 +214,7 @@ const THREAD_DOCS_SPEC: MeiliIndexSpec = MeiliIndexSpec {
         "year",
         "month",
     ],
-    sortable_attributes: &["date_ts"],
+    sortable_attributes: &["date_ts", "id"],
     displayed_attributes: &[
         "id",
         "scope",
@@ -223,7 +235,7 @@ const THREAD_DOCS_SPEC: MeiliIndexSpec = MeiliIndexSpec {
         "has_diff",
         "route",
     ],
-    ranking_rules: RANKING_RULES_DEFAULT,
+    ranking_rules: RANKING_RULES_SORT_FIRST,
     default_facets: &["list_keys", "author_emails", "has_diff"],
     highlight_attributes: &["subject", "participants_joined", "snippet_corpus"],
     crop_attributes: &["snippet_corpus"],

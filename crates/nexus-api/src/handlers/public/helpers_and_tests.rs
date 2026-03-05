@@ -95,6 +95,10 @@ pub(super) fn encode_search_cursor(offset: usize, request_hash: &str) -> String 
     format!("o{offset}-h{request_hash}")
 }
 
+pub(super) fn encode_date_desc_search_cursor(date_ts: i64, id: i64, request_hash: &str) -> String {
+    format!("d{date_ts}-i{id}-h{request_hash}")
+}
+
 pub(super) fn parse_search_cursor(raw: &str) -> Option<(usize, String)> {
     let mut parts = raw.split("-h");
     let offset_part = parts.next()?;
@@ -107,6 +111,29 @@ pub(super) fn parse_search_cursor(raw: &str) -> Option<(usize, String)> {
         return None;
     }
     Some((offset, hash_part.to_string()))
+}
+
+pub(super) fn parse_date_desc_search_cursor(raw: &str) -> Option<(i64, i64, String)> {
+    let mut parts = raw.split("-h");
+    let prefix_part = parts.next()?;
+    let hash_part = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if hash_part.is_empty() {
+        return None;
+    }
+
+    let mut prefix_parts = prefix_part.split("-i");
+    let ts_part = prefix_parts.next()?;
+    let id_part = prefix_parts.next()?;
+    if prefix_parts.next().is_some() {
+        return None;
+    }
+
+    let date_ts = ts_part.strip_prefix('d')?.parse::<i64>().ok()?;
+    let id = id_part.parse::<i64>().ok()?;
+    Some((date_ts, id, hash_part.to_string()))
 }
 
 pub(super) fn escape_filter_value(raw: &str) -> String {
@@ -427,10 +454,10 @@ mod tests {
     use nexus_db::SeriesLogicalCompareRow;
 
     use super::{
-        SearchRequestHashInput, build_page_info, encode_search_cursor, hybrid_requested,
-        if_none_match_matches, normalize_limit, parse_search_cursor, parse_timestamp,
-        parse_window_days, search_request_hash, slice_by_offsets, strip_quoted_lines,
-        to_patch_compare_rows,
+        SearchRequestHashInput, build_page_info, encode_date_desc_search_cursor,
+        encode_search_cursor, hybrid_requested, if_none_match_matches, normalize_limit,
+        parse_date_desc_search_cursor, parse_search_cursor, parse_timestamp, parse_window_days,
+        search_request_hash, slice_by_offsets, strip_quoted_lines, to_patch_compare_rows,
     };
 
     #[test]
@@ -538,6 +565,15 @@ mod tests {
         let decoded = parse_search_cursor(&encoded).expect("decode");
         assert_eq!(decoded.0, 40);
         assert_eq!(decoded.1, "abcd1234");
+    }
+
+    #[test]
+    fn date_desc_search_cursor_round_trip() {
+        let encoded = encode_date_desc_search_cursor(1_706_000_000, 42, "abcd1234");
+        let decoded = parse_date_desc_search_cursor(&encoded).expect("decode");
+        assert_eq!(decoded.0, 1_706_000_000);
+        assert_eq!(decoded.1, 42);
+        assert_eq!(decoded.2, "abcd1234");
     }
 
     #[test]

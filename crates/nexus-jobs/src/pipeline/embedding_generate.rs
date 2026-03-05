@@ -331,6 +331,34 @@ impl Phase0JobHandler {
         Ok(())
     }
 
+    pub async fn ensure_search_indexes_ready(&self) -> Result<(), MeiliClientError> {
+        for index in [
+            MeiliIndexKind::ThreadDocs,
+            MeiliIndexKind::PatchSeriesDocs,
+            MeiliIndexKind::PatchItemDocs,
+        ] {
+            let index_spec = index.spec();
+            let settings = self.meili_index_settings(index);
+            let mut current_settings = self.meili.get_settings(index_spec.uid).await?;
+            if current_settings.is_none() {
+                if let Some(task_uid) = self.meili.ensure_index_exists(index_spec).await? {
+                    self.wait_for_task_no_context(task_uid).await?;
+                }
+                current_settings = self.meili.get_settings(index_spec.uid).await?;
+            }
+
+            if settings_differ(current_settings.as_ref(), &settings) {
+                let task_uid = self
+                    .meili
+                    .update_settings(index_spec.uid, &settings)
+                    .await?;
+                self.wait_for_task_no_context(task_uid).await?;
+            }
+        }
+
+        Ok(())
+    }
+
     pub(super) async fn ensure_index_exists_only(
         &self,
         index_spec: &'static nexus_core::search::MeiliIndexSpec,
@@ -404,6 +432,33 @@ impl Phase0JobHandler {
                 }
             }
             let _ = ctx.heartbeat().await;
+            let task = self.meili.get_task(task_uid).await?;
+            match task.status.as_str() {
+                "enqueued" | "processing" => {
+                    sleep(Duration::from_millis(300)).await;
+                }
+                "succeeded" => return Ok(()),
+                "failed" | "canceled" => {
+                    let code = task.error_code.unwrap_or_else(|| "unknown".to_string());
+                    let message = task
+                        .error_message
+                        .unwrap_or_else(|| "unknown meili task failure".to_string());
+                    return Err(MeiliClientError::Protocol(format!(
+                        "task status={} code={} message={}",
+                        task.status, code, message
+                    )));
+                }
+                other => {
+                    return Err(MeiliClientError::Protocol(format!(
+                        "unexpected task status: {other}"
+                    )));
+                }
+            }
+        }
+    }
+
+    async fn wait_for_task_no_context(&self, task_uid: i64) -> Result<(), MeiliClientError> {
+        loop {
             let task = self.meili.get_task(task_uid).await?;
             match task.status.as_str() {
                 "enqueued" | "processing" => {

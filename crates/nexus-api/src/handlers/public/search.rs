@@ -79,21 +79,46 @@ pub async fn search(
             None
         },
     });
-    let offset = if let Some(cursor) = query.cursor.as_deref() {
-        let (offset, cursor_hash) = parse_search_cursor(cursor).ok_or_else(|| {
-            ApiError::validation("invalid cursor format")
-                .with_invalid_param("cursor", "expected opaque search cursor token")
-        })?;
-        if cursor_hash != request_hash {
-            return Err(
-                ApiError::validation("cursor does not match request filters")
-                    .with_invalid_param("cursor", "cursor must be used with unchanged query shape"),
-            );
+    let mut offset = 0usize;
+    let mut date_desc_cursor: Option<(i64, i64)> = None;
+    if let Some(cursor) = query.cursor.as_deref() {
+        match sort {
+            "date_desc" => {
+                let (cursor_ts, cursor_id, cursor_hash) = parse_date_desc_search_cursor(cursor)
+                    .ok_or_else(|| {
+                        ApiError::validation("invalid cursor format")
+                            .with_invalid_param("cursor", "expected opaque search cursor token")
+                    })?;
+                if cursor_hash != request_hash {
+                    return Err(
+                        ApiError::validation("cursor does not match request filters")
+                            .with_invalid_param(
+                                "cursor",
+                                "cursor must be used with unchanged query shape",
+                            ),
+                    );
+                }
+                date_desc_cursor = Some((cursor_ts, cursor_id));
+            }
+            _ => {
+                let (parsed_offset, cursor_hash) =
+                    parse_search_cursor(cursor).ok_or_else(|| {
+                        ApiError::validation("invalid cursor format")
+                            .with_invalid_param("cursor", "expected opaque search cursor token")
+                    })?;
+                if cursor_hash != request_hash {
+                    return Err(
+                        ApiError::validation("cursor does not match request filters")
+                            .with_invalid_param(
+                                "cursor",
+                                "cursor must be used with unchanged query shape",
+                            ),
+                    );
+                }
+                offset = parsed_offset;
+            }
         }
-        offset
-    } else {
-        0
-    };
+    }
 
     let mut filters: Vec<String> = Vec::new();
     if let Some(list_key) = query.list_key.as_deref() {
@@ -115,25 +140,38 @@ pub async fn search(
     if let Some(to_ts) = to_ts {
         filters.push(format!("date_ts < {}", to_ts.timestamp()));
     }
+    if let Some((cursor_ts, cursor_id)) = date_desc_cursor {
+        filters.push(format!(
+            "(date_ts < {cursor_ts} OR (date_ts = {cursor_ts} AND id < {cursor_id}))"
+        ));
+    }
+
+    let fetch_limit = if sort == "date_desc" {
+        limit.saturating_add(1)
+    } else {
+        limit
+    };
 
     let mut request_body = json!({
         "q": q,
-        "offset": offset,
-        "limit": limit,
+        "limit": fetch_limit,
         "facets": spec.default_facets,
         "attributesToHighlight": spec.highlight_attributes,
         "attributesToCrop": spec.crop_attributes,
         "cropLength": spec.crop_length
     });
+    if sort != "date_desc" {
+        request_body["offset"] = json!(offset);
+    }
     if !filters.is_empty() {
-        if let Some(filter) = filters.first() {
-            request_body["filter"] = Value::String(filter.clone());
+        if filters.len() == 1 {
+            request_body["filter"] = Value::String(filters[0].clone());
         } else {
             request_body["filter"] = json!(filters);
         }
     }
     if sort == "date_desc" {
-        request_body["sort"] = json!(["date_ts:desc"]);
+        request_body["sort"] = json!(["date_ts:desc", "id:desc"]);
     }
     if hybrid_enabled {
         let vector = match compute_or_get_query_embedding(&state, scope, q).await {
@@ -182,52 +220,67 @@ pub async fn search(
         .and_then(|value| usize::try_from(value).ok())
         .unwrap_or(0);
 
-    let hits = payload
+    let mut hits = payload
         .get("hits")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let mut has_more_date_desc = false;
+    if sort == "date_desc" && hits.len() > limit_usize {
+        hits.truncate(limit_usize);
+        has_more_date_desc = true;
+    }
 
-    let should_hydrate_thread_metadata = scope == SearchScope::Thread
-        && hits.iter().any(|hit| {
-            hit.get("message_count").is_none()
-                || hit.get("created_at").is_none()
-                || hit.get("last_activity_at").is_none()
-                || hit.get("starter_email").is_none()
-        });
-    let should_hydrate_series_metadata = scope == SearchScope::Series
-        && hits.iter().any(|hit| {
-            hit.get("latest_version_num").is_none() || hit.get("is_rfc_latest").is_none()
-        });
+    let mut fallback_ids: Vec<i64> = match scope {
+        SearchScope::Thread => hits
+            .iter()
+            .filter_map(|hit| {
+                let id = hit.get("id").and_then(Value::as_i64)?;
+                let missing_metadata = hit.get("message_count").is_none()
+                    || hit.get("created_at").is_none()
+                    || hit.get("last_activity_at").is_none()
+                    || hit.get("starter_email").is_none()
+                    || hit.get("list_key").is_none();
+                if missing_metadata { Some(id) } else { None }
+            })
+            .collect(),
+        SearchScope::Series => hits
+            .iter()
+            .filter_map(|hit| {
+                let id = hit.get("id").and_then(Value::as_i64)?;
+                let missing_metadata =
+                    hit.get("latest_version_num").is_none() || hit.get("is_rfc_latest").is_none();
+                if missing_metadata { Some(id) } else { None }
+            })
+            .collect(),
+        SearchScope::PatchItem => Vec::new(),
+    };
+    fallback_ids.sort_unstable();
+    fallback_ids.dedup();
 
-    let fallback_docs_by_id: HashMap<i64, Value> =
-        if should_hydrate_thread_metadata || should_hydrate_series_metadata {
-            let hit_ids: Vec<i64> = hits
-                .iter()
-                .filter_map(|hit| hit.get("id").and_then(Value::as_i64))
-                .collect();
-            if hit_ids.is_empty() {
-                HashMap::new()
-            } else {
-                let search_store = SearchStore::new(state.db.pool().clone());
-                let docs = if should_hydrate_thread_metadata {
-                    search_store.build_thread_docs(&hit_ids).await
-                } else {
-                    search_store.build_patch_series_docs(&hit_ids).await
-                }
-                .map_err(|_| ApiError::internal("failed to hydrate fallback search metadata"))?;
-
-                docs.into_iter()
-                    .filter_map(|doc| doc.get("id").and_then(Value::as_i64).map(|id| (id, doc)))
-                    .collect()
+    let fallback_docs_by_id: HashMap<i64, Value> = if fallback_ids.is_empty() {
+        HashMap::new()
+    } else {
+        let search_store = SearchStore::new(state.db.pool().clone());
+        let docs = match scope {
+            SearchScope::Thread => search_store.build_thread_metadata_docs(&fallback_ids).await,
+            SearchScope::Series => {
+                search_store
+                    .build_patch_series_metadata_docs(&fallback_ids)
+                    .await
             }
-        } else {
-            HashMap::new()
-        };
+            SearchScope::PatchItem => Ok(Vec::new()),
+        }
+        .map_err(|_| ApiError::internal("failed to hydrate fallback search metadata"))?;
+
+        docs.into_iter()
+            .filter_map(|doc| doc.get("id").and_then(Value::as_i64).map(|id| (id, doc)))
+            .collect()
+    };
 
     let mut items = Vec::with_capacity(hits.len());
     let mut highlights = BTreeMap::new();
-    for hit in hits {
+    for hit in &hits {
         let Some(id) = hit.get("id").and_then(Value::as_i64) else {
             continue;
         };
@@ -347,11 +400,23 @@ pub async fn search(
             .unwrap_or_else(|| json!({})),
         spec.author_filter_field,
     );
-    let next_offset = offset.saturating_add(items.len());
-    let next_cursor = if !items.is_empty() && next_offset < total_hits {
-        Some(encode_search_cursor(next_offset, &request_hash))
+    let next_cursor = if sort == "date_desc" {
+        if has_more_date_desc {
+            hits.last().and_then(|hit| {
+                let date_ts = hit.get("date_ts").and_then(Value::as_i64)?;
+                let id = hit.get("id").and_then(Value::as_i64)?;
+                Some(encode_date_desc_search_cursor(date_ts, id, &request_hash))
+            })
+        } else {
+            None
+        }
     } else {
-        None
+        let next_offset = offset.saturating_add(items.len());
+        if !items.is_empty() && next_offset < total_hits {
+            Some(encode_search_cursor(next_offset, &request_hash))
+        } else {
+            None
+        }
     };
 
     json_response_with_cache(

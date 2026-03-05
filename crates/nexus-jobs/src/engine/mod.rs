@@ -126,6 +126,14 @@ impl Phase0Worker {
         let mut listener = self.db.listener().await?;
         listener.listen("nexus_jobs").await?;
 
+        if let Err(err) = self.handler.ensure_search_indexes_ready().await {
+            warn!(
+                worker_id = %self.worker_id,
+                error = %err,
+                "failed to sync meili search index settings at startup"
+            );
+        }
+
         let mut poll_tick = interval(Duration::from_millis(self.cfg.poll_ms));
         poll_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
