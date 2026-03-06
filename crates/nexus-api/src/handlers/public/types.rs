@@ -337,6 +337,8 @@ pub struct SeriesAuthorResponse {
 pub struct SeriesThreadRefResponse {
     pub list_key: String,
     pub thread_id: i64,
+    pub message_count: i64,
+    pub last_activity_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]

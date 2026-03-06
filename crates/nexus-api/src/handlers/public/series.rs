@@ -122,6 +122,8 @@ pub async fn series_detail(
                     vec![SeriesThreadRefResponse {
                         list_key: thread.list_key,
                         thread_id: thread.thread_id,
+                        message_count: thread.message_count,
+                        last_activity_at: thread.last_activity_at,
                     }]
                 })
                 .unwrap_or_default(),

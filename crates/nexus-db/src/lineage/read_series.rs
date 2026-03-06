@@ -189,7 +189,9 @@ impl LineageStore {
         sqlx::query_as::<_, ThreadRefRecord>(
             r#"SELECT
                 t.id AS thread_id,
-                ml.list_key
+                ml.list_key,
+                t.message_count::bigint AS message_count,
+                t.last_activity_at
             FROM threads t
             JOIN mailing_lists ml
               ON ml.id = t.mailing_list_id

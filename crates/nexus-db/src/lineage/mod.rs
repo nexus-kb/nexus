@@ -391,6 +391,8 @@ pub struct SeriesVersionSummaryRecord {
 pub struct ThreadRefRecord {
     pub thread_id: i64,
     pub list_key: String,
+    pub message_count: i64,
+    pub last_activity_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
