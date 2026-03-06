@@ -348,6 +348,8 @@ pub struct SeriesVersionSummaryResponse {
     pub is_rfc: bool,
     pub is_resend: bool,
     pub sent_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_commit: Option<String>,
     pub cover_message_id: Option<i64>,
     pub thread_refs: Vec<SeriesThreadRefResponse>,
     pub patch_count: i64,
@@ -405,6 +407,8 @@ pub struct SeriesVersionResponse {
     pub sent_at: DateTime<Utc>,
     pub subject: String,
     pub subject_norm: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_commit: Option<String>,
     pub cover_message_id: Option<i64>,
     pub first_patch_message_id: Option<i64>,
     pub assembled: bool,

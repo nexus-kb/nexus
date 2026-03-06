@@ -155,6 +155,7 @@ impl LineageStore {
                 psv.sent_at,
                 psv.subject_raw,
                 psv.subject_norm,
+                psv.base_commit,
                 COUNT(*) FILTER (WHERE pi.item_type = 'patch') AS patch_count
             FROM patch_series_versions psv
             LEFT JOIN patch_items pi
@@ -173,7 +174,8 @@ impl LineageStore {
                 psv.first_patch_message_pk,
                 psv.sent_at,
                 psv.subject_raw,
-                psv.subject_norm
+                psv.subject_norm,
+                psv.base_commit
             ORDER BY psv.version_num ASC, psv.sent_at ASC, psv.id ASC"#,
         )
         .bind(patch_series_id)

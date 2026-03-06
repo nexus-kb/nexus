@@ -384,6 +384,7 @@ pub struct SeriesVersionSummaryRecord {
     pub sent_at: DateTime<Utc>,
     pub subject_raw: String,
     pub subject_norm: String,
+    pub base_commit: Option<String>,
     pub patch_count: i64,
 }
 
