@@ -305,7 +305,7 @@ pub async fn search(
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let snippet = extract_snippet(&hit, spec.crop_attributes);
+        let snippet = extract_snippet(hit, spec.crop_attributes);
         let author_email = hit
             .get("author_email")
             .and_then(Value::as_str)
