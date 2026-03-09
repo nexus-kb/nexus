@@ -87,7 +87,7 @@ pub struct RetryDecision {
 
 #[derive(Debug, Clone)]
 pub enum RetryJobResult {
-    Updated(Job),
+    Updated(Box<Job>),
     RunningConflict,
     NotFound,
 }
@@ -317,7 +317,7 @@ impl JobStore {
         .await?;
 
         tx.commit().await?;
-        Ok(RetryJobResult::Updated(job))
+        Ok(RetryJobResult::Updated(Box::new(job)))
     }
 
     pub async fn promote_ready_jobs(&self) -> Result<u64> {

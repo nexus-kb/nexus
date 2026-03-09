@@ -376,16 +376,17 @@ const ADMIN_OPERATIONS: &[OperationDef] = &[
         Some("ActionResponse"),
         None,
     ),
-    op_admin_with_errors(
-        "/admin/v1/jobs/{job_id}/retry",
-        "post",
-        "Retry job",
-        "Jobs",
-        "200",
-        Some("ActionResponse"),
-        None,
-        &["409"],
-    ),
+    OperationDef {
+        path: "/admin/v1/jobs/{job_id}/retry",
+        method: "post",
+        summary: "Retry job",
+        tag: "Jobs",
+        success_status: "200",
+        success_schema: Some("ActionResponse"),
+        request_schema: None,
+        admin_security: true,
+        extra_problem_statuses: &["409"],
+    },
     op_admin(
         "/admin/v1/diagnostics/queue",
         "get",
@@ -563,29 +564,6 @@ const fn op_admin(
         request_schema,
         admin_security: true,
         extra_problem_statuses: &[],
-    }
-}
-
-const fn op_admin_with_errors(
-    path: &'static str,
-    method: &'static str,
-    summary: &'static str,
-    tag: &'static str,
-    success_status: &'static str,
-    success_schema: Option<&'static str>,
-    request_schema: Option<&'static str>,
-    extra_problem_statuses: &'static [&'static str],
-) -> OperationDef {
-    OperationDef {
-        path,
-        method,
-        summary,
-        tag,
-        success_status,
-        success_schema,
-        request_schema,
-        admin_security: true,
-        extra_problem_statuses,
     }
 }
 
