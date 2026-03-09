@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{future::pending, time::Duration};
 
 use chrono::Utc;
 use nexus_core::config::Settings;
@@ -139,24 +139,47 @@ impl Phase0Worker {
 
         let mut sweep_tick = interval(Duration::from_millis(self.cfg.sweep_ms));
         sweep_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut inflight = JoinSet::new();
+        let mut inflight_count = 0usize;
 
         info!(worker_id = %self.worker_id, "phase0 worker started");
+        self.run_maintenance().await?;
+        self.drain_once(&mut inflight, &mut inflight_count).await?;
 
         loop {
             tokio::select! {
                 _ = poll_tick.tick() => {
-                    self.drain_once().await?;
+                    self.drain_once(&mut inflight, &mut inflight_count).await?;
                 }
                 _ = sweep_tick.tick() => {
                     self.run_maintenance().await?;
                 }
                 _ = listener.recv() => {
-                    self.drain_once().await?;
+                    self.drain_once(&mut inflight, &mut inflight_count).await?;
+                }
+                result = async {
+                    match inflight.join_next().await {
+                        Some(result) => result,
+                        None => pending().await,
+                    }
+                }, if inflight_count > 0 => {
+                    inflight_count = inflight_count.saturating_sub(1);
+                    if let Err(err) = result {
+                        error!(error = %err, "job task failed");
+                    }
+                    self.drain_once(&mut inflight, &mut inflight_count).await?;
                 }
                 _ = tokio::signal::ctrl_c() => {
                     info!("phase0 worker received shutdown signal");
                     break;
                 }
+            }
+        }
+
+        while let Some(result) = inflight.join_next().await {
+            inflight_count = inflight_count.saturating_sub(1);
+            if let Err(err) = result {
+                error!(error = %err, "job task failed");
             }
         }
 
@@ -187,10 +210,19 @@ impl Phase0Worker {
         Ok(())
     }
 
-    async fn drain_once(&self) -> Result<(), sqlx::Error> {
+    async fn drain_once(
+        &self,
+        inflight: &mut JoinSet<()>,
+        inflight_count: &mut usize,
+    ) -> Result<(), sqlx::Error> {
         self.jobs.promote_ready_jobs().await?;
-        let max_inflight_i64 = i64::try_from(self.cfg.max_inflight_jobs).unwrap_or(i64::MAX);
-        let claim_limit = self.cfg.claim_batch.max(1).min(max_inflight_i64);
+        let available_slots = self.cfg.max_inflight_jobs.saturating_sub(*inflight_count);
+        if available_slots == 0 {
+            return Ok(());
+        }
+
+        let available_slots_i64 = i64::try_from(available_slots).unwrap_or(i64::MAX);
+        let claim_limit = self.cfg.claim_batch.max(1).min(available_slots_i64);
         let claimed = self
             .jobs
             .claim_jobs(claim_limit, &self.worker_id, self.cfg.lease_ms)
@@ -200,30 +232,12 @@ impl Phase0Worker {
             return Ok(());
         }
 
-        let mut joinset = JoinSet::new();
-        let mut iter = claimed.into_iter();
-
-        for _ in 0..self.cfg.max_inflight_jobs {
-            let Some(job) = iter.next() else {
-                break;
-            };
+        for job in claimed {
             let worker = self.clone();
-            joinset.spawn(async move {
+            inflight.spawn(async move {
                 worker.process_job(job).await;
             });
-        }
-
-        while let Some(result) = joinset.join_next().await {
-            if let Err(err) = result {
-                error!(error = %err, "job task failed");
-            }
-
-            if let Some(job) = iter.next() {
-                let worker = self.clone();
-                joinset.spawn(async move {
-                    worker.process_job(job).await;
-                });
-            }
+            *inflight_count += 1;
         }
 
         Ok(())
