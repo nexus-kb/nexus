@@ -5,6 +5,9 @@ use utoipa::ToSchema;
 
 use crate::{Job, JobState, Result};
 
+const UNIQUE_VIOLATION_SQLSTATE: &str = "23505";
+const RUNNING_ATTEMPT_CONSTRAINT: &str = "idx_job_attempts_one_running_per_job";
+
 #[derive(Debug, Clone)]
 pub struct EnqueueJobParams {
     pub job_type: String,
@@ -80,6 +83,13 @@ pub struct RetryDecision {
     pub reason: String,
     pub kind: String,
     pub run_after: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub enum RetryJobResult {
+    Updated(Job),
+    RunningConflict,
+    NotFound,
 }
 
 #[derive(Clone)]
@@ -266,8 +276,29 @@ impl JobStore {
         .await
     }
 
-    pub async fn retry(&self, job_id: i64, run_after: DateTime<Utc>) -> Result<Option<Job>> {
-        sqlx::query_as::<_, Job>(
+    pub async fn retry(&self, job_id: i64, run_after: DateTime<Utc>) -> Result<RetryJobResult> {
+        let mut tx = self.pool.begin().await?;
+        let state = sqlx::query_scalar::<_, JobState>(
+            r#"SELECT state
+            FROM jobs
+            WHERE id = $1
+            FOR UPDATE"#,
+        )
+        .bind(job_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some(state) = state else {
+            tx.rollback().await?;
+            return Ok(RetryJobResult::NotFound);
+        };
+
+        if state == JobState::Running {
+            tx.rollback().await?;
+            return Ok(RetryJobResult::RunningConflict);
+        }
+
+        let job = sqlx::query_as::<_, Job>(
             r#"UPDATE jobs
             SET state = CASE WHEN $2 > now() THEN 'scheduled'::job_state ELSE 'queued'::job_state END,
                 run_after = $2,
@@ -282,8 +313,11 @@ impl JobStore {
         )
         .bind(job_id)
         .bind(run_after)
-        .fetch_optional(&self.pool)
-        .await
+        .fetch_one(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(RetryJobResult::Updated(job))
     }
 
     pub async fn promote_ready_jobs(&self) -> Result<u64> {
@@ -665,6 +699,16 @@ impl JobStore {
     }
 }
 
+pub fn is_running_attempt_unique_violation(err: &sqlx::Error) -> bool {
+    match err {
+        sqlx::Error::Database(db_err) => {
+            db_err.code().as_deref() == Some(UNIQUE_VIOLATION_SQLSTATE)
+                && db_err.constraint() == Some(RUNNING_ATTEMPT_CONSTRAINT)
+        }
+        _ => false,
+    }
+}
+
 fn clamp_attempt_limit(limit: i64) -> i64 {
     limit.clamp(1, 200)
 }
@@ -679,7 +723,12 @@ fn clamp_running_limit(limit: i64) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{clamp_attempt_limit, clamp_job_type_limit, clamp_running_limit};
+    use chrono::Utc;
+    use nexus_core::config::DatabaseConfig;
+
+    use crate::Db;
+
+    use super::{RetryJobResult, clamp_attempt_limit, clamp_job_type_limit, clamp_running_limit};
 
     #[test]
     fn attempt_limit_is_clamped() {
@@ -701,5 +750,136 @@ mod tests {
         assert_eq!(clamp_running_limit(0), 1);
         assert_eq!(clamp_running_limit(25), 25);
         assert_eq!(clamp_running_limit(1000), 200);
+    }
+
+    #[tokio::test]
+    async fn retry_rejects_running_jobs() -> Result<(), Box<dyn std::error::Error>> {
+        let Ok(database_url) = std::env::var("NEXUS_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+
+        let db = Db::connect(&DatabaseConfig {
+            url: database_url,
+            max_connections: 4,
+        })
+        .await?;
+        db.migrate().await?;
+
+        let jobs = super::JobStore::new(db.pool().clone());
+        let unique = Utc::now().timestamp_nanos_opt().unwrap_or_default();
+        let job = jobs
+            .enqueue(super::EnqueueJobParams {
+                job_type: "test_retry_running_conflict".to_string(),
+                payload_json: serde_json::json!({ "test": unique }),
+                priority: 1,
+                dedupe_scope: Some(format!("tests:{unique}")),
+                dedupe_key: Some("retry-conflict".to_string()),
+                run_after: None,
+                max_attempts: Some(3),
+            })
+            .await?;
+
+        sqlx::query(
+            r#"UPDATE jobs
+            SET state = 'running',
+                claimed_by = 'test-worker',
+                lease_until = now() + interval '30 seconds',
+                attempt = 1
+            WHERE id = $1"#,
+        )
+        .bind(job.id)
+        .execute(db.pool())
+        .await?;
+
+        let result = jobs.retry(job.id, Utc::now()).await?;
+        assert!(matches!(result, RetryJobResult::RunningConflict));
+
+        sqlx::query("DELETE FROM jobs WHERE id = $1")
+            .bind(job.id)
+            .execute(db.pool())
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn running_attempt_is_closed_when_job_requeues_from_running()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Ok(database_url) = std::env::var("NEXUS_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+
+        let db = Db::connect(&DatabaseConfig {
+            url: database_url,
+            max_connections: 4,
+        })
+        .await?;
+        db.migrate().await?;
+
+        let jobs = super::JobStore::new(db.pool().clone());
+        let unique = Utc::now().timestamp_nanos_opt().unwrap_or_default();
+        let job = jobs
+            .enqueue(super::EnqueueJobParams {
+                job_type: "test_requeue_attempt_finalization".to_string(),
+                payload_json: serde_json::json!({ "test": unique }),
+                priority: 1,
+                dedupe_scope: Some(format!("tests:{unique}")),
+                dedupe_key: Some("requeue-attempt-finalization".to_string()),
+                run_after: None,
+                max_attempts: Some(4),
+            })
+            .await?;
+
+        sqlx::query(
+            r#"UPDATE jobs
+            SET state = 'running',
+                claimed_by = 'test-worker',
+                lease_until = now() - interval '2 minutes',
+                attempt = 1,
+                last_error = NULL,
+                last_error_kind = NULL
+            WHERE id = $1"#,
+        )
+        .bind(job.id)
+        .execute(db.pool())
+        .await?;
+        sqlx::query(
+            r#"INSERT INTO job_attempts (job_id, attempt, status)
+            VALUES ($1, 1, 'running')"#,
+        )
+        .bind(job.id)
+        .execute(db.pool())
+        .await?;
+
+        let (requeued, terminal) = jobs.requeue_stuck_jobs().await?;
+        assert_eq!(requeued, 1);
+        assert_eq!(terminal, 0);
+
+        let first_attempt: super::JobAttempt = sqlx::query_as(
+            r#"SELECT id, job_id, attempt, started_at, finished_at, status, error, metrics_json
+            FROM job_attempts
+            WHERE job_id = $1 AND attempt = 1"#,
+        )
+        .bind(job.id)
+        .fetch_one(db.pool())
+        .await?;
+        assert_eq!(first_attempt.status, "failed");
+        assert!(first_attempt.finished_at.is_some());
+        assert_eq!(first_attempt.error.as_deref(), Some("lease expired"));
+
+        let claimed = jobs.claim_jobs(1, "test-worker-2", 45_000).await?;
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].id, job.id);
+        assert_eq!(claimed[0].attempt, 2);
+
+        let second_attempt = jobs.start_attempt(job.id, claimed[0].attempt).await?;
+        assert_eq!(second_attempt.attempt, 2);
+
+        sqlx::query("DELETE FROM jobs WHERE id = $1")
+            .bind(job.id)
+            .execute(db.pool())
+            .await?;
+
+        Ok(())
     }
 }

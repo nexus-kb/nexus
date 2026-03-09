@@ -129,6 +129,7 @@ struct OperationDef {
     success_schema: Option<&'static str>,
     request_schema: Option<&'static str>,
     admin_security: bool,
+    extra_problem_statuses: &'static [&'static str],
 }
 
 const PUBLIC_OPERATIONS: &[OperationDef] = &[
@@ -375,7 +376,7 @@ const ADMIN_OPERATIONS: &[OperationDef] = &[
         Some("ActionResponse"),
         None,
     ),
-    op_admin(
+    op_admin_with_errors(
         "/admin/v1/jobs/{job_id}/retry",
         "post",
         "Retry job",
@@ -383,6 +384,7 @@ const ADMIN_OPERATIONS: &[OperationDef] = &[
         "200",
         Some("ActionResponse"),
         None,
+        &["409"],
     ),
     op_admin(
         "/admin/v1/diagnostics/queue",
@@ -538,6 +540,7 @@ const fn op(
         success_schema,
         request_schema: None,
         admin_security: false,
+        extra_problem_statuses: &[],
     }
 }
 
@@ -559,6 +562,30 @@ const fn op_admin(
         success_schema,
         request_schema,
         admin_security: true,
+        extra_problem_statuses: &[],
+    }
+}
+
+const fn op_admin_with_errors(
+    path: &'static str,
+    method: &'static str,
+    summary: &'static str,
+    tag: &'static str,
+    success_status: &'static str,
+    success_schema: Option<&'static str>,
+    request_schema: Option<&'static str>,
+    extra_problem_statuses: &'static [&'static str],
+) -> OperationDef {
+    OperationDef {
+        path,
+        method,
+        summary,
+        tag,
+        success_status,
+        success_schema,
+        request_schema,
+        admin_security: true,
+        extra_problem_statuses,
     }
 }
 
@@ -636,13 +663,17 @@ fn operation_request_body(schema_name: &str) -> RequestBody {
 }
 
 fn operation_responses(op: &OperationDef) -> Responses {
-    Responses::from_iter([
-        (
-            op.success_status.to_string(),
-            operation_success_response(op.success_schema),
-        ),
-        ("default".to_string(), operation_default_problem_response()),
-    ])
+    let mut responses = vec![(
+        op.success_status.to_string(),
+        operation_success_response(op.success_schema),
+    )];
+    responses.extend(
+        op.extra_problem_statuses
+            .iter()
+            .map(|status| (status.to_string(), operation_default_problem_response())),
+    );
+    responses.push(("default".to_string(), operation_default_problem_response()));
+    Responses::from_iter(responses)
 }
 
 fn operation_success_response(schema_name: Option<&str>) -> Response {
@@ -711,5 +742,15 @@ mod tests {
             .get_path_operation("/admin/v1/jobs", HttpMethod::Get)
             .expect("admin jobs path must exist");
         assert!(operation.security.is_some());
+    }
+
+    #[test]
+    fn admin_retry_job_documents_conflict_response() {
+        let doc = admin_openapi();
+        let operation = doc
+            .paths
+            .get_path_operation("/admin/v1/jobs/{job_id}/retry", HttpMethod::Post)
+            .expect("retry job path must exist");
+        assert!(operation.responses.responses.contains_key("409"));
     }
 }

@@ -27,7 +27,8 @@ pub use crate::ingest::{
 };
 pub use crate::jobs::{
     EnqueueJobParams, JobAttempt, JobStateCount, JobStore, JobStoreMetrics, JobTypeStateCount,
-    ListJobsParams, RetryDecision, RunningJobSnapshot,
+    ListJobsParams, RetryDecision, RetryJobResult, RunningJobSnapshot,
+    is_running_attempt_unique_violation,
 };
 pub use crate::lineage::{
     AssembledItemRecord, LineageSourceMessage, LineageStore, ListThreadsParams, MessageBodyRecord,

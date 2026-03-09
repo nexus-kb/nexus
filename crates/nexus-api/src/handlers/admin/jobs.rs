@@ -1,4 +1,5 @@
 use super::*;
+use nexus_db::RetryJobResult;
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct EnqueueRequest {
@@ -254,16 +255,152 @@ pub async fn retry_job(
     State(state): State<ApiState>,
     AxumPath(job_id): AxumPath<i64>,
 ) -> HandlerResult<Json<ActionResponse>> {
-    let changed = state
+    match state
         .jobs
         .retry(job_id, Utc::now())
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?
-        .is_some();
+    {
+        RetryJobResult::Updated(_) => Ok(Json(ActionResponse { ok: true })),
+        RetryJobResult::NotFound => Err(axum::http::StatusCode::NOT_FOUND.into()),
+        RetryJobResult::RunningConflict => Err(ApiError::from(axum::http::StatusCode::CONFLICT)
+            .with_detail("cannot retry a running job; wait for it to leave running state")),
+    }
+}
 
-    if !changed {
-        return Err(axum::http::StatusCode::NOT_FOUND.into());
+#[cfg(test)]
+mod tests {
+    use axum::Json;
+    use axum::extract::{Path as AxumPath, State};
+    use axum::response::IntoResponse;
+    use nexus_core::config::{
+        AdminConfig, AppConfig, DatabaseConfig, EmbeddingsConfig, MailConfig, MeiliConfig,
+        Settings, WorkerConfig,
+    };
+    use nexus_db::{Db, EnqueueJobParams, JobState};
+
+    use crate::state::ApiState;
+
+    use super::{ActionResponse, retry_job};
+
+    fn test_settings(database_url: String) -> Settings {
+        Settings {
+            database: DatabaseConfig {
+                url: database_url,
+                max_connections: 4,
+            },
+            app: AppConfig::default(),
+            admin: AdminConfig::default(),
+            mail: MailConfig::default(),
+            meili: MeiliConfig::default(),
+            embeddings: EmbeddingsConfig::default(),
+            worker: WorkerConfig::default(),
+        }
     }
 
-    Ok(Json(ActionResponse { ok: true }))
+    #[tokio::test]
+    async fn retry_job_returns_conflict_for_running_jobs() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let Ok(database_url) = std::env::var("NEXUS_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+
+        let settings = test_settings(database_url);
+        let db = Db::connect(&settings.database).await?;
+        db.migrate().await?;
+        let state = ApiState::new(settings, db.clone());
+
+        let unique = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+        let job = state
+            .jobs
+            .enqueue(EnqueueJobParams {
+                job_type: "test_api_retry_running_conflict".to_string(),
+                payload_json: serde_json::json!({ "test": unique }),
+                priority: 1,
+                dedupe_scope: Some(format!("tests:{unique}")),
+                dedupe_key: Some("api-retry-conflict".to_string()),
+                run_after: None,
+                max_attempts: Some(3),
+            })
+            .await?;
+
+        sqlx::query(
+            r#"UPDATE jobs
+            SET state = 'running',
+                claimed_by = 'test-worker',
+                lease_until = now() + interval '30 seconds',
+                attempt = 1
+            WHERE id = $1"#,
+        )
+        .bind(job.id)
+        .execute(state.db.pool())
+        .await?;
+
+        let result = retry_job(State(state.clone()), AxumPath(job.id)).await;
+        let err = result.expect_err("running job retry should conflict");
+        let response = err.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+
+        sqlx::query("DELETE FROM jobs WHERE id = $1")
+            .bind(job.id)
+            .execute(state.db.pool())
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retry_job_requeues_non_running_jobs() -> Result<(), Box<dyn std::error::Error>> {
+        let Ok(database_url) = std::env::var("NEXUS_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+
+        let settings = test_settings(database_url);
+        let db = Db::connect(&settings.database).await?;
+        db.migrate().await?;
+        let state = ApiState::new(settings, db.clone());
+
+        let unique = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+        let job = state
+            .jobs
+            .enqueue(EnqueueJobParams {
+                job_type: "test_api_retry_non_running".to_string(),
+                payload_json: serde_json::json!({ "test": unique }),
+                priority: 1,
+                dedupe_scope: Some(format!("tests:{unique}")),
+                dedupe_key: Some("api-retry-success".to_string()),
+                run_after: None,
+                max_attempts: Some(3),
+            })
+            .await?;
+
+        sqlx::query(
+            r#"UPDATE jobs
+            SET state = 'failed_retryable',
+                run_after = now() + interval '5 minutes',
+                last_error = 'transient failure',
+                last_error_kind = 'db'
+            WHERE id = $1"#,
+        )
+        .bind(job.id)
+        .execute(state.db.pool())
+        .await?;
+
+        let Json(ActionResponse { ok }) = retry_job(State(state.clone()), AxumPath(job.id))
+            .await
+            .expect("non-running retry should succeed");
+        assert!(ok);
+
+        let updated = state.jobs.get(job.id).await?.expect("job must exist");
+        assert_eq!(updated.state, JobState::Queued);
+        assert!(updated.last_error.is_none());
+        assert!(updated.last_error_kind.is_none());
+
+        sqlx::query("DELETE FROM jobs WHERE id = $1")
+            .bind(job.id)
+            .execute(state.db.pool())
+            .await?;
+
+        Ok(())
+    }
 }

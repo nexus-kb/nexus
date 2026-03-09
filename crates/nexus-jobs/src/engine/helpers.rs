@@ -1,4 +1,5 @@
 use super::*;
+use nexus_db::is_running_attempt_unique_violation;
 
 pub(super) fn is_pipeline_job_type(job_type: &str) -> bool {
     matches!(
@@ -186,7 +187,7 @@ pub(super) fn truncate_for_log(value: &str, max_chars: usize) -> String {
 
 pub(super) async fn finalize_job(
     jobs: &JobStore,
-    settings: &Settings,
+    _settings: &Settings,
     job: &Job,
     outcome: &JobExecutionOutcome,
     attempt_id: i64,
@@ -263,24 +264,87 @@ pub(super) async fn finalize_job(
         }
     }
 
-    // Keep `scheduled` jobs moving if this finalization happened during a long processing window.
-    let _ = jobs.promote_ready_jobs().await;
+    Ok(())
+}
 
-    // If all retries are consumed and the state remained retryable due race, clamp to terminal.
-    if let Some(updated_job) = jobs.get(job.id).await?
-        && updated_job.state == JobState::FailedRetryable
-        && updated_job.attempt >= updated_job.max_attempts
-    {
-        jobs.mark_terminal(job.id, "max attempts reached", "transient")
-            .await?;
+pub(super) async fn finalize_job_without_attempt(
+    jobs: &JobStore,
+    job: &Job,
+    outcome: &JobExecutionOutcome,
+) -> Result<(), sqlx::Error> {
+    match outcome {
+        JobExecutionOutcome::Success { result_json, .. } => {
+            jobs.mark_succeeded(job.id, Some(result_json.clone()))
+                .await?;
+        }
+        JobExecutionOutcome::Cancelled { reason, .. } => {
+            jobs.mark_cancelled(job.id, reason).await?;
+        }
+        JobExecutionOutcome::Terminal { reason, kind, .. } => {
+            jobs.mark_terminal(job.id, reason, kind).await?;
+        }
+        JobExecutionOutcome::Retryable {
+            reason,
+            kind,
+            backoff_ms,
+            ..
+        } => {
+            if job.attempt >= job.max_attempts {
+                jobs.mark_terminal(job.id, reason, kind).await?;
+            } else {
+                let backoff_ms_i64 = i64::try_from((*backoff_ms).max(1)).unwrap_or(i64::MAX);
+                let run_after = Utc::now() + chrono::Duration::milliseconds(backoff_ms_i64);
+
+                jobs.mark_retryable(
+                    job.id,
+                    RetryDecision {
+                        reason: reason.clone(),
+                        kind: kind.clone(),
+                        run_after,
+                    },
+                )
+                .await?;
+            }
+        }
     }
 
-    // Keep backoff policy deterministic for calls that rely on worker defaults.
-    let _ = nexus_db::JobStore::compute_backoff(
+    Ok(())
+}
+
+pub(super) fn start_attempt_failure_outcome(
+    settings: &Settings,
+    job: &Job,
+    err: &sqlx::Error,
+) -> JobExecutionOutcome {
+    let metrics = JobStoreMetrics {
+        duration_ms: 0,
+        rows_written: 0,
+        bytes_read: 0,
+        commit_count: 0,
+        parse_errors: 0,
+    };
+
+    if is_running_attempt_unique_violation(err) {
+        return JobExecutionOutcome::Terminal {
+            reason: format!(
+                "failed to start job attempt: stale running attempt row blocks retry: {err}"
+            ),
+            kind: "queue_state".to_string(),
+            metrics,
+        };
+    }
+
+    let backoff = JobStore::compute_backoff(
         settings.worker.base_backoff_ms,
         settings.worker.max_backoff_ms,
-        attempt,
+        job.attempt,
     );
+    let backoff_ms = u64::try_from(backoff.num_milliseconds().max(1)).unwrap_or(1);
 
-    Ok(())
+    JobExecutionOutcome::Retryable {
+        reason: format!("failed to start job attempt: {err}"),
+        kind: "db".to_string(),
+        backoff_ms,
+        metrics,
+    }
 }

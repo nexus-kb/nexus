@@ -3,8 +3,8 @@ use std::time::Duration;
 use chrono::Utc;
 use nexus_core::config::Settings;
 use nexus_db::{
-    CatalogStore, Db, EmbeddingsStore, IngestStore, Job, JobState, JobStore, JobStoreMetrics,
-    LineageStore, PipelineStore, RetryDecision, SearchStore, ThreadingStore,
+    CatalogStore, Db, EmbeddingsStore, IngestStore, Job, JobStore, JobStoreMetrics, LineageStore,
+    PipelineStore, RetryDecision, SearchStore, ThreadingStore,
 };
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
@@ -234,6 +234,27 @@ impl Phase0Worker {
             Ok(v) => v,
             Err(err) => {
                 error!(job_id = job.id, error = %err, "failed to start job attempt");
+                let outcome = start_attempt_failure_outcome(&self.settings, &job, &err);
+                if let Err(finalize_err) =
+                    finalize_job_without_attempt(&self.jobs, &job, &outcome).await
+                {
+                    error!(
+                        job_id = job.id,
+                        error = %finalize_err,
+                        "failed to finalize job after start attempt error"
+                    );
+                    return;
+                }
+                if let Err(pipeline_err) =
+                    self.finalize_pipeline_run_if_needed(&job, &outcome).await
+                {
+                    error!(
+                        job_id = job.id,
+                        error = %pipeline_err,
+                        "failed to finalize pipeline run after start attempt error"
+                    );
+                }
+                log_job_attempt_completion(&job, &outcome);
                 return;
             }
         };
