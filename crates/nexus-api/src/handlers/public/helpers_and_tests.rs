@@ -525,6 +525,18 @@ mod tests {
     }
 
     #[test]
+    fn metadata_cache_window_is_capped_to_one_hour() {
+        assert_eq!(
+            super::super::CACHE_THREAD,
+            "public, max-age=300, stale-while-revalidate=3600"
+        );
+        assert_eq!(
+            super::super::CACHE_LONG,
+            "public, max-age=86400, stale-while-revalidate=604800"
+        );
+    }
+
+    #[test]
     fn patch_compare_filters_non_patch_rows() {
         let rows = vec![
             SeriesLogicalCompareRow {

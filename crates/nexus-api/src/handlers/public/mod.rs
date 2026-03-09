@@ -37,6 +37,6 @@ use types::*;
 
 type HandlerResult<T> = Result<T, ApiError>;
 
-const CACHE_THREAD: &str = "public, max-age=300, stale-while-revalidate=86400";
+const CACHE_THREAD: &str = "public, max-age=300, stale-while-revalidate=3600";
 const CACHE_LONG: &str = "public, max-age=86400, stale-while-revalidate=604800";
 const CACHE_SEARCH: &str = "public, max-age=30, stale-while-revalidate=300";
