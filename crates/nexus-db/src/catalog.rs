@@ -260,6 +260,37 @@ impl CatalogStore {
             .await
     }
 
+    pub async fn list_mailing_lists_compact(
+        &self,
+        limit: i64,
+        cursor_list_key: Option<&str>,
+    ) -> Result<Vec<ListCatalogItemRecord>> {
+        let limit = limit.clamp(1, 500);
+        let mut qb: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
+            r#"SELECT
+                ml.list_key,
+                ml.description,
+                ml.posting_address,
+                NULL::timestamptz AS latest_activity_at,
+                0::bigint AS thread_count_30d,
+                0::bigint AS message_count_30d
+            FROM mailing_lists ml
+            WHERE ml.active = true"#,
+        );
+
+        if let Some(cursor_list_key) = cursor_list_key {
+            qb.push(" AND ml.list_key > ");
+            qb.push_bind(cursor_list_key);
+        }
+
+        qb.push(" ORDER BY ml.list_key ASC LIMIT ");
+        qb.push_bind(limit);
+
+        qb.build_query_as::<ListCatalogItemRecord>()
+            .fetch_all(&self.pool)
+            .await
+    }
+
     pub async fn get_mailing_list_detail(
         &self,
         list_key: &str,

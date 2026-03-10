@@ -12,11 +12,13 @@ pub struct PageInfoResponse {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-pub struct CursorQuery {
+pub struct ListCatalogQuery {
     #[serde(default)]
     pub limit: Option<i64>,
     #[serde(default)]
     pub cursor: Option<String>,
+    #[serde(default)]
+    pub view: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]

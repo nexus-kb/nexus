@@ -3,7 +3,7 @@ use super::*;
 pub async fn list_catalog(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Query(query): Query<CursorQuery>,
+    Query(query): Query<ListCatalogQuery>,
 ) -> HandlerResult<Response> {
     let limit = normalize_limit(query.limit, 50, 200);
     let cursor_list_key = if let Some(raw) = query.cursor.as_deref() {
@@ -17,11 +17,23 @@ pub async fn list_catalog(
         None
     };
 
-    let mut rows = state
-        .catalog
-        .list_mailing_lists(limit + 1, cursor_list_key.as_deref())
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let compact_view = match query.view.as_deref() {
+        None | Some("") | Some("default") => false,
+        Some("compact") => true,
+        Some(_) => return Err(StatusCode::UNPROCESSABLE_ENTITY.into()),
+    };
+    let mut rows = if compact_view {
+        state
+            .catalog
+            .list_mailing_lists_compact(limit + 1, cursor_list_key.as_deref())
+            .await
+    } else {
+        state
+            .catalog
+            .list_mailing_lists(limit + 1, cursor_list_key.as_deref())
+            .await
+    }
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let limit_usize = limit_to_usize(limit);
     let has_more = rows.len() > limit_usize;
     if has_more {
