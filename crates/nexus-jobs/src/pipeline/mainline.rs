@@ -907,16 +907,16 @@ fn resolve_ref_oid(repo: &gix::Repository, ref_name: &str) -> anyhow::Result<Str
 
 fn collect_release_tags(repo: &gix::Repository) -> anyhow::Result<Vec<ReleaseTag>> {
     let mut tags = Vec::new();
-    for reference in repo.references()?.tags()?.peeled() {
+    for reference in repo.references()?.tags()? {
         let reference = reference.map_err(anyhow::Error::msg)?;
         let tag_name = reference.name().shorten().to_str_lossy().to_string();
         let Some(parsed) = parse_kernel_tag(&tag_name) else {
             continue;
         };
         let target_oid = reference
-            .try_id()
-            .map(|id| id.detach())
-            .ok_or_else(|| anyhow::anyhow!("peeled tag {tag_name} did not resolve to an object id"))?;
+            .into_fully_peeled_id()
+            .with_context(|| format!("failed to fully peel tag {tag_name}"))?
+            .detach();
         tags.push(ReleaseTag {
             name: tag_name,
             target_oid,
