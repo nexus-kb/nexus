@@ -41,9 +41,8 @@ pub async fn start_mainline_scan(
             .with_detail("mainline repo path is not configured"));
     }
     if !Path::new(repo_path).exists() {
-        return Err(ApiError::from(axum::http::StatusCode::CONFLICT).with_detail(format!(
-            "mainline repo path does not exist: {repo_path}"
-        )));
+        return Err(ApiError::from(axum::http::StatusCode::CONFLICT)
+            .with_detail(format!("mainline repo path does not exist: {repo_path}")));
     }
 
     let repo_key = format!("mainline:{repo_path}");
@@ -65,8 +64,11 @@ pub async fn start_mainline_scan(
             .await
             .map_err(|_| ApiError::internal("failed to check active pipeline runs"))?;
         if active_pipeline.is_some() {
-            return Err(ApiError::from(axum::http::StatusCode::CONFLICT)
-                .with_detail("cannot start bootstrap mainline scan while a pipeline run is active"));
+            return Err(
+                ApiError::from(axum::http::StatusCode::CONFLICT).with_detail(
+                    "cannot start bootstrap mainline scan while a pipeline run is active",
+                ),
+            );
         }
     }
 
@@ -114,7 +116,10 @@ pub async fn start_mainline_scan(
         Err(err) => {
             let _ = state
                 .mainline
-                .mark_run_failed(run.id, format!("failed to enqueue mainline_scan_run: {err}").as_str())
+                .mark_run_failed(
+                    run.id,
+                    format!("failed to enqueue mainline_scan_run: {err}").as_str(),
+                )
                 .await;
             return Err(ApiError::internal("failed to enqueue mainline scan job"));
         }
@@ -246,7 +251,10 @@ pub async fn cancel_mainline_scan_run(
     Ok(Json(ActionResponse { ok: true }))
 }
 
-async fn resolve_head_commit_oid(repo_path: &str, ref_name: &str) -> Result<String, std::io::Error> {
+async fn resolve_head_commit_oid(
+    repo_path: &str,
+    ref_name: &str,
+) -> Result<String, std::io::Error> {
     let repo = gix::open(repo_path)
         .map_err(|err| std::io::Error::other(format!("failed to open repo: {err}")))?;
     let reference = repo

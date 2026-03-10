@@ -236,14 +236,16 @@ pub async fn series_version(
             deletions: item.deletions,
             hunks: item.hunk_count,
             inherited_from_version_num: item.inherited_from_version_num,
-            mainline_commit: item.mainline_commit_oid.map(|commit_id| MainlineCommitResponse {
-                commit_id,
-                merged_in_tag: item.mainline_merged_in_tag,
-                merged_in_release: item.mainline_merged_in_release,
-                match_method: item
-                    .mainline_match_method
-                    .unwrap_or_else(|| "patch_id".to_string()),
-            }),
+            mainline_commit: item
+                .mainline_commit_oid
+                .map(|commit_id| MainlineCommitResponse {
+                    commit_id,
+                    merged_in_tag: item.mainline_merged_in_tag,
+                    merged_in_release: item.mainline_merged_in_release,
+                    match_method: item
+                        .mainline_match_method
+                        .unwrap_or_else(|| "patch_id".to_string()),
+                }),
         })
         .collect::<Vec<_>>();
 
@@ -293,7 +295,10 @@ async fn ensure_mainline_filter_ready(
         .get_state(&repo_key)
         .await
         .map_err(|_| ApiError::internal("failed to load mainline filter readiness"))?;
-    if scan_state.as_ref().is_some_and(|scan_state| scan_state.public_filter_ready) {
+    if scan_state
+        .as_ref()
+        .is_some_and(|scan_state| scan_state.public_filter_ready)
+    {
         return Ok(());
     }
 

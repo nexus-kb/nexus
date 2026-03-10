@@ -11,11 +11,10 @@ use nexus_core::embeddings::{EmbeddingsClientError, OpenAiEmbeddingsClient};
 use nexus_core::search::MeiliIndexKind;
 use nexus_db::{
     BackfillProgressUpdate, CatalogStore, EmbeddingVectorUpsert, EmbeddingsStore, EnqueueJobParams,
-    IngestCommitRow, IngestStore, Job, JobStore, JobStoreMetrics, LineageStore, MainlineStore,
-    MailingListRepo, ParsedBodyInput, ParsedMessageInput, ParsedPatchFactsInput,
-    ParsedPatchFileFactInput, PipelineStore, SearchStore, ThreadComponentWrite,
-    ThreadMessageWrite, ThreadNodeWrite, ThreadSummaryWrite, ThreadingApplyStats,
-    ThreadingRunContext, ThreadingStore,
+    IngestCommitRow, IngestStore, Job, JobStore, JobStoreMetrics, LineageStore, MailingListRepo,
+    MainlineStore, ParsedBodyInput, ParsedMessageInput, ParsedPatchFactsInput,
+    ParsedPatchFileFactInput, PipelineStore, SearchStore, ThreadComponentWrite, ThreadMessageWrite,
+    ThreadNodeWrite, ThreadSummaryWrite, ThreadingApplyStats, ThreadingRunContext, ThreadingStore,
 };
 use once_cell::sync::Lazy;
 use regex::Regex;

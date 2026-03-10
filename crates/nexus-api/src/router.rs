@@ -80,7 +80,10 @@ pub fn build_router(state: ApiState) -> Router {
         )
         .route("/mainline/scan", post(admin::start_mainline_scan))
         .route("/mainline/scans", get(admin::list_mainline_scan_runs))
-        .route("/mainline/scans/{run_id}", get(admin::get_mainline_scan_run))
+        .route(
+            "/mainline/scans/{run_id}",
+            get(admin::get_mainline_scan_run),
+        )
         .route(
             "/mainline/scans/{run_id}/cancel",
             post(admin::cancel_mainline_scan_run),

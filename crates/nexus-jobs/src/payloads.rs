@@ -108,8 +108,7 @@ pub struct MainlineScanRunPayload {
 mod tests {
     use super::{
         EmbeddingGenerateBatchPayload, EmbeddingScope, MainlineScanRunPayload,
-        MeiliBootstrapRunPayload,
-        MeiliBootstrapScope,
+        MeiliBootstrapRunPayload, MeiliBootstrapScope,
     };
 
     #[test]

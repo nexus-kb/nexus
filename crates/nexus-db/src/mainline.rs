@@ -500,7 +500,10 @@ impl MainlineStore {
             return Ok(());
         }
 
-        let patch_item_ids = matches.iter().map(|item| item.patch_item_id).collect::<Vec<_>>();
+        let patch_item_ids = matches
+            .iter()
+            .map(|item| item.patch_item_id)
+            .collect::<Vec<_>>();
         sqlx::query(
             "UPDATE patch_item_mainline_matches SET is_canonical = false WHERE patch_item_id = ANY($1)",
         )
@@ -543,10 +546,7 @@ impl MainlineStore {
         .await
     }
 
-    pub async fn recompute_rollups(
-        &self,
-        series_ids: &[i64],
-    ) -> Result<Vec<SeriesMergeSummary>> {
+    pub async fn recompute_rollups(&self, series_ids: &[i64]) -> Result<Vec<SeriesMergeSummary>> {
         if series_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -604,7 +604,9 @@ impl MainlineStore {
                 entry.matched_patch_count += 1;
                 entry.matched_commit_oids.push(commit_oid);
                 if let Some(sort_key) = row.first_tag_sort_key
-                    && entry.best_tag_sort_key.is_none_or(|existing| sort_key > existing)
+                    && entry
+                        .best_tag_sort_key
+                        .is_none_or(|existing| sort_key > existing)
                 {
                     entry.best_tag_sort_key = Some(sort_key);
                     entry.merged_in_tag = row.first_containing_tag.clone();
@@ -622,20 +624,20 @@ impl MainlineStore {
 
         let mut version_summaries = Vec::with_capacity(version_accumulators.len());
         for (version_id, accumulator) in &version_accumulators {
-            let state = if accumulator.total_patch_count == 0 || accumulator.matched_patch_count == 0 {
-                "unmerged"
-            } else if accumulator.matched_patch_count >= accumulator.total_patch_count {
-                "merged"
-            } else {
-                "partial"
-            };
-            let single_patch_commit_oid = if accumulator.total_patch_count == 1
-                && accumulator.matched_patch_count == 1
-            {
-                accumulator.matched_commit_oids.first().cloned()
-            } else {
-                None
-            };
+            let state =
+                if accumulator.total_patch_count == 0 || accumulator.matched_patch_count == 0 {
+                    "unmerged"
+                } else if accumulator.matched_patch_count >= accumulator.total_patch_count {
+                    "merged"
+                } else {
+                    "partial"
+                };
+            let single_patch_commit_oid =
+                if accumulator.total_patch_count == 1 && accumulator.matched_patch_count == 1 {
+                    accumulator.matched_commit_oids.first().cloned()
+                } else {
+                    None
+                };
             version_summaries.push(VersionMergeSummary {
                 version_id: *version_id,
                 patch_series_id: accumulator.patch_series_id,
@@ -738,8 +740,12 @@ impl MainlineStore {
                     SeriesMergeSummary {
                         patch_series_id,
                         state: "unmerged".to_string(),
-                        matched_patch_count: selected.map(|summary| summary.matched_patch_count).unwrap_or(0),
-                        total_patch_count: selected.map(|summary| summary.total_patch_count).unwrap_or(0),
+                        matched_patch_count: selected
+                            .map(|summary| summary.matched_patch_count)
+                            .unwrap_or(0),
+                        total_patch_count: selected
+                            .map(|summary| summary.total_patch_count)
+                            .unwrap_or(0),
                         merged_in_tag: None,
                         merged_in_release: None,
                         single_patch_commit_oid: None,

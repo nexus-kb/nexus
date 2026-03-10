@@ -198,7 +198,13 @@ const PATCH_SERIES_DOCS_SPEC: MeiliIndexSpec = MeiliIndexSpec {
         "route",
     ],
     ranking_rules: RANKING_RULES_SORT_FIRST,
-    default_facets: &["list_keys", "author_email", "has_diff", "is_merged", "merge_state"],
+    default_facets: &[
+        "list_keys",
+        "author_email",
+        "has_diff",
+        "is_merged",
+        "merge_state",
+    ],
     highlight_attributes: &[
         "canonical_subject",
         "cover_abstract",

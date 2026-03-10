@@ -22,8 +22,10 @@ pub async fn search(
     };
     let spec = scope.index_kind().spec();
     if query.merged.is_some() && scope != SearchScope::Series {
-        return Err(ApiError::validation("merged filter is supported only for scope=series")
-            .with_invalid_param("merged", "expected scope=series"));
+        return Err(
+            ApiError::validation("merged filter is supported only for scope=series")
+                .with_invalid_param("merged", "expected scope=series"),
+        );
     }
     ensure_mainline_search_filter_ready(&state, scope, query.merged).await?;
 
@@ -456,7 +458,10 @@ async fn ensure_mainline_search_filter_ready(
         .get_state(&repo_key)
         .await
         .map_err(|_| ApiError::internal("failed to load mainline filter readiness"))?;
-    if scan_state.as_ref().is_some_and(|scan_state| scan_state.public_filter_ready) {
+    if scan_state
+        .as_ref()
+        .is_some_and(|scan_state| scan_state.public_filter_ready)
+    {
         return Ok(());
     }
 

@@ -179,7 +179,11 @@ impl Phase0JobHandler {
             };
         }
 
-        let state = match self.mainline.ensure_state(&run.repo_key, &run.ref_name).await {
+        let state = match self
+            .mainline
+            .ensure_state(&run.repo_key, &run.ref_name)
+            .await
+        {
             Ok(value) => value,
             Err(err) => {
                 return retryable_error(
@@ -193,7 +197,10 @@ impl Phase0JobHandler {
         };
 
         if run.mode == "bootstrap"
-            && let Err(err) = self.mainline.set_public_filter_ready(&run.repo_key, false).await
+            && let Err(err) = self
+                .mainline
+                .set_public_filter_ready(&run.repo_key, false)
+                .await
         {
             return retryable_error(
                 format!("failed to reset mainline public filter readiness: {err}"),
@@ -331,7 +338,10 @@ impl Phase0JobHandler {
             }
             match ctx.is_cancel_requested().await {
                 Ok(true) => {
-                    let _ = self.mainline.mark_run_cancelled(run.id, "cancel requested").await;
+                    let _ = self
+                        .mainline
+                        .mark_run_cancelled(run.id, "cancel requested")
+                        .await;
                     return JobExecutionOutcome::Cancelled {
                         reason: "cancel requested".to_string(),
                         metrics: JobStoreMetrics {
@@ -610,7 +620,11 @@ impl Phase0JobHandler {
             "scan_parallelism": scan_parallelism,
             "commit_window_size": chunk_size,
         });
-        if let Err(err) = self.mainline.mark_run_succeeded(run.id, result_json.clone()).await {
+        if let Err(err) = self
+            .mainline
+            .mark_run_succeeded(run.id, result_json.clone())
+            .await
+        {
             return retryable_error(
                 format!("failed to mark mainline scan run succeeded: {err}"),
                 "db",
@@ -692,10 +706,12 @@ impl Phase0JobHandler {
 
         let mut candidate_patch_item_ids = BTreeSet::new();
         for candidates in link_candidates_by_message_id.values() {
-            candidate_patch_item_ids.extend(candidates.iter().map(|candidate| candidate.patch_item_id));
+            candidate_patch_item_ids
+                .extend(candidates.iter().map(|candidate| candidate.patch_item_id));
         }
         for candidates in patch_candidates_by_patch_id.values() {
-            candidate_patch_item_ids.extend(candidates.iter().map(|candidate| candidate.patch_item_id));
+            candidate_patch_item_ids
+                .extend(candidates.iter().map(|candidate| candidate.patch_item_id));
         }
         let existing_canonical_ids = self
             .mainline
@@ -710,6 +726,7 @@ impl Phase0JobHandler {
         let mut patch_matches = Vec::new();
         let mut matched_commit_oids = BTreeSet::new();
         let mut affected_series_ids = BTreeSet::new();
+        let mut claimed_patch_item_ids = HashSet::new();
 
         for prepared_commit in prepared {
             let link_matches = collect_link_matches(
@@ -733,12 +750,14 @@ impl Phase0JobHandler {
 
             let mut commit_matches = BTreeMap::new();
             for (candidate, matched_message_id) in link_matches {
-                commit_matches.entry(candidate.patch_item_id).or_insert(CommitMatch {
-                    patch_item_id: candidate.patch_item_id,
-                    patch_series_id: candidate.patch_series_id,
-                    match_method: "link".to_string(),
-                    matched_message_id: Some(matched_message_id),
-                });
+                commit_matches
+                    .entry(candidate.patch_item_id)
+                    .or_insert(CommitMatch {
+                        patch_item_id: candidate.patch_item_id,
+                        patch_series_id: candidate.patch_series_id,
+                        match_method: "link".to_string(),
+                        matched_message_id: Some(matched_message_id),
+                    });
             }
             for candidate in patch_id_matches {
                 commit_matches
@@ -751,10 +770,11 @@ impl Phase0JobHandler {
                     });
             }
 
-            let filtered_matches = commit_matches
-                .into_values()
-                .filter(|matched| !existing_canonical_ids.contains(&matched.patch_item_id))
-                .collect::<Vec<_>>();
+            let filtered_matches = filter_new_canonical_matches(
+                commit_matches.into_values().collect(),
+                &existing_canonical_ids,
+                &claimed_patch_item_ids,
+            );
             if filtered_matches.is_empty() {
                 continue;
             }
@@ -777,6 +797,7 @@ impl Phase0JobHandler {
             matched_commit_oids.insert(commit_oid.clone());
 
             for matched in filtered_matches {
+                claimed_patch_item_ids.insert(matched.patch_item_id);
                 affected_series_ids.insert(matched.patch_series_id);
                 patch_matches.push(nexus_db::CanonicalPatchMatchInput {
                     patch_item_id: matched.patch_item_id,
@@ -844,7 +865,12 @@ fn prepare_mainline_scan(
     let mut walk = repo
         .rev_walk([ObjectId::from_hex(head_commit_oid.as_bytes())?])
         .sorting(gix::traverse::commit::simple::Sorting::ByCommitTimeNewestFirst)
-        .selected(|oid| since_commit_oid.as_ref().map(|stop| stop.as_ref() != oid).unwrap_or(true))?;
+        .selected(|oid| {
+            since_commit_oid
+                .as_ref()
+                .map(|stop| stop.as_ref() != oid)
+                .unwrap_or(true)
+        })?;
 
     while let Some(info) = walk.next() {
         if cancel_flag.load(Ordering::Relaxed) {
@@ -865,7 +891,10 @@ fn prepare_mainline_scan(
         left_ts.cmp(right_ts).then_with(|| left_oid.cmp(right_oid))
     });
 
-    let commit_oids = commit_rows.into_iter().map(|(_, oid)| oid).collect::<Vec<_>>();
+    let commit_oids = commit_rows
+        .into_iter()
+        .map(|(_, oid)| oid)
+        .collect::<Vec<_>>();
     let commit_targets = commit_oids.iter().copied().collect::<HashSet<_>>();
     let release_tags = collect_release_tags(&repo)?;
     prep_progress
@@ -881,7 +910,9 @@ fn prepare_mainline_scan(
         &cancel_flag,
         &prep_progress,
     )?;
-    prep_progress.phase.store(PREP_PHASE_DONE, Ordering::Relaxed);
+    prep_progress
+        .phase
+        .store(PREP_PHASE_DONE, Ordering::Relaxed);
 
     Ok(MainlineScanPreparation {
         head_commit_oid,
@@ -974,9 +1005,7 @@ fn assign_release_tags(
             }
             if commit_targets.contains(&commit_oid) {
                 if tag_map.insert(commit_oid, tag_info.clone()).is_none() {
-                    prep_progress
-                        .tagged_commits
-                        .fetch_add(1, Ordering::Relaxed);
+                    prep_progress.tagged_commits.fetch_add(1, Ordering::Relaxed);
                 }
             }
 
@@ -1053,7 +1082,10 @@ async fn load_mainline_commit_batch(
         }
     }
     indexed_records.sort_by_key(|record| record.index);
-    Ok(indexed_records.into_iter().map(|record| record.record).collect())
+    Ok(indexed_records
+        .into_iter()
+        .map(|record| record.record)
+        .collect())
 }
 
 fn load_mainline_commit_partition(
@@ -1185,10 +1217,16 @@ fn append_change_patch(
         return Ok(());
     };
 
-    let old_text = String::from_utf8_lossy(prep.old.data.as_slice().unwrap_or_default()).into_owned();
-    let new_text = String::from_utf8_lossy(prep.new.data.as_slice().unwrap_or_default()).into_owned();
+    let old_text =
+        String::from_utf8_lossy(prep.old.data.as_slice().unwrap_or_default()).into_owned();
+    let new_text =
+        String::from_utf8_lossy(prep.new.data.as_slice().unwrap_or_default()).into_owned();
     let input = imara_diff::intern::InternedInput::new(old_text.as_str(), new_text.as_str());
-    let body = build_unified_diff(DiffAlgorithm::Myers, &input, UnifiedDiffBuilder::new(&input));
+    let body = build_unified_diff(
+        DiffAlgorithm::Myers,
+        &input,
+        UnifiedDiffBuilder::new(&input),
+    );
     if body.trim().is_empty() {
         return Ok(());
     }
@@ -1243,7 +1281,8 @@ fn percent_decode(raw: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut idx = 0usize;
     while idx < bytes.len() {
-        if bytes[idx] == b'%' && idx + 2 < bytes.len()
+        if bytes[idx] == b'%'
+            && idx + 2 < bytes.len()
             && let Ok(value) = u8::from_str_radix(&raw[idx + 1..idx + 3], 16)
         {
             out.push(value);
@@ -1260,7 +1299,12 @@ fn normalize_message_id_token(raw: &str) -> Option<String> {
     let mut value = raw.trim().trim_matches('"').trim_matches('\'').to_string();
     loop {
         let previous = value.clone();
-        value = value.trim().trim_matches('<').trim_matches('>').trim().to_string();
+        value = value
+            .trim()
+            .trim_matches('<')
+            .trim_matches('>')
+            .trim()
+            .to_string();
         if value == previous {
             break;
         }
@@ -1309,7 +1353,9 @@ fn collect_link_matches(
     let mut deduped = BTreeMap::new();
     if unique_subjects.len() <= 1 {
         for (candidate, message_id) in candidates {
-            deduped.entry(candidate.patch_item_id).or_insert((candidate, message_id));
+            deduped
+                .entry(candidate.patch_item_id)
+                .or_insert((candidate, message_id));
         }
         return deduped.into_values().collect();
     }
@@ -1320,7 +1366,9 @@ fn collect_link_matches(
             .as_deref()
             .unwrap_or(candidate.subject_norm.as_str());
         if candidate_subject == subject_norm {
-            deduped.entry(candidate.patch_item_id).or_insert((candidate, message_id));
+            deduped
+                .entry(candidate.patch_item_id)
+                .or_insert((candidate, message_id));
         }
     }
     deduped.into_values().collect()
@@ -1347,6 +1395,20 @@ fn collect_patch_id_matches(
         }
     }
     filtered.into_values().collect()
+}
+
+fn filter_new_canonical_matches(
+    matches: Vec<CommitMatch>,
+    existing_canonical_ids: &HashSet<i64>,
+    claimed_patch_item_ids: &HashSet<i64>,
+) -> Vec<CommitMatch> {
+    matches
+        .into_iter()
+        .filter(|matched| {
+            !existing_canonical_ids.contains(&matched.patch_item_id)
+                && !claimed_patch_item_ids.contains(&matched.patch_item_id)
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1381,7 +1443,9 @@ fn parse_kernel_tag(tag: &str) -> Option<ParsedKernelTag> {
             .name("patch")
             .and_then(|value| value.as_str().parse().ok())
             .unwrap_or(0),
-        rc: captures.name("rc").and_then(|value| value.as_str().parse().ok()),
+        rc: captures
+            .name("rc")
+            .and_then(|value| value.as_str().parse().ok()),
     })
 }
 
@@ -1396,9 +1460,10 @@ fn format_release_tag(major: i64, minor: i64, patch: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        MainlinePatchCandidate, collect_patch_id_matches, extract_link_message_ids,
-        format_release_tag, parse_kernel_tag,
+        CommitMatch, MainlinePatchCandidate, collect_patch_id_matches, extract_link_message_ids,
+        filter_new_canonical_matches, format_release_tag, parse_kernel_tag,
     };
+    use std::collections::HashSet;
 
     #[test]
     fn extracts_and_normalizes_lore_message_ids() {
@@ -1442,7 +1507,8 @@ mod tests {
             subject_norm: "ignored".to_string(),
         };
 
-        let resolved = collect_patch_id_matches(&[matching.clone(), unrelated], "mm: reclaim cleanups");
+        let resolved =
+            collect_patch_id_matches(&[matching.clone(), unrelated], "mm: reclaim cleanups");
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].patch_item_id, matching.patch_item_id);
     }
@@ -1451,5 +1517,29 @@ mod tests {
     fn formats_kernel_release_without_zero_patch() {
         assert_eq!(format_release_tag(6, 9, 0), "v6.9");
         assert_eq!(format_release_tag(6, 9, 3), "v6.9.3");
+    }
+
+    #[test]
+    fn skips_patch_items_already_claimed_in_same_batch() {
+        let existing = HashSet::new();
+        let claimed = HashSet::from([11_i64]);
+        let matches = vec![
+            CommitMatch {
+                patch_item_id: 11,
+                patch_series_id: 21,
+                match_method: "link".to_string(),
+                matched_message_id: Some("one@example.com".to_string()),
+            },
+            CommitMatch {
+                patch_item_id: 12,
+                patch_series_id: 22,
+                match_method: "patch_id".to_string(),
+                matched_message_id: None,
+            },
+        ];
+
+        let filtered = filter_new_canonical_matches(matches, &existing, &claimed);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].patch_item_id, 12);
     }
 }
