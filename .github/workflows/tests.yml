@@ -4,9 +4,11 @@ on:
   pull_request:
     branches:
       - main
+      - release
   push:
     branches:
       - main
+      - release
   workflow_dispatch:
 
 permissions:
@@ -54,7 +56,7 @@ jobs:
     timeout-minutes: 30
     needs:
       - verify
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release')
     permissions:
       contents: read
       packages: write
@@ -84,8 +86,9 @@ jobs:
         with:
           images: ${{ steps.prep.outputs.image_ref }}
           tags: |
-            type=raw,value=latest
-            type=raw,value=main
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=release,enable=${{ github.ref == 'refs/heads/release' }}
             type=sha,format=short,prefix=sha-
 
       - name: Build local image candidate for scan
