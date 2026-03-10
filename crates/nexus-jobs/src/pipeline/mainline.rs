@@ -872,7 +872,7 @@ fn prepare_mainline_scan(
                 .unwrap_or(true)
         })?;
 
-    while let Some(info) = walk.next() {
+    for info in &mut walk {
         if cancel_flag.load(Ordering::Relaxed) {
             anyhow::bail!("mainline scan preparation cancelled");
         }
@@ -1003,10 +1003,10 @@ fn assign_release_tags(
             if !covered.insert(commit_oid) {
                 continue;
             }
-            if commit_targets.contains(&commit_oid) {
-                if tag_map.insert(commit_oid, tag_info.clone()).is_none() {
-                    prep_progress.tagged_commits.fetch_add(1, Ordering::Relaxed);
-                }
+            if commit_targets.contains(&commit_oid)
+                && tag_map.insert(commit_oid, tag_info.clone()).is_none()
+            {
+                prep_progress.tagged_commits.fetch_add(1, Ordering::Relaxed);
             }
 
             let commit = match repo.find_object(commit_oid)?.try_into_commit() {
