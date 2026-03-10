@@ -917,6 +917,14 @@ fn collect_release_tags(repo: &gix::Repository) -> anyhow::Result<Vec<ReleaseTag
             .into_fully_peeled_id()
             .with_context(|| format!("failed to fully peel tag {tag_name}"))?
             .detach();
+        if repo.find_object(target_oid)?.try_into_commit().is_err() {
+            warn!(
+                tag = %tag_name,
+                target_oid = %target_oid,
+                "skipping non-commit kernel release tag"
+            );
+            continue;
+        }
         tags.push(ReleaseTag {
             name: tag_name,
             target_oid,
@@ -972,10 +980,17 @@ fn assign_release_tags(
                 }
             }
 
-            let commit = repo
-                .find_object(commit_oid)?
-                .try_into_commit()
-                .with_context(|| format!("tag ancestry object {commit_oid} was not a commit"))?;
+            let commit = match repo.find_object(commit_oid)?.try_into_commit() {
+                Ok(commit) => commit,
+                Err(_) => {
+                    warn!(
+                        commit_oid = %commit_oid,
+                        tag = %release_tag.name,
+                        "skipping non-commit object encountered during release tag ancestry walk"
+                    );
+                    continue;
+                }
+            };
             stack.extend(commit.parent_ids().map(|parent| parent.detach()));
         }
         prep_progress
