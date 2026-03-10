@@ -301,11 +301,38 @@ pub struct SeriesListQuery {
     #[serde(default)]
     pub list_key: Option<String>,
     #[serde(default)]
+    pub merged: Option<bool>,
+    #[serde(default)]
     pub sort: Option<String>,
     #[serde(default)]
     pub limit: Option<i64>,
     #[serde(default)]
     pub cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MergeSummaryResponse {
+    pub state: String,
+    pub matched_patch_count: i32,
+    pub total_patch_count: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merged_in_tag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merged_in_release: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merged_version_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merged_commit_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MainlineCommitResponse {
+    pub commit_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merged_in_tag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merged_in_release: Option<String>,
+    pub match_method: String,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -319,6 +346,7 @@ pub struct SeriesListItemResponse {
     pub last_seen_at: DateTime<Utc>,
     pub latest_version_num: i32,
     pub is_rfc_latest: bool,
+    pub merge_summary: MergeSummaryResponse,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -354,6 +382,7 @@ pub struct SeriesVersionSummaryResponse {
     pub thread_refs: Vec<SeriesThreadRefResponse>,
     pub patch_count: i64,
     pub is_partial_reroll: bool,
+    pub merge_summary: MergeSummaryResponse,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -366,6 +395,7 @@ pub struct SeriesDetailResponse {
     pub lists: Vec<String>,
     pub versions: Vec<SeriesVersionSummaryResponse>,
     pub latest_version_id: Option<i64>,
+    pub merge_summary: MergeSummaryResponse,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -394,6 +424,8 @@ pub struct SeriesVersionPatchItemResponse {
     pub hunks: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inherited_from_version_num: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mainline_commit: Option<MainlineCommitResponse>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -412,6 +444,7 @@ pub struct SeriesVersionResponse {
     pub cover_message_id: Option<i64>,
     pub first_patch_message_id: Option<i64>,
     pub assembled: bool,
+    pub merge_summary: MergeSummaryResponse,
     pub patch_items: Vec<SeriesVersionPatchItemResponse>,
 }
 
@@ -477,6 +510,8 @@ pub struct SearchQuery {
     pub list_key: Option<String>,
     #[serde(default)]
     pub author: Option<String>,
+    #[serde(default)]
+    pub merged: Option<bool>,
     #[serde(default)]
     pub from: Option<String>,
     #[serde(default)]

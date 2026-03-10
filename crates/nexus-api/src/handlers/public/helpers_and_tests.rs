@@ -23,6 +23,26 @@ pub(super) fn map_patch_item(item: PatchItemDetailRecord) -> PatchItemResponse {
     }
 }
 
+pub(super) fn merge_summary_response(
+    state: String,
+    matched_patch_count: i32,
+    total_patch_count: i32,
+    merged_in_tag: Option<String>,
+    merged_in_release: Option<String>,
+    merged_version_id: Option<i64>,
+    merged_commit_id: Option<String>,
+) -> MergeSummaryResponse {
+    MergeSummaryResponse {
+        state,
+        matched_patch_count,
+        total_patch_count,
+        merged_in_tag,
+        merged_in_release,
+        merged_version_id,
+        merged_commit_id,
+    }
+}
+
 pub(super) fn to_patch_compare_rows(
     rows: Vec<SeriesLogicalCompareRow>,
 ) -> Vec<SeriesComparePatchRow> {
@@ -60,6 +80,7 @@ pub(super) struct SearchRequestHashInput<'a> {
     pub(super) scope: SearchScope,
     pub(super) list_key: Option<&'a str>,
     pub(super) author: Option<&'a str>,
+    pub(super) merged: Option<bool>,
     pub(super) from_ts: Option<DateTime<Utc>>,
     pub(super) to_ts: Option<DateTime<Utc>>,
     pub(super) has_diff: Option<bool>,
@@ -76,6 +97,7 @@ pub(super) fn search_request_hash(input: SearchRequestHashInput<'_>) -> String {
         "scope": input.scope.as_str(),
         "list_key": input.list_key.unwrap_or(""),
         "author": input.author.unwrap_or(""),
+        "merged": input.merged,
         "from_ts": input.from_ts.map(|value| value.timestamp()),
         "to_ts": input.to_ts.map(|value| value.timestamp()),
         "has_diff": input.has_diff,
@@ -595,6 +617,7 @@ mod tests {
             scope: nexus_core::search::SearchScope::Thread,
             list_key: Some("lkml"),
             author: None,
+            merged: None,
             from_ts: None,
             to_ts: None,
             has_diff: Some(true),
@@ -609,6 +632,7 @@ mod tests {
             scope: nexus_core::search::SearchScope::Series,
             list_key: Some("lkml"),
             author: None,
+            merged: None,
             from_ts: None,
             to_ts: None,
             has_diff: Some(true),
@@ -635,6 +659,7 @@ mod tests {
             scope: nexus_core::search::SearchScope::Thread,
             list_key: Some("lkml"),
             author: None,
+            merged: None,
             from_ts: None,
             to_ts: None,
             has_diff: Some(true),
@@ -649,6 +674,7 @@ mod tests {
             scope: nexus_core::search::SearchScope::Thread,
             list_key: Some("lkml"),
             author: None,
+            merged: None,
             from_ts: None,
             to_ts: None,
             has_diff: Some(true),

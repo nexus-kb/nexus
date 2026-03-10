@@ -72,6 +72,28 @@ fn default_commit_batch_size() -> usize {
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
+pub struct MainlineConfig {
+    #[serde(default = "default_mainline_repo_path")]
+    pub repo_path: String,
+    #[serde(default = "default_mainline_commit_window_size")]
+    pub commit_window_size: usize,
+    #[serde(default = "default_mainline_scan_parallelism")]
+    pub scan_parallelism: usize,
+}
+
+fn default_mainline_repo_path() -> String {
+    "/opt/nexus/mainline".to_string()
+}
+
+fn default_mainline_commit_window_size() -> usize {
+    1_000
+}
+
+fn default_mainline_scan_parallelism() -> usize {
+    4
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct MeiliConfig {
     #[serde(default = "default_meili_url")]
     pub url: String,
@@ -229,6 +251,8 @@ pub struct Settings {
     #[serde(default)]
     pub mail: MailConfig,
     #[serde(default)]
+    pub mainline: MainlineConfig,
+    #[serde(default)]
     pub meili: MeiliConfig,
     #[serde(default)]
     pub embeddings: EmbeddingsConfig,
@@ -263,6 +287,15 @@ pub fn load() -> Result<Settings, crate::Error> {
     }
     if settings.mail.commit_batch_size == 0 {
         settings.mail.commit_batch_size = default_commit_batch_size();
+    }
+    if settings.mainline.repo_path.trim().is_empty() {
+        settings.mainline.repo_path = default_mainline_repo_path();
+    }
+    if settings.mainline.commit_window_size == 0 {
+        settings.mainline.commit_window_size = default_mainline_commit_window_size();
+    }
+    if settings.mainline.scan_parallelism == 0 {
+        settings.mainline.scan_parallelism = default_mainline_scan_parallelism();
     }
     if settings.meili.url.trim().is_empty() {
         settings.meili.url = default_meili_url();

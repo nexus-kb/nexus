@@ -22,7 +22,13 @@ impl LineageStore {
                 subject_raw,
                 subject_norm,
                 base_commit,
-                version_fingerprint
+                version_fingerprint,
+                mainline_merge_state,
+                mainline_matched_patch_count,
+                mainline_total_patch_count,
+                mainline_merged_in_tag,
+                mainline_merged_in_release,
+                mainline_single_patch_commit_oid
             FROM patch_series_versions
             WHERE patch_series_id = $1
               AND id = $2
@@ -37,6 +43,7 @@ impl LineageStore {
     pub async fn list_series(
         &self,
         list_key: Option<&str>,
+        merged: Option<bool>,
         sort: &str,
         limit: i64,
         cursor_ts: Option<DateTime<Utc>>,
@@ -53,7 +60,14 @@ impl LineageStore {
                 COALESCE(latest.sent_at, ps.last_seen_at) AS latest_patchset_at,
                 ps.last_seen_at,
                 COALESCE(latest.version_num, 1) AS latest_version_num,
-                COALESCE(latest.is_rfc, false) AS is_rfc_latest
+                COALESCE(latest.is_rfc, false) AS is_rfc_latest,
+                ps.mainline_merge_state,
+                ps.mainline_matched_patch_count,
+                ps.mainline_total_patch_count,
+                ps.mainline_merged_in_tag,
+                ps.mainline_merged_in_release,
+                ps.mainline_merged_version_id,
+                ps.mainline_single_patch_commit_oid
             FROM patch_series ps
             LEFT JOIN LATERAL (
                 SELECT psv.version_num, psv.is_rfc, psv.sent_at
@@ -77,6 +91,13 @@ impl LineageStore {
         if let Some(list_key) = list_key {
             qb.push(" AND ml.list_key = ");
             qb.push_bind(list_key);
+        }
+        if let Some(merged) = merged {
+            if merged {
+                qb.push(" AND ps.mainline_merge_state = 'merged'");
+            } else {
+                qb.push(" AND ps.mainline_merge_state <> 'merged'");
+            }
         }
 
         if let (Some(cursor_ts), Some(cursor_id)) = (cursor_ts, cursor_id) {
@@ -156,7 +177,13 @@ impl LineageStore {
                 psv.subject_raw,
                 psv.subject_norm,
                 psv.base_commit,
-                COUNT(*) FILTER (WHERE pi.item_type = 'patch') AS patch_count
+                COUNT(*) FILTER (WHERE pi.item_type = 'patch') AS patch_count,
+                psv.mainline_merge_state,
+                psv.mainline_matched_patch_count,
+                psv.mainline_total_patch_count,
+                psv.mainline_merged_in_tag,
+                psv.mainline_merged_in_release,
+                psv.mainline_single_patch_commit_oid
             FROM patch_series_versions psv
             LEFT JOIN patch_items pi
               ON pi.patch_series_version_id = psv.id
@@ -175,7 +202,13 @@ impl LineageStore {
                 psv.sent_at,
                 psv.subject_raw,
                 psv.subject_norm,
-                psv.base_commit
+                psv.base_commit,
+                psv.mainline_merge_state,
+                psv.mainline_matched_patch_count,
+                psv.mainline_total_patch_count,
+                psv.mainline_merged_in_tag,
+                psv.mainline_merged_in_release,
+                psv.mainline_single_patch_commit_oid
             ORDER BY psv.version_num ASC, psv.sent_at ASC, psv.id ASC"#,
         )
         .bind(patch_series_id)
@@ -231,12 +264,21 @@ impl LineageStore {
                     pi.additions,
                     pi.deletions,
                     pi.hunk_count,
-                    psvai.inherited_from_version_num
+                    psvai.inherited_from_version_num,
+                    pim.commit_oid AS mainline_commit_oid,
+                    mc.first_containing_tag AS mainline_merged_in_tag,
+                    mc.first_final_release AS mainline_merged_in_release,
+                    pim.match_method AS mainline_match_method
                 FROM patch_series_version_assembled_items psvai
                 JOIN patch_items pi
                   ON pi.id = psvai.patch_item_id
                 JOIN messages m
                   ON m.id = pi.message_pk
+                LEFT JOIN patch_item_mainline_matches pim
+                  ON pim.patch_item_id = pi.id
+                 AND pim.is_canonical = true
+                LEFT JOIN mainline_commits mc
+                  ON mc.commit_oid = pim.commit_oid
                 WHERE psvai.patch_series_version_id = $1
                 ORDER BY psvai.ordinal ASC, pi.id ASC"#,
             )
@@ -263,10 +305,19 @@ impl LineageStore {
                 pi.additions,
                 pi.deletions,
                 pi.hunk_count,
-                NULL::int4 AS inherited_from_version_num
+                NULL::int4 AS inherited_from_version_num,
+                pim.commit_oid AS mainline_commit_oid,
+                mc.first_containing_tag AS mainline_merged_in_tag,
+                mc.first_final_release AS mainline_merged_in_release,
+                pim.match_method AS mainline_match_method
             FROM patch_items pi
             JOIN messages m
               ON m.id = pi.message_pk
+            LEFT JOIN patch_item_mainline_matches pim
+              ON pim.patch_item_id = pi.id
+             AND pim.is_canonical = true
+            LEFT JOIN mainline_commits mc
+              ON mc.commit_oid = pim.commit_oid
             WHERE pi.patch_series_version_id = $1
             ORDER BY pi.ordinal ASC, pi.id ASC"#,
         )

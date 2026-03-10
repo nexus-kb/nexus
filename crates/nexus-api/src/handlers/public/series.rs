@@ -14,6 +14,7 @@ pub async fn series_list(
 
     let cursor_hash = short_hash(&json!({
         "list_key": query.list_key.as_deref().unwrap_or(""),
+        "merged": query.merged,
         "sort": sort,
     }));
     let (cursor_ts, cursor_id) = if let Some(raw_cursor) = query.cursor.as_deref() {
@@ -31,10 +32,13 @@ pub async fn series_list(
         (None, None)
     };
 
+    ensure_mainline_filter_ready(&state, query.merged).await?;
+
     let mut items = state
         .lineage
         .list_series(
             query.list_key.as_deref(),
+            query.merged,
             sort,
             fetch_limit,
             cursor_ts,
@@ -75,6 +79,15 @@ pub async fn series_list(
                     last_seen_at: item.last_seen_at,
                     latest_version_num: item.latest_version_num,
                     is_rfc_latest: item.is_rfc_latest,
+                    merge_summary: merge_summary_response(
+                        item.mainline_merge_state,
+                        item.mainline_matched_patch_count,
+                        item.mainline_total_patch_count,
+                        item.mainline_merged_in_tag,
+                        item.mainline_merged_in_release,
+                        item.mainline_merged_version_id,
+                        item.mainline_single_patch_commit_oid,
+                    ),
                 })
                 .collect(),
             page_info: build_page_info(limit, next_cursor),
@@ -142,6 +155,15 @@ pub async fn series_detail(
             thread_refs,
             patch_count: version.patch_count,
             is_partial_reroll: version.is_partial_reroll,
+            merge_summary: merge_summary_response(
+                version.mainline_merge_state,
+                version.mainline_matched_patch_count,
+                version.mainline_total_patch_count,
+                version.mainline_merged_in_tag,
+                version.mainline_merged_in_release,
+                None,
+                version.mainline_single_patch_commit_oid,
+            ),
         });
     }
 
@@ -159,6 +181,15 @@ pub async fn series_detail(
             lists,
             versions: version_items,
             latest_version_id: series.latest_version_id,
+            merge_summary: merge_summary_response(
+                series.mainline_merge_state,
+                series.mainline_matched_patch_count,
+                series.mainline_total_patch_count,
+                series.mainline_merged_in_tag,
+                series.mainline_merged_in_release,
+                series.mainline_merged_version_id,
+                series.mainline_single_patch_commit_oid,
+            ),
         },
         CACHE_THREAD,
         None,
@@ -205,6 +236,14 @@ pub async fn series_version(
             deletions: item.deletions,
             hunks: item.hunk_count,
             inherited_from_version_num: item.inherited_from_version_num,
+            mainline_commit: item.mainline_commit_oid.map(|commit_id| MainlineCommitResponse {
+                commit_id,
+                merged_in_tag: item.mainline_merged_in_tag,
+                merged_in_release: item.mainline_merged_in_release,
+                match_method: item
+                    .mainline_match_method
+                    .unwrap_or_else(|| "patch_id".to_string()),
+            }),
         })
         .collect::<Vec<_>>();
 
@@ -224,11 +263,42 @@ pub async fn series_version(
             cover_message_id: version.cover_message_pk,
             first_patch_message_id: version.first_patch_message_pk,
             assembled,
+            merge_summary: merge_summary_response(
+                version.mainline_merge_state,
+                version.mainline_matched_patch_count,
+                version.mainline_total_patch_count,
+                version.mainline_merged_in_tag,
+                version.mainline_merged_in_release,
+                None,
+                version.mainline_single_patch_commit_oid,
+            ),
             patch_items,
         },
         CACHE_THREAD,
         None,
     )
+}
+
+async fn ensure_mainline_filter_ready(
+    state: &ApiState,
+    merged_filter: Option<bool>,
+) -> Result<(), ApiError> {
+    if merged_filter.is_none() {
+        return Ok(());
+    }
+
+    let repo_key = format!("mainline:{}", state.settings.mainline.repo_path.trim());
+    let scan_state = state
+        .mainline
+        .get_state(&repo_key)
+        .await
+        .map_err(|_| ApiError::internal("failed to load mainline filter readiness"))?;
+    if scan_state.as_ref().is_some_and(|scan_state| scan_state.public_filter_ready) {
+        return Ok(());
+    }
+
+    Err(ApiError::from(StatusCode::CONFLICT)
+        .with_detail("merged filter is not ready until the initial mainline bootstrap completes"))
 }
 
 pub async fn series_compare(

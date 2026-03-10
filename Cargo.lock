@@ -2423,6 +2423,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "chrono",
+ "gix",
  "moka",
  "nexus-core",
  "nexus-db",
@@ -2492,6 +2493,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "gix",
+ "imara-diff",
  "mailparse",
  "nexus-core",
  "nexus-db",

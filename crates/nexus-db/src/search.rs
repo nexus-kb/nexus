@@ -36,6 +36,11 @@ struct PatchSeriesDocRow {
     has_diff: Option<bool>,
     patch_subjects: Vec<String>,
     list_keys: Vec<String>,
+    mainline_merge_state: String,
+    mainline_merged_in_tag: Option<String>,
+    mainline_merged_in_release: Option<String>,
+    mainline_merged_version_id: Option<i64>,
+    mainline_single_patch_commit_oid: Option<String>,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -70,6 +75,11 @@ struct PatchSeriesMetadataDocRow {
     latest_version_num: Option<i32>,
     latest_version_id: Option<i64>,
     latest_version_is_rfc: Option<bool>,
+    mainline_merge_state: String,
+    mainline_merged_in_tag: Option<String>,
+    mainline_merged_in_release: Option<String>,
+    mainline_merged_version_id: Option<i64>,
+    mainline_single_patch_commit_oid: Option<String>,
 }
 
 #[derive(Clone)]
@@ -213,7 +223,12 @@ impl SearchStore {
                     ),
                     ARRAY[]::text[]
                 ) AS patch_subjects,
-                COALESCE(ARRAY_REMOVE(ARRAY_AGG(DISTINCT ml.list_key), NULL), ARRAY[]::text[]) AS list_keys
+                COALESCE(ARRAY_REMOVE(ARRAY_AGG(DISTINCT ml.list_key), NULL), ARRAY[]::text[]) AS list_keys,
+                ps.mainline_merge_state,
+                ps.mainline_merged_in_tag,
+                ps.mainline_merged_in_release,
+                ps.mainline_merged_version_id,
+                ps.mainline_single_patch_commit_oid
             FROM patch_series ps
             LEFT JOIN patch_series_versions psv
               ON psv.id = ps.latest_version_id
@@ -229,7 +244,10 @@ impl SearchStore {
               ON ml.id = psl.mailing_list_id
             WHERE ps.id = ANY($1)
             GROUP BY ps.id, ps.canonical_subject_norm, ps.author_email, ps.last_seen_at,
-                     psv.version_num, psv.id, psv.is_rfc, mb.body_text
+                     psv.version_num, psv.id, psv.is_rfc, mb.body_text,
+                     ps.mainline_merge_state, ps.mainline_merged_in_tag,
+                     ps.mainline_merged_in_release, ps.mainline_merged_version_id,
+                     ps.mainline_single_patch_commit_oid
             ORDER BY ps.id ASC"#,
         )
         .bind(ids)
@@ -265,6 +283,12 @@ impl SearchStore {
                     "latest_version_num": row.latest_version_num.unwrap_or(1),
                     "latest_version_id": row.latest_version_id,
                     "is_rfc_latest": row.latest_version_is_rfc.unwrap_or(false),
+                    "merge_state": row.mainline_merge_state,
+                    "is_merged": row.mainline_merge_state == "merged",
+                    "merged_in_tag": row.mainline_merged_in_tag,
+                    "merged_in_release": row.mainline_merged_in_release,
+                    "merged_version_id": row.mainline_merged_version_id,
+                    "merged_commit_id": row.mainline_single_patch_commit_oid,
                     "cover_abstract": limit_text(&cover_abstract, 2_000),
                     "patch_subjects_joined": limit_text(&patch_subjects_joined, 8_000),
                     "route": format!("/series/{}", row.id),
@@ -410,7 +434,12 @@ impl SearchStore {
                 ps.id,
                 psv.version_num AS latest_version_num,
                 psv.id AS latest_version_id,
-                psv.is_rfc AS latest_version_is_rfc
+                psv.is_rfc AS latest_version_is_rfc,
+                ps.mainline_merge_state,
+                ps.mainline_merged_in_tag,
+                ps.mainline_merged_in_release,
+                ps.mainline_merged_version_id,
+                ps.mainline_single_patch_commit_oid
             FROM patch_series ps
             LEFT JOIN patch_series_versions psv
               ON psv.id = ps.latest_version_id
@@ -429,6 +458,12 @@ impl SearchStore {
                     "latest_version_num": row.latest_version_num.unwrap_or(1),
                     "latest_version_id": row.latest_version_id,
                     "is_rfc_latest": row.latest_version_is_rfc.unwrap_or(false),
+                    "merge_state": row.mainline_merge_state,
+                    "is_merged": row.mainline_merge_state == "merged",
+                    "merged_in_tag": row.mainline_merged_in_tag,
+                    "merged_in_release": row.mainline_merged_in_release,
+                    "merged_version_id": row.mainline_merged_version_id,
+                    "merged_commit_id": row.mainline_single_patch_commit_oid,
                 })
             })
             .collect())

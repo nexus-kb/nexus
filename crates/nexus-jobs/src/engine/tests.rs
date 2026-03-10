@@ -1,6 +1,6 @@
 use nexus_core::config::{
-    AdminConfig, AppConfig, DatabaseConfig, EmbeddingsConfig, MailConfig, MeiliConfig, Settings,
-    WorkerConfig,
+    AdminConfig, AppConfig, DatabaseConfig, EmbeddingsConfig, MailConfig, MainlineConfig,
+    MeiliConfig, Settings, WorkerConfig,
 };
 use nexus_db::{CatalogStore, Db, EnqueueJobParams, JobState, PipelineStore};
 use serde_json::json;
@@ -129,6 +129,7 @@ fn test_settings(database_url: String) -> Settings {
         app: AppConfig::default(),
         admin: AdminConfig::default(),
         mail: MailConfig::default(),
+        mainline: MainlineConfig::default(),
         meili: MeiliConfig::default(),
         embeddings: EmbeddingsConfig::default(),
         worker: WorkerConfig::default(),

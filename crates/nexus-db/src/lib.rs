@@ -6,6 +6,7 @@ mod embeddings;
 mod ingest;
 mod jobs;
 mod lineage;
+mod mainline;
 mod models;
 mod pipeline;
 mod search;
@@ -41,7 +42,15 @@ pub use crate::lineage::{
     ThreadSummaryRecord, UpsertPatchItemFileInput, UpsertPatchItemInput, UpsertPatchSeriesInput,
     UpsertPatchSeriesVersionInput,
 };
-pub use crate::models::{EmbeddingBackfillRun, Job, JobState, MeiliBootstrapRun, PipelineRun};
+pub use crate::mainline::{
+    CanonicalPatchMatchInput, CreateMainlineScanRunParams, ListMainlineScanRunsParams,
+    MainlinePatchCandidate, MainlineStore, SeriesMergeSummary, UpsertMainlineCommitInput,
+    VersionMergeSummary,
+};
+pub use crate::models::{
+    EmbeddingBackfillRun, Job, JobState, MainlineScanRun, MainlineScanState, MeiliBootstrapRun,
+    PipelineRun,
+};
 pub use crate::pipeline::{ListPipelineRunsParams, PipelineStore};
 pub use crate::search::SearchStore;
 pub use crate::threading::{

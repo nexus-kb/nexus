@@ -99,10 +99,16 @@ pub struct MeiliBootstrapRunPayload {
     pub run_id: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MainlineScanRunPayload {
+    pub run_id: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        EmbeddingGenerateBatchPayload, EmbeddingScope, MeiliBootstrapRunPayload,
+        EmbeddingGenerateBatchPayload, EmbeddingScope, MainlineScanRunPayload,
+        MeiliBootstrapRunPayload,
         MeiliBootstrapScope,
     };
 
@@ -133,5 +139,14 @@ mod tests {
         let decoded: MeiliBootstrapRunPayload =
             serde_json::from_value(encoded).expect("deserialize run payload");
         assert_eq!(decoded.run_id, 7);
+    }
+
+    #[test]
+    fn mainline_scan_run_payload_round_trip() {
+        let payload = MainlineScanRunPayload { run_id: 9 };
+        let encoded = serde_json::to_value(&payload).expect("serialize run payload");
+        let decoded: MainlineScanRunPayload =
+            serde_json::from_value(encoded).expect("deserialize run payload");
+        assert_eq!(decoded.run_id, 9);
     }
 }

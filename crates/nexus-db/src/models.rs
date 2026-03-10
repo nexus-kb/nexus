@@ -107,3 +107,40 @@ pub struct MeiliBootstrapRun {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, ToSchema)]
+pub struct MainlineScanState {
+    pub repo_key: String,
+    pub ref_name: String,
+    pub public_filter_ready: bool,
+    pub bootstrap_completed_at: Option<DateTime<Utc>>,
+    pub last_scanned_commit_oid: Option<String>,
+    pub last_scanned_head_oid: Option<String>,
+    pub last_successful_scan_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, ToSchema)]
+pub struct MainlineScanRun {
+    pub id: i64,
+    pub repo_key: String,
+    pub mode: String,
+    pub state: String,
+    pub ref_name: String,
+    pub job_id: Option<i64>,
+    pub head_commit_oid: Option<String>,
+    pub cursor_commit_oid: Option<String>,
+    pub scanned_commits: i64,
+    pub matched_commits: i64,
+    pub matched_patch_items: i64,
+    pub updated_series: i64,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub progress_json: serde_json::Value,
+    pub result_json: Option<serde_json::Value>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}

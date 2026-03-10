@@ -78,6 +78,13 @@ pub fn build_router(state: ApiState) -> Router {
             "/diagnostics/meili/bootstrap/{run_id}/cancel",
             post(admin::cancel_meili_bootstrap_run),
         )
+        .route("/mainline/scan", post(admin::start_mainline_scan))
+        .route("/mainline/scans", get(admin::list_mainline_scan_runs))
+        .route("/mainline/scans/{run_id}", get(admin::get_mainline_scan_run))
+        .route(
+            "/mainline/scans/{run_id}/cancel",
+            post(admin::cancel_mainline_scan_run),
+        )
         .route("/ingest/sync", post(admin::ingest_sync))
         .route("/ingest/grokmirror", post(admin::ingest_grokmirror))
         .route("/ingest/reset-watermark", post(admin::reset_watermark))

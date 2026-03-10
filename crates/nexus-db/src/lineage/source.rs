@@ -175,7 +175,14 @@ impl LineageStore {
                 change_id,
                 created_at,
                 last_seen_at,
-                latest_version_id
+                latest_version_id,
+                mainline_merge_state,
+                mainline_matched_patch_count,
+                mainline_total_patch_count,
+                mainline_merged_in_tag,
+                mainline_merged_in_release,
+                mainline_single_patch_commit_oid,
+                mainline_merged_version_id
             FROM patch_series
             WHERE id = $1
             LIMIT 1"#,
@@ -200,7 +207,14 @@ impl LineageStore {
                 change_id,
                 created_at,
                 last_seen_at,
-                latest_version_id
+                latest_version_id,
+                mainline_merge_state,
+                mainline_matched_patch_count,
+                mainline_total_patch_count,
+                mainline_merged_in_tag,
+                mainline_merged_in_release,
+                mainline_single_patch_commit_oid,
+                mainline_merged_version_id
             FROM patch_series
             WHERE canonical_subject_norm = $1
               AND last_seen_at >= $2

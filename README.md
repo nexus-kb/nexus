@@ -33,6 +33,7 @@ docker run -d --name nexus-worker \
   --network nexus-kb \
   --env-file ./nexus-api.env \
   -v /srv/nexus/mailing-lists:/opt/nexus/mailing-lists:ro \
+  -v /srv/nexus/mainline:/opt/nexus/mainline:ro \
   "$IMAGE" /usr/local/bin/worker
 ```
 
@@ -61,7 +62,10 @@ This list includes only variables currently read by runtime code (`nexus-core` c
 | Variable | Required | Default if unset | Production guidance |
 | --- | --- | --- | --- |
 | `NEXUS__MAIL__MIRROR_ROOT` | required for ingest/list-sync jobs | `/opt/nexus/mailing-lists` | Mount mirror path read-only in worker. |
+| `NEXUS__MAINLINE__REPO_PATH` | required for mainline merge detection jobs | `/opt/nexus/mainline` | Mount Linus mainline clone read-only in API/worker. |
 | `NEXUS__MAIL__COMMIT_BATCH_SIZE` | no | `250` | Tune by ingest throughput and memory budget. |
+| `NEXUS__MAINLINE__COMMIT_WINDOW_SIZE` | no | `1000` | Mainline scan commit window size before serialized DB/writeback. |
+| `NEXUS__MAINLINE__SCAN_PARALLELISM` | no | `4` | Internal parallelism for `gix`-backed mainline commit loading/diffing. |
 | `NEXUS__MEILI__URL` | no | `http://127.0.0.1:7700` | Point to your Meilisearch service URL. |
 | `NEXUS__MEILI__MASTER_KEY` | no | `nexus-dev-key` | Set to your real Meili master key. |
 | `NEXUS__MEILI__UPSERT_BATCH_SIZE` | no | `1000` | Lexical/search doc upsert chunk size to Meili. |

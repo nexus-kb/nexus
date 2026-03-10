@@ -29,6 +29,7 @@ pub(crate) mod embeddings;
 mod helpers_and_tests;
 pub(crate) mod ingest;
 pub(crate) mod jobs;
+pub(crate) mod mainline;
 pub(crate) mod meili_bootstrap;
 pub(crate) mod openapi;
 pub(crate) mod pipeline;
@@ -38,6 +39,9 @@ pub use diagnostics::{diagnostics_queue, diagnostics_storage};
 pub use embeddings::{get_search_embeddings_backfill, search_embeddings_backfill};
 pub use ingest::{ingest_grokmirror, ingest_sync, reset_watermark};
 pub use jobs::{cancel_job, enqueue_job, get_job, list_job_attempts, list_jobs, retry_job};
+pub use mainline::{
+    cancel_mainline_scan_run, get_mainline_scan_run, list_mainline_scan_runs, start_mainline_scan,
+};
 pub use meili_bootstrap::{
     cancel_meili_bootstrap_run, get_meili_bootstrap_run, list_meili_bootstrap_runs,
     start_meili_bootstrap,

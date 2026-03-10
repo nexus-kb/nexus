@@ -21,6 +21,11 @@ pub async fn search(
         None => SearchScope::Thread,
     };
     let spec = scope.index_kind().spec();
+    if query.merged.is_some() && scope != SearchScope::Series {
+        return Err(ApiError::validation("merged filter is supported only for scope=series")
+            .with_invalid_param("merged", "expected scope=series"));
+    }
+    ensure_mainline_search_filter_ready(&state, scope, query.merged).await?;
 
     let hybrid_enabled = hybrid_requested(query.hybrid, query.semantic_ratio);
     let semantic_ratio = if hybrid_enabled {
@@ -66,6 +71,7 @@ pub async fn search(
         scope,
         list_key: query.list_key.as_deref(),
         author: query.author.as_deref(),
+        merged: query.merged,
         from_ts,
         to_ts,
         has_diff: query.has_diff,
@@ -130,6 +136,9 @@ pub async fn search(
             spec.author_filter_field,
             escape_filter_value(author)
         ));
+    }
+    if let Some(merged) = query.merged {
+        filters.push(format!("is_merged = {merged}"));
     }
     if let Some(has_diff) = query.has_diff {
         filters.push(format!("has_diff = {has_diff}"));
@@ -430,4 +439,27 @@ pub async fn search(
         CACHE_SEARCH,
         None,
     )
+}
+
+async fn ensure_mainline_search_filter_ready(
+    state: &ApiState,
+    scope: SearchScope,
+    merged_filter: Option<bool>,
+) -> Result<(), ApiError> {
+    if merged_filter.is_none() || scope != SearchScope::Series {
+        return Ok(());
+    }
+
+    let repo_key = format!("mainline:{}", state.settings.mainline.repo_path.trim());
+    let scan_state = state
+        .mainline
+        .get_state(&repo_key)
+        .await
+        .map_err(|_| ApiError::internal("failed to load mainline filter readiness"))?;
+    if scan_state.as_ref().is_some_and(|scan_state| scan_state.public_filter_ready) {
+        return Ok(());
+    }
+
+    Err(ApiError::from(StatusCode::CONFLICT)
+        .with_detail("merged filter is not ready until the initial mainline bootstrap completes"))
 }

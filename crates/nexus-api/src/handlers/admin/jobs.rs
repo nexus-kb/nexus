@@ -274,8 +274,8 @@ mod tests {
     use axum::extract::{Path as AxumPath, State};
     use axum::response::IntoResponse;
     use nexus_core::config::{
-        AdminConfig, AppConfig, DatabaseConfig, EmbeddingsConfig, MailConfig, MeiliConfig,
-        Settings, WorkerConfig,
+        AdminConfig, AppConfig, DatabaseConfig, EmbeddingsConfig, MailConfig, MainlineConfig,
+        MeiliConfig, Settings, WorkerConfig,
     };
     use nexus_db::{Db, EnqueueJobParams, JobState};
 
@@ -292,6 +292,7 @@ mod tests {
             app: AppConfig::default(),
             admin: AdminConfig::default(),
             mail: MailConfig::default(),
+            mainline: MainlineConfig::default(),
             meili: MeiliConfig::default(),
             embeddings: EmbeddingsConfig::default(),
             worker: WorkerConfig::default(),

@@ -11,10 +11,11 @@ use nexus_core::embeddings::{EmbeddingsClientError, OpenAiEmbeddingsClient};
 use nexus_core::search::MeiliIndexKind;
 use nexus_db::{
     BackfillProgressUpdate, CatalogStore, EmbeddingVectorUpsert, EmbeddingsStore, EnqueueJobParams,
-    IngestCommitRow, IngestStore, Job, JobStore, JobStoreMetrics, LineageStore, MailingListRepo,
-    ParsedBodyInput, ParsedMessageInput, ParsedPatchFactsInput, ParsedPatchFileFactInput,
-    PipelineStore, SearchStore, ThreadComponentWrite, ThreadMessageWrite, ThreadNodeWrite,
-    ThreadSummaryWrite, ThreadingApplyStats, ThreadingRunContext, ThreadingStore,
+    IngestCommitRow, IngestStore, Job, JobStore, JobStoreMetrics, LineageStore, MainlineStore,
+    MailingListRepo, ParsedBodyInput, ParsedMessageInput, ParsedPatchFactsInput,
+    ParsedPatchFileFactInput, PipelineStore, SearchStore, ThreadComponentWrite,
+    ThreadMessageWrite, ThreadNodeWrite, ThreadSummaryWrite, ThreadingApplyStats,
+    ThreadingRunContext, ThreadingStore,
 };
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -31,9 +32,9 @@ use crate::patch_detect::extract_diff_text;
 use crate::patch_id::compute_patch_id_stable;
 use crate::payloads::{
     EmbeddingBackfillRunPayload, EmbeddingGenerateBatchPayload, EmbeddingScope,
-    LineageRebuildListPayload, MeiliBootstrapRunPayload, PipelineEmbeddingPayload,
-    PipelineIngestPayload, PipelineLexicalPayload, PipelineLineagePayload,
-    PipelineThreadingPayload, ThreadingRebuildListPayload,
+    LineageRebuildListPayload, MainlineScanRunPayload, MeiliBootstrapRunPayload,
+    PipelineEmbeddingPayload, PipelineIngestPayload, PipelineLexicalPayload,
+    PipelineLineagePayload, PipelineThreadingPayload, ThreadingRebuildListPayload,
 };
 use crate::scanner::stream_new_commit_oid_chunks;
 use crate::threading::{ThreadingInputMessage, build_threads};
@@ -47,6 +48,7 @@ pub struct Phase0JobHandler {
     threading: ThreadingStore,
     lineage: LineageStore,
     pipeline: PipelineStore,
+    mainline: MainlineStore,
     search: SearchStore,
     embeddings: EmbeddingsStore,
     jobs: JobStore,
@@ -81,6 +83,7 @@ impl Phase0JobHandler {
         threading: ThreadingStore,
         lineage: LineageStore,
         pipeline: PipelineStore,
+        mainline: MainlineStore,
         search: SearchStore,
         embeddings: EmbeddingsStore,
         jobs: JobStore,
@@ -94,6 +97,7 @@ impl Phase0JobHandler {
             threading,
             lineage,
             pipeline,
+            mainline,
             search,
             embeddings,
             jobs,
@@ -114,6 +118,7 @@ impl Phase0JobHandler {
             "embedding_backfill_run" => self.handle_embedding_backfill_run(job, ctx).await,
             "embedding_generate_batch" => self.handle_embedding_generate_batch(job, ctx).await,
             "meili_bootstrap_run" => self.handle_meili_bootstrap_run(job, ctx).await,
+            "mainline_scan_run" => self.handle_mainline_scan_run(job, ctx).await,
             other => JobExecutionOutcome::Terminal {
                 reason: format!("unknown job type: {other}"),
                 kind: "invalid_job_type".to_string(),
@@ -129,6 +134,7 @@ mod helpers;
 mod ingest;
 mod lexical;
 mod lineage;
+mod mainline;
 mod meili_bootstrap;
 mod pipeline_flow;
 mod rebuild;

@@ -86,6 +86,13 @@ pub struct PatchSeriesRecord {
     pub created_at: DateTime<Utc>,
     pub last_seen_at: DateTime<Utc>,
     pub latest_version_id: Option<i64>,
+    pub mainline_merge_state: String,
+    pub mainline_matched_patch_count: i32,
+    pub mainline_total_patch_count: i32,
+    pub mainline_merged_in_tag: Option<String>,
+    pub mainline_merged_in_release: Option<String>,
+    pub mainline_single_patch_commit_oid: Option<String>,
+    pub mainline_merged_version_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -105,6 +112,12 @@ pub struct PatchSeriesVersionRecord {
     pub subject_norm: String,
     pub base_commit: Option<String>,
     pub version_fingerprint: Vec<u8>,
+    pub mainline_merge_state: String,
+    pub mainline_matched_patch_count: i32,
+    pub mainline_total_patch_count: i32,
+    pub mainline_merged_in_tag: Option<String>,
+    pub mainline_merged_in_release: Option<String>,
+    pub mainline_single_patch_commit_oid: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -367,6 +380,13 @@ pub struct SeriesListItemRecord {
     pub last_seen_at: DateTime<Utc>,
     pub latest_version_num: i32,
     pub is_rfc_latest: bool,
+    pub mainline_merge_state: String,
+    pub mainline_matched_patch_count: i32,
+    pub mainline_total_patch_count: i32,
+    pub mainline_merged_in_tag: Option<String>,
+    pub mainline_merged_in_release: Option<String>,
+    pub mainline_merged_version_id: Option<i64>,
+    pub mainline_single_patch_commit_oid: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -386,6 +406,12 @@ pub struct SeriesVersionSummaryRecord {
     pub subject_norm: String,
     pub base_commit: Option<String>,
     pub patch_count: i64,
+    pub mainline_merge_state: String,
+    pub mainline_matched_patch_count: i32,
+    pub mainline_total_patch_count: i32,
+    pub mainline_merged_in_tag: Option<String>,
+    pub mainline_merged_in_release: Option<String>,
+    pub mainline_single_patch_commit_oid: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -415,6 +441,10 @@ pub struct SeriesVersionPatchItemRecord {
     pub deletions: i32,
     pub hunk_count: i32,
     pub inherited_from_version_num: Option<i32>,
+    pub mainline_commit_oid: Option<String>,
+    pub mainline_merged_in_tag: Option<String>,
+    pub mainline_merged_in_release: Option<String>,
+    pub mainline_match_method: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]

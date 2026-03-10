@@ -3,7 +3,9 @@ use std::time::Duration;
 use moka::future::Cache;
 use nexus_core::config::Settings;
 use nexus_core::embeddings::OpenAiEmbeddingsClient;
-use nexus_db::{CatalogStore, Db, EmbeddingsStore, JobStore, LineageStore, PipelineStore};
+use nexus_db::{
+    CatalogStore, Db, EmbeddingsStore, JobStore, LineageStore, MainlineStore, PipelineStore,
+};
 
 #[derive(Clone)]
 pub struct QueryEmbeddingCache {
@@ -37,6 +39,7 @@ pub struct ApiState {
     pub catalog: CatalogStore,
     pub lineage: LineageStore,
     pub pipeline: PipelineStore,
+    pub mainline: MainlineStore,
     pub embeddings: EmbeddingsStore,
     pub embedding_client: OpenAiEmbeddingsClient,
     pub http_client: reqwest::Client,
@@ -49,6 +52,7 @@ impl ApiState {
         let catalog = CatalogStore::new(db.pool().clone());
         let lineage = LineageStore::new(db.pool().clone());
         let pipeline = PipelineStore::new(db.pool().clone());
+        let mainline = MainlineStore::new(db.pool().clone());
         let embeddings = EmbeddingsStore::new(db.pool().clone());
         let embedding_client = OpenAiEmbeddingsClient::from_settings(&settings);
         let http_client = reqwest::Client::new();
@@ -63,6 +67,7 @@ impl ApiState {
             catalog,
             lineage,
             pipeline,
+            mainline,
             embeddings,
             embedding_client,
             http_client,
