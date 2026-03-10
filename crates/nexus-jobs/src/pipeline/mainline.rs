@@ -1151,16 +1151,29 @@ fn append_change_patch(
     }
 
     let (old_path, new_path) = match change.event {
-        gix::object::tree::diff::change::Event::Addition { .. } => {
+        gix::object::tree::diff::change::Event::Addition { entry_mode, .. }
+            if entry_mode.is_blob() || entry_mode.is_link() =>
+        {
             ("/dev/null".to_string(), format!("b/{path}"))
         }
-        gix::object::tree::diff::change::Event::Deletion { .. } => {
+        gix::object::tree::diff::change::Event::Deletion { entry_mode, .. }
+            if entry_mode.is_blob() || entry_mode.is_link() =>
+        {
             (format!("a/{path}"), "/dev/null".to_string())
         }
-        gix::object::tree::diff::change::Event::Modification { .. } => {
+        gix::object::tree::diff::change::Event::Modification {
+            previous_entry_mode,
+            entry_mode,
+            ..
+        } if (previous_entry_mode.is_blob() || previous_entry_mode.is_link())
+            && (entry_mode.is_blob() || entry_mode.is_link()) =>
+        {
             (format!("a/{path}"), format!("b/{path}"))
         }
         gix::object::tree::diff::change::Event::Rewrite { .. } => {
+            return Ok(());
+        }
+        _ => {
             return Ok(());
         }
     };
