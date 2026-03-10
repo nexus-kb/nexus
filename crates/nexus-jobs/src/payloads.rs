@@ -50,6 +50,13 @@ pub struct LineageRebuildListPayload {
     pub to_seen_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LineageThreadRefsBackfillListPayload {
+    pub list_key: String,
+    pub from_seen_at: Option<DateTime<Utc>>,
+    pub to_seen_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum EmbeddingScope {

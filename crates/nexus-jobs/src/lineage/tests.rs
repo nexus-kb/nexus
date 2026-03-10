@@ -421,6 +421,219 @@ async fn local_db_e2e_partial_reroll_and_idempotency() -> Result<(), Box<dyn std
     Ok(())
 }
 
+#[tokio::test]
+async fn local_db_cross_posted_series_versions_keep_refs_for_both_lists()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Ok(database_url) = std::env::var("NEXUS_TEST_DATABASE_URL") else {
+        return Ok(());
+    };
+
+    let db = Db::connect(&DatabaseConfig {
+        url: database_url,
+        max_connections: 4,
+    })
+    .await?;
+    db.migrate().await?;
+
+    let catalog = CatalogStore::new(db.pool().clone());
+    let ingest = IngestStore::new(db.pool().clone());
+    let lineage = LineageStore::new(db.pool().clone());
+
+    let now_nanos = Utc::now()
+        .timestamp_nanos_opt()
+        .unwrap_or_else(|| Utc::now().timestamp_micros() * 1_000)
+        .abs();
+    let list_a = catalog
+        .ensure_mailing_list(&format!("crosspost-a-{now_nanos}"))
+        .await?;
+    let list_b = catalog
+        .ensure_mailing_list(&format!("crosspost-b-{now_nanos}"))
+        .await?;
+    let repo_a = catalog.ensure_repo(list_a.id, "a.git", "a.git").await?;
+    let repo_b = catalog.ensure_repo(list_b.id, "b.git", "b.git").await?;
+
+    let series_tag = format!("cross-posted-{now_nanos}");
+    let messages = fixture_messages(&series_tag);
+    let message_pks_a = ingest_fixture_messages(&ingest, &repo_a, &messages).await?;
+    let message_pks_b = ingest_fixture_messages(&ingest, &repo_b, &messages).await?;
+    assert_eq!(
+        message_pks_a, message_pks_b,
+        "cross-posted messages must dedupe globally"
+    );
+
+    let thread_a = insert_linear_thread(
+        db.pool(),
+        list_a.id,
+        "crosspost-a-root",
+        "subsys: demo series",
+        &message_pks_a,
+    )
+    .await?;
+    let thread_b = insert_linear_thread(
+        db.pool(),
+        list_b.id,
+        "crosspost-b-root",
+        "subsys: demo series",
+        &message_pks_b,
+    )
+    .await?;
+
+    let _first = process_patch_extract_threads(&lineage, list_a.id, &[thread_a]).await?;
+    let _second = process_patch_extract_threads(&lineage, list_b.id, &[thread_b]).await?;
+
+    let series_id: i64 = sqlx::query_scalar("SELECT id FROM patch_series ORDER BY id DESC LIMIT 1")
+        .fetch_one(db.pool())
+        .await?;
+
+    let version_counts = sqlx::query_as::<_, (i32, i64)>(
+        r#"SELECT psv.version_num, COUNT(*)::bigint
+        FROM patch_series_version_threads psvt
+        JOIN patch_series_versions psv
+          ON psv.id = psvt.patch_series_version_id
+        WHERE psv.patch_series_id = $1
+        GROUP BY psv.version_num
+        ORDER BY psv.version_num ASC"#,
+    )
+    .bind(series_id)
+    .fetch_all(db.pool())
+    .await?;
+    assert_eq!(version_counts, vec![(1, 2), (2, 2)]);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn local_db_thread_ref_backfill_helpers_restore_missing_second_list_refs()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Ok(database_url) = std::env::var("NEXUS_TEST_DATABASE_URL") else {
+        return Ok(());
+    };
+
+    let db = Db::connect(&DatabaseConfig {
+        url: database_url,
+        max_connections: 4,
+    })
+    .await?;
+    db.migrate().await?;
+
+    let catalog = CatalogStore::new(db.pool().clone());
+    let ingest = IngestStore::new(db.pool().clone());
+    let lineage = LineageStore::new(db.pool().clone());
+
+    let now_nanos = Utc::now()
+        .timestamp_nanos_opt()
+        .unwrap_or_else(|| Utc::now().timestamp_micros() * 1_000)
+        .abs();
+    let list_a = catalog
+        .ensure_mailing_list(&format!("backfill-a-{now_nanos}"))
+        .await?;
+    let list_b = catalog
+        .ensure_mailing_list(&format!("backfill-b-{now_nanos}"))
+        .await?;
+    let repo_a = catalog.ensure_repo(list_a.id, "a.git", "a.git").await?;
+    let repo_b = catalog.ensure_repo(list_b.id, "b.git", "b.git").await?;
+
+    let series_tag = format!("backfill-{now_nanos}");
+    let messages = fixture_messages(&series_tag);
+    let message_pks = ingest_fixture_messages(&ingest, &repo_a, &messages).await?;
+    let message_pks_dupe = ingest_fixture_messages(&ingest, &repo_b, &messages).await?;
+    assert_eq!(message_pks, message_pks_dupe);
+
+    let thread_a = insert_linear_thread(
+        db.pool(),
+        list_a.id,
+        "backfill-a-root",
+        "subsys: demo series",
+        &message_pks,
+    )
+    .await?;
+    let _thread_b = insert_linear_thread(
+        db.pool(),
+        list_b.id,
+        "backfill-b-root",
+        "subsys: demo series",
+        &message_pks,
+    )
+    .await?;
+
+    let _first = process_patch_extract_threads(&lineage, list_a.id, &[thread_a]).await?;
+
+    let series_id: i64 = sqlx::query_scalar("SELECT id FROM patch_series ORDER BY id DESC LIMIT 1")
+        .fetch_one(db.pool())
+        .await?;
+    let initial_counts = sqlx::query_as::<_, (i32, i64)>(
+        r#"SELECT psv.version_num, COUNT(*)::bigint
+        FROM patch_series_version_threads psvt
+        JOIN patch_series_versions psv
+          ON psv.id = psvt.patch_series_version_id
+        WHERE psv.patch_series_id = $1
+        GROUP BY psv.version_num
+        ORDER BY psv.version_num ASC"#,
+    )
+    .bind(series_id)
+    .fetch_all(db.pool())
+    .await?;
+    assert_eq!(initial_counts, vec![(1, 1), (2, 1)]);
+
+    let candidates = lineage
+        .list_series_version_thread_ref_backfill_candidates(list_b.id, None, None, 0, 100)
+        .await?;
+    let anchor_message_pks = candidates
+        .iter()
+        .filter_map(|candidate| candidate.anchor_message_pk)
+        .collect::<Vec<_>>();
+    let present_message_pks = lineage
+        .list_message_pks_present_in_list(list_b.id, &anchor_message_pks, None, None)
+        .await?;
+    let present_set = present_message_pks
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    let thread_match_map = lineage
+        .list_thread_matches_for_messages(list_b.id, &present_message_pks)
+        .await?
+        .into_iter()
+        .map(|row| (row.message_pk, row))
+        .collect::<std::collections::HashMap<_, _>>();
+    let upserts = candidates
+        .iter()
+        .filter_map(|candidate| {
+            let anchor_message_pk = candidate.anchor_message_pk?;
+            if !present_set.contains(&anchor_message_pk) {
+                return None;
+            }
+            let match_row = thread_match_map.get(&anchor_message_pk)?;
+            if match_row.thread_match_count != 1 {
+                return None;
+            }
+            Some((
+                candidate.patch_series_version_id,
+                list_b.id,
+                match_row.thread_id.expect("single match thread id"),
+            ))
+        })
+        .collect::<Vec<_>>();
+    lineage
+        .upsert_series_version_thread_refs_batch(&upserts)
+        .await?;
+
+    let final_counts = sqlx::query_as::<_, (i32, i64)>(
+        r#"SELECT psv.version_num, COUNT(*)::bigint
+        FROM patch_series_version_threads psvt
+        JOIN patch_series_versions psv
+          ON psv.id = psvt.patch_series_version_id
+        WHERE psv.patch_series_id = $1
+        GROUP BY psv.version_num
+        ORDER BY psv.version_num ASC"#,
+    )
+    .bind(series_id)
+    .fetch_all(db.pool())
+    .await?;
+    assert_eq!(final_counts, vec![(1, 2), (2, 2)]);
+
+    Ok(())
+}
+
 async fn snapshot_counts(
     pool: &sqlx::PgPool,
     series_id: i64,
@@ -474,6 +687,99 @@ async fn snapshot_counts(
     .await?;
 
     Ok((versions, items, assembled, logical_versions, files))
+}
+
+async fn ingest_fixture_messages(
+    ingest: &IngestStore,
+    repo: &nexus_db::MailingListRepo,
+    messages: &[String],
+) -> Result<Vec<i64>, Box<dyn std::error::Error>> {
+    let mut message_pks = Vec::new();
+    for (idx, raw) in messages.iter().enumerate() {
+        let parsed = parse_email(raw.as_bytes())?;
+        let input = ParsedMessageInput {
+            content_hash_sha256: parsed.content_hash_sha256,
+            subject_raw: parsed.subject_raw,
+            subject_norm: parsed.subject_norm,
+            from_name: parsed.from_name,
+            from_email: parsed.from_email,
+            date_utc: parsed.date_utc,
+            to_raw: parsed.to_raw,
+            cc_raw: parsed.cc_raw,
+            message_ids: parsed.message_ids,
+            message_id_primary: parsed.message_id_primary,
+            in_reply_to_ids: parsed.in_reply_to_ids,
+            references_ids: parsed.references_ids,
+            mime_type: parsed.mime_type,
+            body: ParsedBodyInput {
+                raw_rfc822: raw.as_bytes().to_vec(),
+                body_text: parsed.body_text,
+                diff_text: parsed.diff_text,
+                search_text: parsed.search_text,
+                has_diff: parsed.has_diff,
+                has_attachments: parsed.has_attachments,
+            },
+            patch_facts: None,
+        };
+        let outcome = ingest
+            .ingest_message(repo, &format!("{:040x}", idx + 1), &input)
+            .await?;
+        message_pks.push(outcome.message_pk.expect("message pk"));
+    }
+    Ok(message_pks)
+}
+
+async fn insert_linear_thread(
+    pool: &sqlx::PgPool,
+    mailing_list_id: i64,
+    root_node_key: &str,
+    subject_norm: &str,
+    message_pks: &[i64],
+) -> Result<i64, sqlx::Error> {
+    let root_message_pk = *message_pks.first().expect("messages");
+    let thread_id: i64 = sqlx::query_scalar(
+        r#"INSERT INTO threads
+        (mailing_list_id, root_node_key, root_message_pk, subject_norm, created_at, last_activity_at, message_count, membership_hash)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        RETURNING id"#,
+    )
+    .bind(mailing_list_id)
+    .bind(root_node_key)
+    .bind(root_message_pk)
+    .bind(subject_norm)
+    .bind(Utc.timestamp_opt(1_700_000_000, 0).single().expect("ts"))
+    .bind(Utc.timestamp_opt(1_700_000_100, 0).single().expect("ts"))
+    .bind(message_pks.len() as i32)
+    .bind(vec![1u8; 32])
+    .fetch_one(pool)
+    .await?;
+
+    for (idx, message_pk) in message_pks.iter().enumerate() {
+        let depth = if idx == 0 { 0 } else { 1 };
+        let parent = if idx == 0 {
+            None
+        } else {
+            Some(root_message_pk)
+        };
+        let mut sort_key = Vec::new();
+        sort_key.extend(((idx + 1) as u32).to_be_bytes());
+
+        sqlx::query(
+            r#"INSERT INTO thread_messages
+            (mailing_list_id, thread_id, message_pk, parent_message_pk, depth, sort_key, is_dummy)
+            VALUES ($1, $2, $3, $4, $5, $6, false)"#,
+        )
+        .bind(mailing_list_id)
+        .bind(thread_id)
+        .bind(*message_pk)
+        .bind(parent)
+        .bind(depth)
+        .bind(sort_key)
+        .execute(pool)
+        .await?;
+    }
+
+    Ok(thread_id)
 }
 
 fn fixture_messages(series_tag: &str) -> Vec<String> {

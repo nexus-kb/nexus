@@ -96,6 +96,10 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/threading/rebuild", post(admin::threading_rebuild))
         .route("/lineage/rebuild", post(admin::lineage_rebuild))
         .route(
+            "/lineage/thread-refs/backfill",
+            post(admin::lineage_thread_refs_backfill),
+        )
+        .route(
             "/search/embeddings/backfill",
             post(admin::search_embeddings_backfill),
         )

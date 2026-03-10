@@ -13,8 +13,8 @@ use nexus_db::{
 };
 use nexus_jobs::payloads::{
     EmbeddingBackfillRunPayload, EmbeddingScope, LineageRebuildListPayload,
-    MeiliBootstrapRunPayload, MeiliBootstrapScope, PipelineIngestPayload,
-    ThreadingRebuildListPayload,
+    LineageThreadRefsBackfillListPayload, MeiliBootstrapRunPayload, MeiliBootstrapScope,
+    PipelineIngestPayload, ThreadingRebuildListPayload,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -48,7 +48,7 @@ pub use meili_bootstrap::{
 };
 pub use openapi::{openapi_docs, openapi_json};
 pub use pipeline::{get_pipeline_run, list_pipeline_runs};
-pub use rebuild::{lineage_rebuild, threading_rebuild};
+pub use rebuild::{lineage_rebuild, lineage_thread_refs_backfill, threading_rebuild};
 
 use diagnostics::{
     QueueStateCountsResponse, StorageDbListCountsResponse, StorageDbListRepoCountsResponse,

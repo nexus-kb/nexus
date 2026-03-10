@@ -33,13 +33,14 @@ pub use crate::jobs::{
 };
 pub use crate::lineage::{
     AssembledItemRecord, LineageSourceMessage, LineageStore, ListThreadsParams, MessageBodyRecord,
-    MessageDetailRecord, PatchFactHydrationOutcome, PatchItemDetailRecord, PatchItemDiffRecord,
-    PatchItemFileAggregateRecord, PatchItemFileBatchInput, PatchItemFileDiffSliceSource,
-    PatchItemFileRecord, PatchItemRecord, PatchLogicalRecord, PatchSeriesRecord,
-    PatchSeriesVersionRecord, SeriesListItemRecord, SeriesLogicalCompareRow,
-    SeriesVersionPatchItemRecord, SeriesVersionPatchRef, SeriesVersionSummaryRecord,
-    ThreadListItemRecord, ThreadMessageRecord, ThreadParticipantRecord, ThreadRefRecord,
-    ThreadSummaryRecord, UpsertPatchItemFileInput, UpsertPatchItemInput, UpsertPatchSeriesInput,
+    MessageDetailRecord, MessageThreadMatchRecord, PatchFactHydrationOutcome,
+    PatchItemDetailRecord, PatchItemDiffRecord, PatchItemFileAggregateRecord,
+    PatchItemFileBatchInput, PatchItemFileDiffSliceSource, PatchItemFileRecord, PatchItemRecord,
+    PatchLogicalRecord, PatchSeriesRecord, PatchSeriesVersionRecord, SeriesListItemRecord,
+    SeriesLogicalCompareRow, SeriesVersionPatchItemRecord, SeriesVersionPatchRef,
+    SeriesVersionSummaryRecord, SeriesVersionThreadRefBackfillCandidate, ThreadListItemRecord,
+    ThreadMessageRecord, ThreadParticipantRecord, ThreadRefRecord, ThreadSummaryRecord,
+    UpsertPatchItemFileInput, UpsertPatchItemInput, UpsertPatchSeriesInput,
     UpsertPatchSeriesVersionInput,
 };
 pub use crate::mainline::{

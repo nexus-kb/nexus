@@ -122,28 +122,31 @@ pub async fn series_detail(
         .list_series_versions_with_counts(series_id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let version_ids = versions
+        .iter()
+        .map(|version| version.id)
+        .collect::<Vec<_>>();
+    let thread_refs = state
+        .lineage
+        .list_thread_refs_for_series_versions(&version_ids)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut thread_refs_by_version =
+        std::collections::BTreeMap::<i64, Vec<SeriesThreadRefResponse>>::new();
+    for thread in thread_refs {
+        thread_refs_by_version
+            .entry(thread.patch_series_version_id)
+            .or_default()
+            .push(SeriesThreadRefResponse {
+                list_key: thread.list_key,
+                thread_id: thread.thread_id,
+                message_count: thread.message_count,
+                last_activity_at: thread.last_activity_at,
+            });
+    }
 
     let mut version_items = Vec::with_capacity(versions.len());
     for version in versions {
-        let thread_refs = match (version.thread_mailing_list_id, version.thread_id) {
-            (Some(mailing_list_id), Some(thread_id)) => state
-                .lineage
-                .get_thread_ref(mailing_list_id, thread_id)
-                .await
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-                .map(|thread| {
-                    vec![SeriesThreadRefResponse {
-                        list_key: thread.list_key,
-                        thread_id: thread.thread_id,
-                        message_count: thread.message_count,
-                        last_activity_at: thread.last_activity_at,
-                    }]
-                })
-                .unwrap_or_default(),
-            (None, None) => Vec::new(),
-            _ => Vec::new(),
-        };
-
         version_items.push(SeriesVersionSummaryResponse {
             series_version_id: version.id,
             version_num: version.version_num,
@@ -152,7 +155,9 @@ pub async fn series_detail(
             sent_at: version.sent_at,
             base_commit: version.base_commit,
             cover_message_id: version.cover_message_pk,
-            thread_refs,
+            thread_refs: thread_refs_by_version
+                .remove(&version.id)
+                .unwrap_or_default(),
             patch_count: version.patch_count,
             is_partial_reroll: version.is_partial_reroll,
             merge_summary: merge_summary_response(

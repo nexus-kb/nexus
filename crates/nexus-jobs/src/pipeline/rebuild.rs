@@ -623,4 +623,321 @@ impl Phase0JobHandler {
             },
         }
     }
+
+    pub(super) async fn handle_lineage_thread_refs_backfill_list(
+        &self,
+        job: Job,
+        ctx: ExecutionContext,
+    ) -> JobExecutionOutcome {
+        let started = Instant::now();
+
+        let payload: LineageThreadRefsBackfillListPayload =
+            match serde_json::from_value(job.payload_json.clone()) {
+                Ok(v) => v,
+                Err(err) => {
+                    return JobExecutionOutcome::Terminal {
+                        reason: format!("invalid lineage_thread_refs_backfill_list payload: {err}"),
+                        kind: "payload".to_string(),
+                        metrics: empty_metrics(started.elapsed().as_millis()),
+                    };
+                }
+            };
+
+        match self
+            .pipeline
+            .get_active_run_for_list(&payload.list_key)
+            .await
+        {
+            Ok(Some(_)) => {
+                return retryable_error(
+                    format!(
+                        "pipeline is running for list {}, deferring lineage_thread_refs_backfill_list",
+                        payload.list_key
+                    ),
+                    "stage_barrier",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+            Err(err) => {
+                return retryable_error(
+                    format!(
+                        "failed to check active pipeline for list {}: {err}",
+                        payload.list_key
+                    ),
+                    "db",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+            Ok(None) => {}
+        }
+
+        let list = match self.catalog.get_mailing_list(&payload.list_key).await {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                return JobExecutionOutcome::Terminal {
+                    reason: format!("mailing list not found for list_key={}", payload.list_key),
+                    kind: "not_found".to_string(),
+                    metrics: empty_metrics(started.elapsed().as_millis()),
+                };
+            }
+            Err(err) => {
+                return retryable_error(
+                    format!("failed to load mailing list: {err}"),
+                    "db",
+                    &job,
+                    started.elapsed().as_millis(),
+                    &self.settings,
+                );
+            }
+        };
+
+        let mut cursor = 0i64;
+        let mut processed_chunks = 0u64;
+        let mut versions_scanned = 0u64;
+        let mut versions_present_in_list = 0u64;
+        let mut refs_upserted = 0u64;
+        let mut missing_anchor = 0u64;
+        let mut missing_thread_membership = 0u64;
+        let mut duplicate_thread_matches = 0u64;
+        let mut last_progress_log = Instant::now();
+        let batch_limit = usize_to_i64(self.settings.mail.commit_batch_size.max(1));
+
+        loop {
+            if let Err(err) = ctx.heartbeat().await {
+                warn!(job_id = job.id, error = %err, "heartbeat update failed");
+            }
+            match ctx.is_cancel_requested().await {
+                Ok(true) => {
+                    return JobExecutionOutcome::Cancelled {
+                        reason: "cancel requested".to_string(),
+                        metrics: JobStoreMetrics {
+                            duration_ms: started.elapsed().as_millis(),
+                            rows_written: refs_upserted,
+                            bytes_read: 0,
+                            commit_count: versions_scanned,
+                            parse_errors: 0,
+                        },
+                    };
+                }
+                Ok(false) => {}
+                Err(err) => warn!(job_id = job.id, error = %err, "cancel check failed"),
+            }
+
+            let candidates = match self
+                .lineage
+                .list_series_version_thread_ref_backfill_candidates(
+                    list.id,
+                    payload.from_seen_at,
+                    payload.to_seen_at,
+                    cursor,
+                    batch_limit,
+                )
+                .await
+            {
+                Ok(v) => v,
+                Err(err) => {
+                    return retryable_error(
+                        format!(
+                            "failed to load thread ref backfill candidate chunk for {}: {err}",
+                            payload.list_key
+                        ),
+                        "db",
+                        &job,
+                        started.elapsed().as_millis(),
+                        &self.settings,
+                    );
+                }
+            };
+
+            if candidates.is_empty() {
+                break;
+            }
+
+            cursor = candidates
+                .last()
+                .map(|row| row.patch_series_version_id)
+                .unwrap_or(cursor);
+            processed_chunks += 1;
+            versions_scanned += usize_to_u64(candidates.len());
+
+            let anchor_message_pks = candidates
+                .iter()
+                .filter_map(|row| row.anchor_message_pk)
+                .collect::<Vec<_>>();
+            missing_anchor += usize_to_u64(
+                candidates
+                    .iter()
+                    .filter(|row| row.anchor_message_pk.is_none())
+                    .count(),
+            );
+
+            if !anchor_message_pks.is_empty() {
+                let present_message_pks = match self
+                    .lineage
+                    .list_message_pks_present_in_list(
+                        list.id,
+                        &anchor_message_pks,
+                        payload.from_seen_at,
+                        payload.to_seen_at,
+                    )
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(err) => {
+                        return retryable_error(
+                            format!(
+                                "failed to load list message presence for {}: {err}",
+                                payload.list_key
+                            ),
+                            "db",
+                            &job,
+                            started.elapsed().as_millis(),
+                            &self.settings,
+                        );
+                    }
+                };
+
+                let present_message_set =
+                    present_message_pks.iter().copied().collect::<HashSet<_>>();
+                versions_present_in_list += usize_to_u64(
+                    candidates
+                        .iter()
+                        .filter(|row| {
+                            row.anchor_message_pk
+                                .is_some_and(|message_pk| present_message_set.contains(&message_pk))
+                        })
+                        .count(),
+                );
+
+                let thread_match_map = match self
+                    .lineage
+                    .list_thread_matches_for_messages(list.id, &present_message_pks)
+                    .await
+                {
+                    Ok(v) => v
+                        .into_iter()
+                        .map(|row| (row.message_pk, row))
+                        .collect::<std::collections::HashMap<_, _>>(),
+                    Err(err) => {
+                        return retryable_error(
+                            format!(
+                                "failed to load thread matches for {}: {err}",
+                                payload.list_key
+                            ),
+                            "db",
+                            &job,
+                            started.elapsed().as_millis(),
+                            &self.settings,
+                        );
+                    }
+                };
+
+                let mut upserts = Vec::new();
+                for candidate in &candidates {
+                    let Some(anchor_message_pk) = candidate.anchor_message_pk else {
+                        continue;
+                    };
+                    if !present_message_set.contains(&anchor_message_pk) {
+                        continue;
+                    }
+                    match thread_match_map.get(&anchor_message_pk) {
+                        Some(match_row)
+                            if match_row.thread_match_count == 1
+                                && match_row.thread_id.is_some() =>
+                        {
+                            upserts.push((
+                                candidate.patch_series_version_id,
+                                list.id,
+                                match_row.thread_id.unwrap_or_default(),
+                            ));
+                        }
+                        Some(match_row) if match_row.thread_match_count > 1 => {
+                            duplicate_thread_matches += 1;
+                        }
+                        _ => {
+                            missing_thread_membership += 1;
+                        }
+                    }
+                }
+
+                match self
+                    .lineage
+                    .upsert_series_version_thread_refs_batch(&upserts)
+                    .await
+                {
+                    Ok(_) => {
+                        refs_upserted += usize_to_u64(upserts.len());
+                    }
+                    Err(err) => {
+                        return retryable_error(
+                            format!(
+                                "failed to upsert thread refs for {}: {err}",
+                                payload.list_key
+                            ),
+                            "db",
+                            &job,
+                            started.elapsed().as_millis(),
+                            &self.settings,
+                        );
+                    }
+                }
+            }
+
+            if processed_chunks.is_multiple_of(10)
+                || last_progress_log.elapsed() >= Duration::from_secs(30)
+            {
+                info!(
+                    job_id = job.id,
+                    list_key = %payload.list_key,
+                    processed_chunks,
+                    versions_scanned,
+                    versions_present_in_list,
+                    refs_upserted,
+                    missing_anchor,
+                    missing_thread_membership,
+                    duplicate_thread_matches,
+                    "lineage_thread_refs_backfill_list progress"
+                );
+                last_progress_log = Instant::now();
+            }
+        }
+
+        info!(
+            list_key = %payload.list_key,
+            processed_chunks,
+            versions_scanned,
+            versions_present_in_list,
+            refs_upserted,
+            missing_anchor,
+            missing_thread_membership,
+            duplicate_thread_matches,
+            "lineage_thread_refs_backfill_list completed"
+        );
+
+        JobExecutionOutcome::Success {
+            result_json: serde_json::json!({
+                "list_key": payload.list_key,
+                "processed_chunks": processed_chunks,
+                "versions_scanned": versions_scanned,
+                "versions_present_in_list": versions_present_in_list,
+                "refs_upserted": refs_upserted,
+                "missing_anchor": missing_anchor,
+                "missing_thread_membership": missing_thread_membership,
+                "duplicate_thread_matches": duplicate_thread_matches,
+                "from_seen_at": payload.from_seen_at,
+                "to_seen_at": payload.to_seen_at,
+            }),
+            metrics: JobStoreMetrics {
+                duration_ms: started.elapsed().as_millis(),
+                rows_written: refs_upserted,
+                bytes_read: 0,
+                commit_count: versions_scanned,
+                parse_errors: 0,
+            },
+        }
+    }
 }

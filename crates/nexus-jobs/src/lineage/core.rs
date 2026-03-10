@@ -112,6 +112,11 @@ async fn process_patch_extract_source_messages(
             .await
             .context("upsert patch_series_versions")?;
 
+        store
+            .upsert_series_version_thread_ref(version.id, mailing_list_id, candidate.thread_id)
+            .await
+            .context("upsert patch_series_version_threads")?;
+
         let upsert_inputs = candidate
             .items
             .iter()

@@ -397,8 +397,6 @@ pub struct SeriesVersionSummaryRecord {
     pub is_rfc: bool,
     pub is_resend: bool,
     pub is_partial_reroll: bool,
-    pub thread_mailing_list_id: Option<i64>,
-    pub thread_id: Option<i64>,
     pub cover_message_pk: Option<i64>,
     pub first_patch_message_pk: Option<i64>,
     pub sent_at: DateTime<Utc>,
@@ -416,10 +414,24 @@ pub struct SeriesVersionSummaryRecord {
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct ThreadRefRecord {
+    pub patch_series_version_id: i64,
     pub thread_id: i64,
     pub list_key: String,
     pub message_count: i64,
     pub last_activity_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct SeriesVersionThreadRefBackfillCandidate {
+    pub patch_series_version_id: i64,
+    pub anchor_message_pk: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct MessageThreadMatchRecord {
+    pub message_pk: i64,
+    pub thread_match_count: i64,
+    pub thread_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]

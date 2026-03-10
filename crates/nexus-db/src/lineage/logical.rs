@@ -201,6 +201,7 @@ impl LineageStore {
                 is_rfc,
                 is_resend,
                 is_partial_reroll,
+                thread_mailing_list_id,
                 thread_id,
                 cover_message_pk,
                 first_patch_message_pk,
@@ -208,7 +209,13 @@ impl LineageStore {
                 subject_raw,
                 subject_norm,
                 base_commit,
-                version_fingerprint
+                version_fingerprint,
+                mainline_merge_state,
+                mainline_matched_patch_count,
+                mainline_total_patch_count,
+                mainline_merged_in_tag,
+                mainline_merged_in_release,
+                mainline_single_patch_commit_oid
             FROM patch_series_versions
             WHERE patch_series_id = $1
             ORDER BY version_num ASC, sent_at ASC, id ASC"#,

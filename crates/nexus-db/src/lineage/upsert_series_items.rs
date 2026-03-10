@@ -19,7 +19,14 @@ impl LineageStore {
                           change_id,
                           created_at,
                           last_seen_at,
-                          latest_version_id"#,
+                          latest_version_id,
+                          mainline_merge_state,
+                          mainline_matched_patch_count,
+                          mainline_total_patch_count,
+                          mainline_merged_in_tag,
+                          mainline_merged_in_release,
+                          mainline_single_patch_commit_oid,
+                          mainline_merged_version_id"#,
             )
             .bind(&input.canonical_subject_norm)
             .bind(&input.author_email)
@@ -42,7 +49,14 @@ impl LineageStore {
                       change_id,
                       created_at,
                       last_seen_at,
-                      latest_version_id"#,
+                      latest_version_id,
+                      mainline_merge_state,
+                      mainline_matched_patch_count,
+                      mainline_total_patch_count,
+                      mainline_merged_in_tag,
+                      mainline_merged_in_release,
+                      mainline_single_patch_commit_oid,
+                      mainline_merged_version_id"#,
         )
         .bind(&input.canonical_subject_norm)
         .bind(&input.author_email)
@@ -147,7 +161,13 @@ impl LineageStore {
                       subject_raw,
                       subject_norm,
                       base_commit,
-                      version_fingerprint"#,
+                      version_fingerprint,
+                      mainline_merge_state,
+                      mainline_matched_patch_count,
+                      mainline_total_patch_count,
+                      mainline_merged_in_tag,
+                      mainline_merged_in_release,
+                      mainline_single_patch_commit_oid"#,
         )
         .bind(input.patch_series_id)
         .bind(input.version_num)
@@ -164,6 +184,57 @@ impl LineageStore {
         .bind(&input.version_fingerprint)
         .fetch_one(&self.pool)
         .await
+    }
+
+    pub async fn upsert_series_version_thread_ref(
+        &self,
+        patch_series_version_id: i64,
+        mailing_list_id: i64,
+        thread_id: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"INSERT INTO patch_series_version_threads
+            (patch_series_version_id, mailing_list_id, thread_id)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (patch_series_version_id, mailing_list_id)
+            DO UPDATE SET thread_id = EXCLUDED.thread_id"#,
+        )
+        .bind(patch_series_version_id)
+        .bind(mailing_list_id)
+        .bind(thread_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn upsert_series_version_thread_refs_batch(
+        &self,
+        rows: &[(i64, i64, i64)],
+    ) -> Result<u64> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        let mut qb = QueryBuilder::<sqlx::Postgres>::new(
+            "INSERT INTO patch_series_version_threads \
+             (patch_series_version_id, mailing_list_id, thread_id) ",
+        );
+        qb.push_values(
+            rows.iter(),
+            |mut b, (patch_series_version_id, mailing_list_id, thread_id)| {
+                b.push_bind(*patch_series_version_id)
+                    .push_bind(*mailing_list_id)
+                    .push_bind(*thread_id);
+            },
+        );
+        qb.push(
+            " ON CONFLICT (patch_series_version_id, mailing_list_id) \
+              DO UPDATE SET thread_id = EXCLUDED.thread_id",
+        );
+
+        let result = qb.build().execute(&self.pool).await?;
+        Ok(result.rows_affected())
     }
 
     pub async fn upsert_patch_item(

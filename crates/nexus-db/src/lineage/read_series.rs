@@ -169,8 +169,6 @@ impl LineageStore {
                 psv.is_rfc,
                 psv.is_resend,
                 psv.is_partial_reroll,
-                psv.thread_mailing_list_id,
-                psv.thread_id,
                 psv.cover_message_pk,
                 psv.first_patch_message_pk,
                 psv.sent_at,
@@ -195,8 +193,6 @@ impl LineageStore {
                 psv.is_rfc,
                 psv.is_resend,
                 psv.is_partial_reroll,
-                psv.thread_mailing_list_id,
-                psv.thread_id,
                 psv.cover_message_pk,
                 psv.first_patch_message_pk,
                 psv.sent_at,
@@ -216,27 +212,123 @@ impl LineageStore {
         .await
     }
 
-    pub async fn get_thread_ref(
+    pub async fn list_thread_refs_for_series_versions(
         &self,
-        mailing_list_id: i64,
-        thread_id: i64,
-    ) -> Result<Option<ThreadRefRecord>> {
+        series_version_ids: &[i64],
+    ) -> Result<Vec<ThreadRefRecord>> {
+        if series_version_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
         sqlx::query_as::<_, ThreadRefRecord>(
             r#"SELECT
+                psvt.patch_series_version_id,
                 t.id AS thread_id,
                 ml.list_key,
                 t.message_count::bigint AS message_count,
                 t.last_activity_at
-            FROM threads t
+            FROM patch_series_version_threads psvt
+            JOIN threads t
+              ON t.mailing_list_id = psvt.mailing_list_id
+             AND t.id = psvt.thread_id
             JOIN mailing_lists ml
               ON ml.id = t.mailing_list_id
-            WHERE t.mailing_list_id = $1
-              AND t.id = $2
-            LIMIT 1"#,
+            WHERE psvt.patch_series_version_id = ANY($1)
+            ORDER BY psvt.patch_series_version_id ASC, ml.list_key ASC, t.id ASC"#,
+        )
+        .bind(series_version_ids)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn list_series_version_thread_ref_backfill_candidates(
+        &self,
+        mailing_list_id: i64,
+        from_seen_at: Option<DateTime<Utc>>,
+        to_seen_at: Option<DateTime<Utc>>,
+        after_series_version_id: i64,
+        limit: i64,
+    ) -> Result<Vec<SeriesVersionThreadRefBackfillCandidate>> {
+        sqlx::query_as::<_, SeriesVersionThreadRefBackfillCandidate>(
+            r#"SELECT
+                id AS patch_series_version_id,
+                COALESCE(cover_message_pk, first_patch_message_pk) AS anchor_message_pk
+            FROM patch_series_versions
+            WHERE id > $1
+              AND (
+                  COALESCE(cover_message_pk, first_patch_message_pk) IS NULL
+                  OR EXISTS (
+                      SELECT 1
+                      FROM list_message_instances lmi
+                      WHERE lmi.mailing_list_id = $2
+                        AND lmi.message_pk = COALESCE(cover_message_pk, first_patch_message_pk)
+                        AND ($3::timestamptz IS NULL OR lmi.seen_at >= $3)
+                        AND ($4::timestamptz IS NULL OR lmi.seen_at < $4)
+                  )
+              )
+            ORDER BY id ASC
+            LIMIT $5"#,
+        )
+        .bind(after_series_version_id)
+        .bind(mailing_list_id)
+        .bind(from_seen_at)
+        .bind(to_seen_at)
+        .bind(limit.clamp(1, 5_000))
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn list_message_pks_present_in_list(
+        &self,
+        mailing_list_id: i64,
+        message_pks: &[i64],
+        from_seen_at: Option<DateTime<Utc>>,
+        to_seen_at: Option<DateTime<Utc>>,
+    ) -> Result<Vec<i64>> {
+        if message_pks.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        sqlx::query_scalar::<_, i64>(
+            r#"SELECT DISTINCT lmi.message_pk
+            FROM list_message_instances lmi
+            WHERE lmi.mailing_list_id = $1
+              AND lmi.message_pk = ANY($2)
+              AND ($3::timestamptz IS NULL OR lmi.seen_at >= $3)
+              AND ($4::timestamptz IS NULL OR lmi.seen_at < $4)
+            ORDER BY lmi.message_pk ASC"#,
         )
         .bind(mailing_list_id)
-        .bind(thread_id)
-        .fetch_optional(&self.pool)
+        .bind(message_pks)
+        .bind(from_seen_at)
+        .bind(to_seen_at)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn list_thread_matches_for_messages(
+        &self,
+        mailing_list_id: i64,
+        message_pks: &[i64],
+    ) -> Result<Vec<MessageThreadMatchRecord>> {
+        if message_pks.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        sqlx::query_as::<_, MessageThreadMatchRecord>(
+            r#"SELECT
+                tm.message_pk,
+                COUNT(DISTINCT tm.thread_id)::bigint AS thread_match_count,
+                MIN(tm.thread_id) AS thread_id
+            FROM thread_messages tm
+            WHERE tm.mailing_list_id = $1
+              AND tm.message_pk = ANY($2)
+            GROUP BY tm.message_pk
+            ORDER BY tm.message_pk ASC"#,
+        )
+        .bind(mailing_list_id)
+        .bind(message_pks)
+        .fetch_all(&self.pool)
         .await
     }
 

@@ -86,6 +86,7 @@ struct PublicApiSchemas;
         crate::handlers::admin::ingest::ResetWatermarkRequest,
         crate::handlers::admin::rebuild::ThreadingRebuildRequest,
         crate::handlers::admin::rebuild::LineageRebuildRequest,
+        crate::handlers::admin::rebuild::LineageThreadRefsBackfillRequest,
         crate::handlers::admin::embeddings::SearchEmbeddingsBackfillRequest,
         crate::handlers::admin::embeddings::SearchEmbeddingsBackfillResponse,
         crate::handlers::admin::meili_bootstrap::StartMeiliBootstrapRequest,
@@ -503,6 +504,15 @@ const ADMIN_OPERATIONS: &[OperationDef] = &[
         "200",
         Some("EnqueueResponse"),
         Some("LineageRebuildRequest"),
+    ),
+    op_admin(
+        "/admin/v1/lineage/thread-refs/backfill",
+        "post",
+        "Enqueue lineage thread refs backfill",
+        "Rebuild",
+        "200",
+        Some("EnqueueResponse"),
+        Some("LineageThreadRefsBackfillRequest"),
     ),
     op_admin(
         "/admin/v1/search/embeddings/backfill",

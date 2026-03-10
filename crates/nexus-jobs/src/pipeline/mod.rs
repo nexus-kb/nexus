@@ -31,9 +31,10 @@ use crate::patch_detect::extract_diff_text;
 use crate::patch_id::compute_patch_id_stable;
 use crate::payloads::{
     EmbeddingBackfillRunPayload, EmbeddingGenerateBatchPayload, EmbeddingScope,
-    LineageRebuildListPayload, MainlineScanRunPayload, MeiliBootstrapRunPayload,
-    PipelineEmbeddingPayload, PipelineIngestPayload, PipelineLexicalPayload,
-    PipelineLineagePayload, PipelineThreadingPayload, ThreadingRebuildListPayload,
+    LineageRebuildListPayload, LineageThreadRefsBackfillListPayload, MainlineScanRunPayload,
+    MeiliBootstrapRunPayload, PipelineEmbeddingPayload, PipelineIngestPayload,
+    PipelineLexicalPayload, PipelineLineagePayload, PipelineThreadingPayload,
+    ThreadingRebuildListPayload,
 };
 use crate::scanner::stream_new_commit_oid_chunks;
 use crate::threading::{ThreadingInputMessage, build_threads};
@@ -114,6 +115,10 @@ impl Phase0JobHandler {
             "pipeline_embedding" => self.handle_pipeline_embedding(job, ctx).await,
             "threading_rebuild_list" => self.handle_threading_rebuild_list(job, ctx).await,
             "lineage_rebuild_list" => self.handle_lineage_rebuild_list(job, ctx).await,
+            "lineage_thread_refs_backfill_list" => {
+                self.handle_lineage_thread_refs_backfill_list(job, ctx)
+                    .await
+            }
             "embedding_backfill_run" => self.handle_embedding_backfill_run(job, ctx).await,
             "embedding_generate_batch" => self.handle_embedding_generate_batch(job, ctx).await,
             "meili_bootstrap_run" => self.handle_meili_bootstrap_run(job, ctx).await,
