@@ -76,6 +76,7 @@ struct PostgresIngestService: Sendable {
     private struct NormalizedPublicInboxMessage:
         Sendable
     {
+        let commitOID: String
         let blobOID: String
         let parsed: ParsedIngestMessage
     }
@@ -244,6 +245,7 @@ struct PostgresIngestService: Sendable {
         let normalized = remappingThreadIdentifiers(
             in: messages.map {
                 NormalizedPublicInboxMessage(
+                    commitOID: $0.commitOID,
                     blobOID: $0.blobOID,
                     parsed:
                         PostgresTextNormalizer
@@ -308,8 +310,12 @@ struct PostgresIngestService: Sendable {
                 messageIndex,
                 message
             ) in normalized.enumerated() {
-                let persisted =
-                    try await persistMessage(
+                let persisted: (
+                    id: Int64,
+                    threadID: Int64
+                )
+                do {
+                    persisted = try await persistMessage(
                         blobOID:
                             message.blobOID,
                         parsed:
@@ -319,6 +325,21 @@ struct PostgresIngestService: Sendable {
                         connection: connection,
                         logger: logger
                     )
+                } catch let error as PostgresPatchIngestError {
+                    logger.error(
+                        "Patch persistence failed",
+                        metadata: [
+                            "commit-oid": "\(message.commitOID)",
+                            "blob-oid": "\(message.blobOID)",
+                            "epoch": "\(epoch)",
+                            "mailing-list-id": "\(mailingListID)",
+                            "message-id": "\(message.parsed.message.messageID)",
+                            "subject": "\(message.parsed.message.subject)",
+                            "error": "\(String(reflecting: error))",
+                        ]
+                    )
+                    throw error
+                }
 
                 batchState
                     .recipientsByMessageDatabaseID[
@@ -473,6 +494,7 @@ struct PostgresIngestService: Sendable {
 
         return messages.map { message in
             NormalizedPublicInboxMessage(
+                commitOID: message.commitOID,
                 blobOID: message.blobOID,
                 parsed: remappingThreadIdentifiers(
                     in: message.parsed,

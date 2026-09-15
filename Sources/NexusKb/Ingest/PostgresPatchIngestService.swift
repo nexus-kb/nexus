@@ -16,7 +16,9 @@ enum PostgresPatchIngestError:
 {
     case indexCollision(
         patchSetID: Int64,
-        partIndex: Int32
+        partIndex: Int32,
+        incomingMessageID: String,
+        existingMessageID: String
     )
     case missingPatchSet
 }
@@ -65,6 +67,25 @@ struct PostgresPatchIngestService: Sendable {
                 || coverLetterMessageID != nil
         else {
             return nil
+        }
+
+        if let existingPatchSetID = try await existingPatchSetID(
+            messageID: message.messageID,
+            connection: connection,
+            logger: logger
+        ) {
+            if let diff = metadata.diff {
+                try await execute(
+                    """
+                    UPDATE patches
+                    SET diff = \(diff)
+                    WHERE message_id = \(message.messageID)
+                    """,
+                    connection: connection,
+                    logger: logger
+                )
+            }
+            return existingPatchSetID
         }
 
         let candidates = try await matchingCandidates(
@@ -642,7 +663,7 @@ struct PostgresPatchIngestService: Sendable {
             return
         }
 
-        if try await hasPatchIndexCollision(
+        if let existingMessageID = try await patchIndexOccupant(
             patchSetID: patchSetID,
             messageID: messageID,
             partIndex: partIndex,
@@ -652,7 +673,9 @@ struct PostgresPatchIngestService: Sendable {
             throw PostgresPatchIngestError
                 .indexCollision(
                     patchSetID: patchSetID,
-                    partIndex: partIndex
+                    partIndex: partIndex,
+                    incomingMessageID: messageID,
+                    existingMessageID: existingMessageID
                 )
         }
 
@@ -838,34 +861,30 @@ struct PostgresPatchIngestService: Sendable {
         )
     }
 
-    private func hasPatchIndexCollision(
+    private func patchIndexOccupant(
         patchSetID: Int64,
         messageID: String,
         partIndex: Int32,
         connection: PostgresConnection,
         logger: Logger
-    ) async throws -> Bool {
+    ) async throws -> String? {
         let rows = try await connection.query(
             """
-            SELECT EXISTS (
-                SELECT 1
-                FROM patches
-                WHERE patchset_id =
-                        \(patchSetID)
-                  AND part_index =
-                        \(partIndex)
-                  AND message_id <>
-                        \(messageID)
-            )
+            SELECT message_id
+            FROM patches
+            WHERE patchset_id = \(patchSetID)
+              AND part_index = \(partIndex)
+              AND message_id <> \(messageID)
+            LIMIT 1
             """,
             logger: logger
         )
 
         for try await row in rows {
-            return try row.decode(Bool.self)
+            return try row.decode(String.self)
         }
 
-        return false
+        return nil
     }
 
     private func existingPatchSetID(

@@ -813,6 +813,125 @@ struct PublicInboxIngestBatchTests {
             try await fixture.remove()
         }
     }
+
+    @Test("Cross-list duplicate keeps its original patch position")
+    func preservesDuplicatePatchAssociation() async throws {
+        try await withApp(configure: configure) { app in
+            let fixture = try await DatabaseFixture(app: app)
+            do {
+                let patchBody =
+                    """
+                    diff --git a/file b/file
+                    --- a/file
+                    +++ b/file
+                    @@ -1 +1 @@
+                    -old
+                    +new
+                    """
+                let cover = try fixture.message(
+                    number: 1,
+                    subject: "[PATCH 0/2] duplicate series"
+                )
+                let partOne = try fixture.message(
+                    number: 2,
+                    inReplyTo: cover.parsed.message.messageID,
+                    subject: "[PATCH 1/2] first part",
+                    body: patchBody
+                )
+                let partTwo = try fixture.message(
+                    number: 3,
+                    inReplyTo: cover.parsed.message.messageID,
+                    subject: "[PATCH 2/2] second part",
+                    body: patchBody
+                )
+                let duplicatePartTwo = try fixture.message(
+                    number: 4,
+                    messageID: partTwo.parsed.message.messageID,
+                    subject: "[PATCH] differently wrapped second part",
+                    body: patchBody.replacingOccurrences(
+                        of: "+new",
+                        with: "+newer"
+                    )
+                )
+                let otherMailingListID =
+                    try await fixture.createAdditionalMailingList()
+                let service = PostgresIngestService(client: app.postgres)
+
+                _ = try await service.ingestBatch(
+                    [cover, partOne, partTwo],
+                    mailingListID: fixture.mailingListID,
+                    epoch: fixture.epoch,
+                    expectedPreviousCommitOID: nil,
+                    logger: app.logger
+                )
+                let original = try #require(
+                    try await fixture.patchSetState(
+                        messageID: cover.parsed.message.messageID
+                    )
+                )
+
+                _ = try await service.ingestBatch(
+                    [duplicatePartTwo],
+                    mailingListID: otherMailingListID,
+                    epoch: fixture.epoch,
+                    expectedPreviousCommitOID: nil,
+                    logger: app.logger
+                )
+
+                let updated = try #require(
+                    try await fixture.patchSetState(
+                        messageID: cover.parsed.message.messageID
+                    )
+                )
+                #expect(updated.id == original.id)
+                #expect(updated.threadID == original.threadID)
+                #expect(updated.totalParts == 2)
+                #expect(updated.receivedParts == 2)
+                #expect(updated.status == "Complete")
+                #expect(
+                    try await fixture.patchRows(
+                        patchSetID: updated.id
+                    ) == [
+                        TestPatchRow(
+                            messageID: partOne.parsed.message.messageID,
+                            partIndex: 1,
+                            diff: patchBody
+                        ),
+                        TestPatchRow(
+                            messageID: partTwo.parsed.message.messageID,
+                            partIndex: 2,
+                            diff: duplicatePartTwo.parsed.patch.diff ?? ""
+                        ),
+                    ]
+                )
+                #expect(
+                    try await fixture.messageBody(
+                        messageID: partTwo.parsed.message.messageID
+                    ) == duplicatePartTwo.parsed.message.textBody
+                )
+                #expect(
+                    try await fixture.mailingListBlobOID(
+                        messageID: partTwo.parsed.message.messageID,
+                        mailingListID: otherMailingListID
+                    ) == duplicatePartTwo.blobOID
+                )
+                #expect(
+                    try await fixture.cursor(
+                        mailingListID: otherMailingListID
+                    ) == duplicatePartTwo.commitOID
+                )
+                #expect(
+                    try await fixture.lineageWorkCount(
+                        mailingListID: otherMailingListID
+                    ) == 1
+                )
+            } catch {
+                try? await fixture.remove()
+                throw error
+            }
+            try await fixture.remove()
+        }
+    }
 }
 
 private struct TestPerson {
@@ -845,6 +964,12 @@ private struct TestPatchSetState {
     let totalParts: Int32
     let receivedParts: Int32
     let status: String
+}
+
+private struct TestPatchRow: Equatable {
+    let messageID: String
+    let partIndex: Int32
+    let diff: String
 }
 
 private struct TestThreadMetadata {
@@ -1007,12 +1132,16 @@ private final class DatabaseFixture {
         )
     }
 
-    func cursor() async throws -> String? {
+    func cursor(
+        mailingListID: Int64? = nil
+    ) async throws -> String? {
+        let targetMailingListID =
+            mailingListID ?? self.mailingListID
         let rows = try await app.postgres.query(
             """
             SELECT last_scanned_commit_oid
             FROM mailing_list_archive_epochs
-            WHERE mailing_list_id = \(mailingListID)
+            WHERE mailing_list_id = \(targetMailingListID)
               AND epoch = \(epoch)
             """,
             logger: app.logger
@@ -1360,6 +1489,51 @@ private final class DatabaseFixture {
         return messageIDs
     }
 
+    func patchRows(
+        patchSetID: Int64
+    ) async throws -> [TestPatchRow] {
+        let rows = try await app.postgres.query(
+            """
+            SELECT message_id, part_index, diff
+            FROM patches
+            WHERE patchset_id = \(patchSetID)
+            ORDER BY part_index
+            """,
+            logger: app.logger
+        )
+        var values: [TestPatchRow] = []
+        for try await row in rows {
+            let value = try row.decode(
+                (String, Int32, String).self
+            )
+            values.append(
+                TestPatchRow(
+                    messageID: value.0,
+                    partIndex: value.1,
+                    diff: value.2
+                )
+            )
+        }
+        return values
+    }
+
+    func messageBody(
+        messageID: String
+    ) async throws -> String? {
+        let rows = try await app.postgres.query(
+            """
+            SELECT body
+            FROM messages
+            WHERE message_id = \(messageID)
+            """,
+            logger: app.logger
+        )
+        for try await row in rows {
+            return try row.decode(String.self)
+        }
+        return nil
+    }
+
     func mailingListBlobOID(
         messageID: String,
         mailingListID: Int64? = nil
@@ -1485,12 +1659,16 @@ private final class DatabaseFixture {
         }
     }
 
-    func lineageWorkCount() async throws -> Int64 {
+    func lineageWorkCount(
+        mailingListID: Int64? = nil
+    ) async throws -> Int64 {
+        let targetMailingListID =
+            mailingListID ?? self.mailingListID
         let rows = try await app.postgres.query(
             """
             SELECT count(*)::bigint
             FROM patch_lineage_work_items
-            WHERE mailing_list_id = \(mailingListID)
+            WHERE mailing_list_id = \(targetMailingListID)
             """,
             logger: app.logger
         )
