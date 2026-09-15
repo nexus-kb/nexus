@@ -1,19 +1,4 @@
 # ================================
-# Web UI build image
-# ================================
-FROM node:24-bookworm-slim AS web
-
-WORKDIR /build/WebUI
-
-RUN corepack enable && corepack prepare pnpm@11.19.0 --activate
-
-COPY WebUI/package.json WebUI/pnpm-lock.yaml ./
-RUN pnpm install --frozen-lockfile
-
-COPY WebUI/ ./
-RUN pnpm build
-
-# ================================
 # Build image
 # ================================
 FROM swift:6.3-noble AS build
@@ -38,9 +23,6 @@ RUN swift package resolve \
 # Copy entire repo into container
 COPY . .
 
-# Use assets built from the WebUI source in this checkout.
-COPY --from=web /build/Public ./Public
-
 RUN mkdir /staging
 
 # Build the application, with optimizations, with static linking, and using jemalloc
@@ -62,9 +44,8 @@ WORKDIR /staging
 # Copy static swift backtracer binary to staging area
 RUN cp "/usr/libexec/swift/linux/swift-backtrace-static" ./
 
-# Copy any resources from the public directory and views directory if the directories exist
+# Copy any resources from the views directory if it exists
 # Ensure that by default, neither the directory nor any of its contents are writable.
-RUN [ -d /build/Public ] && { mv /build/Public ./Public && chmod -R a-w ./Public; } || true
 RUN [ -d /build/Resources ] && { mv /build/Resources ./Resources && chmod -R a-w ./Resources; } || true
 
 # ================================

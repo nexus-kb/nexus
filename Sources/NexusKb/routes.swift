@@ -1,15 +1,6 @@
 import Vapor
 
 func routes(_ app: Application) throws {
-    app.get { req async throws -> Response in
-        try await req.fileio.asyncStreamFile(
-            at:
-                req.application.directory
-                    .publicDirectory
-                + "index.html"
-        )
-    }
-
     let api = app.grouped(
         "api",
         "v1"

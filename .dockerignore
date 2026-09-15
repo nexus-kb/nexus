@@ -3,6 +3,6 @@
 .git/
 .vscode/
 docs/
-Public/
 WebUI/node_modules/
 WebUI/coverage/
+WebUI/dist/
