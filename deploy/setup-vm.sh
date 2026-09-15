@@ -63,7 +63,22 @@ systemctl enable --now cron
 
 docker compose up --detach db
 docker compose run --rm migrate
-docker compose up --detach --build server worker web
+deployment_tag="${NEXUS_IMAGE_TAG:-latest}-deploy-$(date -u +%Y%m%d%H%M%S)-$$"
+NEXUS_IMAGE_TAG="$deployment_tag" docker compose build server web
+expected_app_image=$(
+    docker image inspect --format '{{.Id}}' "nexus-kb:$deployment_tag"
+)
+NEXUS_IMAGE_TAG="$deployment_tag" \
+    docker compose up --detach --force-recreate server worker web
+
+server_image=$(docker inspect --format '{{.Image}}' "$(docker compose ps --quiet server)")
+worker_image=$(docker inspect --format '{{.Image}}' "$(docker compose ps --quiet worker)")
+if [[ "$server_image" != "$expected_app_image" ||
+      "$worker_image" != "$expected_app_image" ]]; then
+    echo "Server or worker is not running the image built by this deployment" >&2
+    docker compose ps >&2
+    exit 1
+fi
 
 echo "Waiting for Nexus to become healthy..."
 for _ in {1..60}; do

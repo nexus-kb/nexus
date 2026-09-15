@@ -90,8 +90,17 @@ restarting application processes:
 ```bash
 docker compose up -d db
 docker compose run --rm migrate
-docker compose up -d --build server worker web
+deployment_tag="${NEXUS_IMAGE_TAG:-latest}-deploy-$(date -u +%Y%m%d%H%M%S)-$$"
+NEXUS_IMAGE_TAG="$deployment_tag" docker compose build server web
+expected_app_image=$(docker image inspect --format '{{.Id}}' "nexus-kb:$deployment_tag")
+NEXUS_IMAGE_TAG="$deployment_tag" docker compose up -d --force-recreate server worker web
+test "$(docker inspect --format '{{.Image}}' "$(docker compose ps -q server)")" = "$expected_app_image"
+test "$(docker inspect --format '{{.Image}}' "$(docker compose ps -q worker)")" = "$expected_app_image"
 ```
+
+The unique deployment tag prevents another build from changing the selected
+image between build and startup. Both application services are then checked
+against the exact image produced by this deployment.
 
 Applied migration names and checksums are recorded in
 `nexus_schema_migrations`; an already-applied SQL file must never be edited.
