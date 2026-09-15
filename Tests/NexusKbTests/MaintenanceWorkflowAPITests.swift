@@ -35,6 +35,25 @@ struct MaintenanceWorkflowAPITests {
                 #expect(completedIngest.state == .succeeded)
                 #expect(completedIngest.stages.first?.processedItems == 1)
                 #expect(try await fixture.messageCount() == 1)
+                var searchComponents = URLComponents()
+                searchComponents.path = "/api/v1/search"
+                searchComponents.queryItems = [
+                    URLQueryItem(name: "q", value: archive.searchToken)
+                ]
+                try await app.testing().test(
+                    .GET,
+                    try #require(searchComponents.string)
+                ) { response async throws in
+                    #expect(response.status == .ok)
+                    let results = try response.content.decode(
+                        MailSearchCollectionView.self
+                    )
+                    #expect(
+                        results.items.contains {
+                            $0.rootMessageId == archive.messageID
+                        }
+                    )
+                }
                 #expect(try await fixture.lineageWorkCount() == 1)
                 #expect(try await fixture.lineageStateCount() == 0)
 
@@ -471,11 +490,15 @@ private final class MaintenanceAPIFixture: @unchecked Sendable {
 private final class MaintenanceTestArchive: @unchecked Sendable {
     let rootURL: URL
     let messageID: String
+    let searchToken: String
     private let repositoryURL: URL
 
     init() throws {
-        messageID =
-            "maintenance-workflow-\(UUID().uuidString.lowercased())@example.com"
+        let identifier = UUID().uuidString
+            .replacingOccurrences(of: "-", with: "")
+            .lowercased()
+        messageID = "maintenance-workflow-\(identifier)@example.com"
+        searchToken = "nexusmaintenance\(identifier)"
         rootURL = FileManager.default.temporaryDirectory
             .appendingPathComponent(
                 "nexus-kb-maintenance-archive-\(UUID().uuidString)",
@@ -502,7 +525,7 @@ private final class MaintenanceTestArchive: @unchecked Sendable {
             """
             From: Nexus Test <nexus@example.com>
             Message-ID: <\(messageID)>
-            Subject: [PATCH] test: maintenance workflow
+            Subject: [PATCH] test: \(searchToken) maintenance workflow
             Date: Fri, 21 Aug 2026 12:00:00 -0400
 
             diff --git a/file b/file
