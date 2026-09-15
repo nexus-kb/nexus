@@ -1598,6 +1598,27 @@ private final class DatabaseFixture {
         return nil
     }
 
+    func threadRootMessageID(
+        messageID: String
+    ) async throws -> String? {
+        let rows = try await app.postgres.query(
+            """
+            SELECT thread.root_message_id
+            FROM threads AS thread
+            JOIN messages AS message
+              ON message.thread_id = thread.id
+            WHERE message.message_id = \(messageID)
+            """,
+            logger: app.logger
+        )
+
+        for try await row in rows {
+            return try row.decode(String.self)
+        }
+
+        return nil
+    }
+
     func threadCount() async throws -> Int64 {
         let rows = try await app.postgres.query(
             """
@@ -2430,6 +2451,84 @@ func resolvesPlaceholderInBatch() async throws {
                 try await fixture.threadCount()
                     == 1
             )
+        } catch {
+            try? await fixture.remove()
+            throw error
+        }
+
+        try await fixture.remove()
+    }
+}
+
+@Test(
+    "A parent arriving after root promotion restores the original root"
+)
+func resolvesPromotedRootInLaterBatch() async throws {
+    try await withApp(
+        configure: configure
+    ) { app in
+        let fixture = try await DatabaseFixture(
+            app: app
+        )
+
+        do {
+            let rootMessageID =
+                "\(fixture.prefix)-root@example.com"
+            let reply = try fixture.message(
+                number: 1,
+                inReplyTo: rootMessageID,
+                subject: "First available"
+            )
+            let service = PostgresIngestService(
+                client: app.postgres
+            )
+            let results = try await service.ingestBatch(
+                [reply],
+                mailingListID: fixture.mailingListID,
+                epoch: fixture.epoch,
+                expectedPreviousCommitOID: nil,
+                logger: app.logger
+            )
+            let threadID = try #require(
+                results.first?.threadID
+            )
+
+            try await PostgresThreadRootService(
+                client: app.postgres
+            ).finalizeEligibleRoots(
+                threadIDs: [threadID],
+                logger: app.logger
+            )
+            #expect(
+                try await fixture.threadRootMessageID(
+                    messageID: rootMessageID
+                ) == reply.parsed.message.messageID
+            )
+
+            let root = try fixture.message(
+                number: 2,
+                messageID: rootMessageID,
+                subject: "Late root"
+            )
+            _ = try await service.ingestBatch(
+                [root],
+                mailingListID: fixture.mailingListID,
+                epoch: fixture.epoch,
+                expectedPreviousCommitOID: reply.commitOID,
+                logger: app.logger
+            )
+
+            #expect(
+                try await fixture.threadRootMessageID(
+                    messageID: rootMessageID
+                ) == rootMessageID
+            )
+            #expect(
+                try await fixture.threadMetadata(
+                    messageID: rootMessageID
+                )?.subject == "Late root"
+            )
+            #expect(try await fixture.threadCount() == 1)
         } catch {
             try? await fixture.remove()
             throw error

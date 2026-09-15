@@ -6,6 +6,10 @@ export interface ThreadTreeNode {
 }
 
 function candidateParentIDs(message: MessageDetail): string[] {
+  if (message.messageId === message.rootMessageId) {
+    return [];
+  }
+
   const references = [...message.referenceMessageIds].reverse();
   return message.inReplyToMessageId
     ? [message.inReplyToMessageId, ...references]

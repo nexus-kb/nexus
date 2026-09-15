@@ -109,6 +109,19 @@ struct MaintenanceWorkflowJob: AsyncJob {
                 )
             }
 
+            if current.kind == .grokmirror {
+                try await PostgresThreadRootService(
+                    client: context.application.postgres
+                ).finalizeEligibleRoots(
+                    mailingListIDs: current.stages
+                        .filter {
+                            $0.operation == .ingest
+                        }
+                        .map(\.mailingListID),
+                    logger: context.logger
+                )
+            }
+
             try await repository.markRunSucceeded(
                 payload.runID,
                 logger: context.logger

@@ -406,6 +406,13 @@ struct PostgresIngestService: Sendable {
                 logger: logger
             )
 
+            try await PostgresThreadRootService(
+                client: client
+            ).reconcilePromotions(
+                connection: connection,
+                logger: logger
+            )
+
             try await enqueuePatchLineageWork(
                 patchSetIDs:
                     batchState.affectedPatchSetIDs
@@ -1488,7 +1495,10 @@ struct PostgresIngestService: Sendable {
                                     .root_message_id
                             )
                         )[1],
-                        thread.subject,
+                        NULLIF(
+                            thread.subject,
+                            '(placeholder)'
+                        ),
                         (
                             array_agg(
                                 input.subject

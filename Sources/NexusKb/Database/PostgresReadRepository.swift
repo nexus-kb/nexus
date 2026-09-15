@@ -275,7 +275,11 @@ struct PostgresReadRepository: Sendable {
             WITH page AS MATERIALIZED (
                 SELECT t.*
                 FROM threads AS t
-                WHERE t.root_message_id = \(rootMessageID.value)
+                WHERE t.id = (
+                    SELECT message.thread_id
+                    FROM messages AS message
+                    WHERE message.message_id = \(rootMessageID.value)
+                )
             )
             \(unescaped: threadProjectionSQL)
             """,
@@ -291,12 +295,13 @@ struct PostgresReadRepository: Sendable {
         cursor: MessageCursor?,
         logger: Logger
     ) async throws -> ThreadMessagePageResult? {
-        guard let threadID = try await threadDatabaseID(
+        guard let threadIdentity = try await threadIdentity(
             rootMessageID: rootMessageID,
             logger: logger
         ) else {
             return nil
         }
+        let threadID = threadIdentity.id
 
         let fetchLimit = limit + 1
         let rows: PostgresRowSequence
@@ -308,6 +313,8 @@ struct PostgresReadRepository: Sendable {
                 """
                 \(unescaped: messageProjectionSQL)
                 WHERE message.thread_id = \(threadID)
+                  AND message.message_id IS DISTINCT FROM
+                        thread.promoted_from_message_id
                   AND (
                     COALESCE(
                         message.sent_at,
@@ -335,6 +342,8 @@ struct PostgresReadRepository: Sendable {
                 """
                 \(unescaped: messageProjectionSQL)
                 WHERE message.thread_id = \(threadID)
+                  AND message.message_id IS DISTINCT FROM
+                        thread.promoted_from_message_id
                   AND (
                     COALESCE(
                         message.sent_at,
@@ -361,6 +370,8 @@ struct PostgresReadRepository: Sendable {
                 """
                 \(unescaped: messageProjectionSQL)
                 WHERE message.thread_id = \(threadID)
+                  AND message.message_id IS DISTINCT FROM
+                        thread.promoted_from_message_id
                 ORDER BY
                     COALESCE(
                         message.sent_at,
@@ -400,7 +411,7 @@ struct PostgresReadRepository: Sendable {
         }
 
         return ThreadMessagePageResult(
-            rootMessageID: rootMessageID.value,
+            rootMessageID: threadIdentity.rootMessageID,
             items: items,
             previousCursor: try hasPrevious
                 ? items.first.map {
@@ -546,21 +557,28 @@ struct PostgresReadRepository: Sendable {
         return try await decodeThreads(rows)
     }
 
-    private func threadDatabaseID(
+    private func threadIdentity(
         rootMessageID: MessageIdentifier,
         logger: Logger
-    ) async throws -> Int64? {
+    ) async throws -> (
+        id: Int64,
+        rootMessageID: String
+    )? {
         let rows = try await client.query(
             """
-            SELECT id
-            FROM threads
-            WHERE root_message_id = \(rootMessageID.value)
+            SELECT thread.id, thread.root_message_id
+            FROM messages AS message
+            JOIN threads AS thread
+              ON thread.id = message.thread_id
+            WHERE message.message_id = \(rootMessageID.value)
             """,
             logger: logger
         )
 
         for try await row in rows {
-            return try row.decode(Int64.self)
+            return try row.decode(
+                (Int64, String).self
+            )
         }
 
         return nil
@@ -859,6 +877,8 @@ struct PostgresReadRepository: Sendable {
                 )::bigint AS message_count,
                 COUNT(*) FILTER (
                     WHERE message.is_placeholder
+                      AND message.message_id IS DISTINCT FROM
+                            t.promoted_from_message_id
                 )::bigint AS missing_message_count
             FROM messages AS message
             WHERE message.thread_id = t.id

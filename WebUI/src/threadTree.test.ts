@@ -27,6 +27,22 @@ function message(
 }
 
 describe("buildThreadTree", () => {
+  it("treats the canonical promoted root as parentless", () => {
+    const missingParent = "missing@example.com";
+    const promotedRoot = message("promoted@example.com", missingParent, [missingParent]);
+    promotedRoot.rootMessageId = promotedRoot.messageId;
+
+    const roots = buildThreadTree([
+      message("other@example.com"),
+      promotedRoot,
+    ]);
+
+    expect(roots.map((node) => node.message.messageId)).toEqual([
+      "other@example.com",
+      "promoted@example.com",
+    ]);
+  });
+
   it("builds nested replies and preserves sibling input order", () => {
     const tree = buildThreadTree([
       message("root"),

@@ -185,8 +185,12 @@ struct PostgresPatchLineageReadRepository:
               ON patchset.thread_id = thread.id
             JOIN patchset_lineage_state AS state
               ON state.patchset_id = patchset.id
-            WHERE thread.root_message_id =
-                    \(rootMessageID.value)
+            WHERE thread.id = (
+                SELECT message.thread_id
+                FROM messages AS message
+                WHERE message.message_id =
+                        \(rootMessageID.value)
+            )
             ORDER BY state.lineage_id
             """,
             logger: logger
