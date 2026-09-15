@@ -77,9 +77,12 @@ clone the repository and run:
 
 The idempotent setup creates a private `.env` with a random database password,
 installs the tracked grokmirror configuration, installs a cron entry that pulls
-at minute 17 every four hours, applies pending SQL migrations, builds the WebUI
-and Vapor image, and starts the stack. Edit `.env` before rerunning setup if the
-bind address, port, logging, or credentials need to differ.
+the BPF, DAMON, Git, KVM, Linux MM, LKML, LLVM, Netdev, Rust for Linux,
+Sched-ext, and Linux Stable archives at minute 17 every four hours, applies
+pending SQL migrations, builds the WebUI and Vapor image, starts the stack, and
+queues an initial mirror pull followed by maintenance. Edit `.env` before
+rerunning setup if the bind address, port, logging, or credentials need to
+differ.
 
 Migrations are deliberately manual. On later deployments, run them before
 restarting application processes:

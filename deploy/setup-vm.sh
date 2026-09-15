@@ -7,7 +7,7 @@ if ((EUID != 0)); then
     exec sudo -- "$repository_root/deploy/setup-vm.sh" "$@"
 fi
 
-for command in curl docker flock grok-pull openssl systemctl; do
+for command in curl docker flock grok-pull openssl systemctl systemd-run; do
     if ! command -v "$command" >/dev/null; then
         echo "Required command not found: $command" >&2
         exit 1
@@ -75,6 +75,13 @@ for _ in {1..60}; do
     )
     if [[ "$health" == healthy ]]; then
         docker compose ps
+        systemd-run \
+            --collect \
+            --no-block \
+            --description="Initial Nexus grokmirror pull and maintenance" \
+            /usr/bin/flock -n /run/lock/nexus-grokmirror.lock \
+            /usr/local/sbin/nexus-grokmirror
+        echo "Queued the initial grokmirror pull and maintenance workflow."
         echo "Nexus is available on port $nexus_port."
         exit 0
     fi
