@@ -26,6 +26,7 @@ if [[ ! -f "$repository_root/.env" ]]; then
 POSTGRES_USER=nexus
 POSTGRES_PASSWORD=$(openssl rand -hex 32)
 POSTGRES_DATABASE=nexus
+NEXUS_DATABASE_PORT=5432
 LOG_LEVEL=info
 NEXUS_BIND_ADDRESS=0.0.0.0
 NEXUS_PORT=8080
@@ -62,15 +63,15 @@ systemctl enable --now cron
 
 docker compose up --detach db
 docker compose run --rm migrate
-docker compose up --detach --build server worker
+docker compose up --detach --build server worker web
 
 echo "Waiting for Nexus to become healthy..."
 for _ in {1..60}; do
-    server_container=$(docker compose ps --quiet server)
+    web_container=$(docker compose ps --quiet web)
     health=$(
         docker inspect \
             --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' \
-            "$server_container" 2>/dev/null || true
+            "$web_container" 2>/dev/null || true
     )
     if [[ "$health" == healthy ]]; then
         docker compose ps
@@ -78,12 +79,12 @@ for _ in {1..60}; do
         exit 0
     fi
     if [[ "$health" == unhealthy || "$health" == exited ]]; then
-        docker compose logs --tail 100 server worker db >&2
+        docker compose logs --tail 100 web server worker db >&2
         exit 1
     fi
     sleep 2
 done
 
-docker compose logs --tail 100 server worker db >&2
+docker compose logs --tail 100 web server worker db >&2
 echo "Timed out waiting for Nexus to become healthy" >&2
 exit 1

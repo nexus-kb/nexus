@@ -23,10 +23,24 @@ services:
   db:
     image: paradedb/paradedb:0.25.9-pg18
     restart: unless-stopped
+    mem_limit: 8g
+    shm_size: 2gb
+    command:
+      - postgres
+      - -c
+      - shared_buffers=2GB
+      - -c
+      - effective_cache_size=6GB
+      - -c
+      - maintenance_work_mem=512MB
+      - -c
+      - work_mem=16MB
     environment:
       POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: ${POSTGRES_DATABASE:-nexus}
+    ports:
+      - "127.0.0.1:${NEXUS_DATABASE_PORT:-5432}:5432"
     volumes:
       - /opt/nexus/db:/var/lib/postgresql
     healthcheck:
@@ -38,15 +52,34 @@ services:
 
   server:
     <<: *app
-    ports:
-      - "${NEXUS_BIND_ADDRESS:-0.0.0.0}:${NEXUS_PORT:-8080}:8080"
+    expose:
+      - "8080"
     command: ["serve", "--env", "production", "--hostname", "0.0.0.0", "--port", "8080"]
     healthcheck:
-      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/"]
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/api/v1/mailing-lists"]
       interval: 10s
       timeout: 5s
       retries: 10
       start_period: 10s
+
+  web:
+    image: nexus-kb-web:${NEXUS_IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: WebUI/Dockerfile
+    init: true
+    restart: unless-stopped
+    depends_on:
+      server:
+        condition: service_healthy
+    ports:
+      - "${NEXUS_BIND_ADDRESS:-0.0.0.0}:${NEXUS_PORT:-8080}:80"
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
 
   worker:
     <<: *app

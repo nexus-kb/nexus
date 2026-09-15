@@ -12,8 +12,8 @@ swift test
 ```
 
 The Vapor application requires the existing Postgres environment variables.
-It serves the production web interface from `Public/` at
-`http://127.0.0.1:8080/`.
+In production it serves only the API; nginx serves the web interface and
+proxies `/api` requests to Vapor.
 
 ## Web interface
 
@@ -37,16 +37,15 @@ pnpm dev
 
 Vite proxies `/api` requests to Vapor at `http://127.0.0.1:8080`.
 
-Generate the production assets served by Vapor:
+Generate the production assets:
 
 ```bash
 cd WebUI
 pnpm build
 ```
 
-The build replaces `Public/index.html` and `Public/assets/`. These generated
-files are committed so a checkout can serve the web interface without running
-the frontend toolchain.
+The build writes untracked production assets to `WebUI/dist/`. The production
+nginx image builds these assets directly from the WebUI source.
 
 ## Tests
 
@@ -61,9 +60,13 @@ The frontend can also be type-checked independently with `pnpm check`.
 
 ## VM deployment
 
-The production stack contains ParadeDB/PostgreSQL 18, the Vapor HTTP server,
-and a separate Vapor Queues worker. Database files and lore mirrors remain on
-the host under `/opt/nexus/db` and `/opt/nexus/lore`.
+The production stack contains ParadeDB/PostgreSQL 18, an internal Vapor API
+server, a separate Vapor Queues worker, and the host-facing nginx WebUI.
+Database files and lore mirrors remain on the host under `/opt/nexus/db` and
+`/opt/nexus/lore`. Postgres is available to VM-local tools and tests on
+`127.0.0.1:${NEXUS_DATABASE_PORT:-5432}` but is not exposed publicly.
+The database container is limited to 8 GiB of memory and PostgreSQL is sized
+with a 2 GiB shared buffer pool plus headroom for queries and parallel workers.
 
 On an Ubuntu 24.04 VM with Docker, grokmirror, `curl`, and `openssl` installed,
 clone the repository and run:
@@ -84,7 +87,7 @@ restarting application processes:
 ```bash
 docker compose up -d db
 docker compose run --rm migrate
-docker compose up -d --build server worker
+docker compose up -d --build server worker web
 ```
 
 Applied migration names and checksums are recorded in
@@ -95,6 +98,6 @@ Useful operational commands:
 
 ```bash
 docker compose ps
-docker compose logs -f server worker
+docker compose logs -f web server worker
 sudo /usr/local/sbin/nexus-grokmirror  # pull and queue maintenance now
 ```
