@@ -1,4 +1,19 @@
 # ================================
+# Web UI build image
+# ================================
+FROM node:24-bookworm-slim AS web
+
+WORKDIR /build/WebUI
+
+RUN corepack enable && corepack prepare pnpm@11.19.0 --activate
+
+COPY WebUI/package.json WebUI/pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile
+
+COPY WebUI/ ./
+RUN pnpm build
+
+# ================================
 # Build image
 # ================================
 FROM swift:6.3-noble AS build
@@ -22,6 +37,9 @@ RUN swift package resolve \
 
 # Copy entire repo into container
 COPY . .
+
+# Use assets built from the WebUI source in this checkout.
+COPY --from=web /build/Public ./Public
 
 RUN mkdir /staging
 
@@ -58,15 +76,20 @@ FROM ubuntu:noble
 RUN export DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true \
     && apt-get -q update \
     && apt-get -q dist-upgrade -y \
-    && apt-get -q install -y \
+    && apt-get -q install -y --no-install-recommends \
       libjemalloc2 \
       ca-certificates \
+      curl \
+      git \
       tzdata \
 # If your app or its dependencies import FoundationNetworking, also install `libcurl4`.
       # libcurl4 \
 # If your app or its dependencies import FoundationXML, also install `libxml2`.
       # libxml2 \
     && rm -r /var/lib/apt/lists/*
+
+# Lore mirrors are updated by root on the host and mounted read-only here.
+RUN git config --system --add safe.directory '*'
 
 # Create a vapor user and group with /app as its home directory
 RUN useradd --user-group --create-home --system --skel /dev/null --home-dir /app vapor

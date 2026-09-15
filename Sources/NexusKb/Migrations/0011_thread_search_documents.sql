@@ -1,5 +1,5 @@
 -- One BM25 document per thread: root plus two reply levels.
-CREATE EXTENSION pg_search CASCADE;
+CREATE EXTENSION IF NOT EXISTS pg_search CASCADE;
 
 CREATE TABLE thread_search_documents (
     thread_id       bigint PRIMARY KEY

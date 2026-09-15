@@ -1,29 +1,71 @@
-# Docker Compose file for Vapor
-#
-# Install Docker on your system to run and test
-# your Vapor app in a production-like environment.
-#
-# Note: This file is intended for testing and does not
-# implement best practices for a production deployment.
-#
-# Learn more: https://docs.docker.com/compose/reference/
-#
-#   Build images: docker compose build
-#      Start app: docker compose up app
-#       Stop all: docker compose down
-#
-
 x-shared_environment: &shared_environment
-  LOG_LEVEL: ${LOG_LEVEL:-debug}
-  
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  POSTGRES_HOST: db
+  POSTGRES_PORT: 5432
+  POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+  POSTGRES_DATABASE: ${POSTGRES_DATABASE:-nexus}
+
+x-app: &app
+  image: nexus-kb:${NEXUS_IMAGE_TAG:-latest}
+  build:
+    context: .
+  environment: *shared_environment
+  init: true
+  restart: unless-stopped
+  depends_on:
+    db:
+      condition: service_healthy
+  volumes:
+    - /opt/nexus/lore:/opt/nexus/lore:ro
+
 services:
-  app:
-    image: nexus-kb:latest
-    build:
-      context: .
+  db:
+    image: paradedb/paradedb:0.25.9-pg18
+    restart: unless-stopped
     environment:
-      <<: *shared_environment
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DATABASE:-nexus}
+    volumes:
+      - /opt/nexus/db:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  server:
+    <<: *app
     ports:
-      - '8080:8080'
-    # user: '0' # uncomment to run as root for testing purposes even though Dockerfile defines 'vapor' user.
+      - "${NEXUS_BIND_ADDRESS:-0.0.0.0}:${NEXUS_PORT:-8080}:8080"
     command: ["serve", "--env", "production", "--hostname", "0.0.0.0", "--port", "8080"]
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  worker:
+    <<: *app
+    command: ["queues", "--env", "production"]
+
+  migrate:
+    image: paradedb/paradedb:0.25.9-pg18
+    profiles: ["tools"]
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGHOST: db
+      PGPORT: 5432
+      PGUSER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      PGDATABASE: ${POSTGRES_DATABASE:-nexus}
+    entrypoint: ["bash", "/deploy/migrate.sh"]
+    volumes:
+      - ./deploy:/deploy:ro
+      - ./Sources/NexusKb/Migrations:/migrations:ro
