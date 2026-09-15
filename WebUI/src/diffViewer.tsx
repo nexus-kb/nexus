@@ -280,19 +280,19 @@ async function loadDiffHighlighter() {
     { createHighlighterCore },
     { createJavaScriptRegexEngine },
     { default: diff },
-    { default: githubLight },
-    { default: githubDark },
+    { default: ayuLight },
+    { default: ayuDark },
   ] = await Promise.all([
     import("shiki/core"),
     import("shiki/engine/javascript"),
     import("@shikijs/langs/diff"),
-    import("@shikijs/themes/github-light"),
-    import("@shikijs/themes/github-dark"),
+    import("@shikijs/themes/ayu-light"),
+    import("@shikijs/themes/ayu-dark"),
   ]);
 
   return createHighlighterCore({
     langs: diff,
-    themes: [githubLight, githubDark],
+    themes: [ayuLight, ayuDark],
     engine: createJavaScriptRegexEngine(),
   });
 }
@@ -324,7 +324,7 @@ async function highlightDiff(
   if (!lineNumbers) {
     return highlighter.codeToHtml(code, {
       lang: language,
-      themes: { light: "github-light", dark: "github-dark" },
+      themes: { light: "ayu-light", dark: "ayu-dark" },
       defaultColor: "light",
     });
   }
@@ -333,7 +333,7 @@ async function highlightDiff(
 
   return highlighter.codeToHtml(prepared.code, {
     lang: language,
-    themes: { light: "github-light", dark: "github-dark" },
+    themes: { light: "ayu-light", dark: "ayu-dark" },
     defaultColor: "light",
     transformers: [unifiedDiffTransformer(prepared.lines)],
   });

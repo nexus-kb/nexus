@@ -3,6 +3,7 @@ import { render } from "solid-js/web";
 import { AppShell } from "./App";
 import { ThreadListPage } from "./pages/ThreadListPage";
 import { ThreadPage } from "./pages/ThreadPage";
+import { applyTheme, storedTheme } from "./theme";
 import "./styles.css";
 
 const root = document.getElementById("root");
@@ -10,6 +11,8 @@ const root = document.getElementById("root");
 if (!root) {
   throw new Error("Missing #root element");
 }
+
+applyTheme(storedTheme());
 
 render(
   () => (
