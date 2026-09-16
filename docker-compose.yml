@@ -23,18 +23,69 @@ services:
   db:
     image: paradedb/paradedb:0.25.9-pg18
     restart: unless-stopped
-    mem_limit: 8g
+    mem_limit: 12g
     shm_size: 2gb
+    # Docker's default seccomp profile blocks io_uring_setup.
+    security_opt:
+      - seccomp=unconfined
     command:
       - postgres
       - -c
-      - shared_buffers=2GB
+      - max_connections=100
       - -c
-      - effective_cache_size=6GB
+      - shared_buffers=3GB
+      - -c
+      - effective_cache_size=9GB
+      - -c
+      - work_mem=16MB
       - -c
       - maintenance_work_mem=512MB
       - -c
-      - work_mem=16MB
+      - autovacuum_work_mem=256MB
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - checkpoint_timeout=15min
+      - -c
+      - min_wal_size=1GB
+      - -c
+      - max_wal_size=8GB
+      - -c
+      - wal_buffers=-1
+      - -c
+      - wal_compression=lz4
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=128
+      - -c
+      - maintenance_io_concurrency=128
+      - -c
+      - io_method=io_uring
+      - -c
+      - default_statistics_target=100
+      - -c
+      - jit=off
+      - -c
+      - huge_pages=try
+      - -c
+      - max_parallel_workers=8
+      - -c
+      - max_parallel_workers_per_gather=2
+      - -c
+      - max_parallel_maintenance_workers=4
+      - -c
+      - shared_preload_libraries=pg_search,pg_cron,pg_stat_statements
+      - -c
+      - pg_stat_statements.track=all
+      - -c
+      - track_io_timing=on
+      - -c
+      - track_wal_io_timing=on
+      - -c
+      - log_connections=on
+      - -c
+      - log_disconnections=on
     environment:
       POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
