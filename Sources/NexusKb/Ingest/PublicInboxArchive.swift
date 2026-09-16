@@ -16,6 +16,7 @@ struct PublicInboxCommit: Sendable, Equatable {
     let commitOID: String
     let blobOID: String
     let rawMessage: Data
+    var archiveTimestamp: Date? = nil
 }
 
 enum PublicInboxArchiveEntry:
@@ -451,6 +452,26 @@ struct PublicInboxEpochRepository: Sendable {
                 commitOIDs: commitOIDs
             )
 
+        // public-inbox records its Received-preferred timestamp as the
+        // committer time, not the author time (which prefers Date).
+        let timestampOutput = try git.run(
+            arguments: [
+                "-C", epoch.repositoryURL.path,
+                "log", "--no-walk=unsorted", "--format=%H %ct", "--stdin",
+            ],
+            standardInput: Data((commitOIDs.joined(separator: "\n") + "\n").utf8)
+        )
+        var timestamps: [String: Date] = [:]
+        for line in String(decoding: timestampOutput.standardOutput, as: UTF8.self)
+            .split(separator: "\n")
+        {
+            let fields = line.split(separator: " ")
+            guard fields.count == 2, let seconds = Int64(fields[1]) else {
+                throw PublicInboxArchiveError.invalidGitOutput(String(line))
+            }
+            timestamps[String(fields[0])] = Date(timeIntervalSince1970: Double(seconds))
+        }
+
         return try zip(
             messageLookups,
             deletionBlobOIDs
@@ -459,7 +480,13 @@ struct PublicInboxEpochRepository: Sendable {
                 messageLookup,
                 deletionBlobOID
             ) {
-            case (.message(let message), nil):
+            case (.message(var message), nil):
+                guard let timestamp = timestamps[message.commitOID] else {
+                    throw PublicInboxArchiveError.invalidGitOutput(
+                        "missing committer timestamp for \(message.commitOID)"
+                    )
+                }
+                message.archiveTimestamp = timestamp
                 return .message(message)
 
             case (

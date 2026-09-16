@@ -10,6 +10,166 @@ import VaporTesting
     .serialized
 )
 struct PublicInboxIngestBatchTests {
+    @Test("Repeated commits of the same blob retain earliest clock evidence")
+    func preservesSameBlobTimestamp() async throws {
+        try await withApp(configure: configure) { app in
+            let fixture = try await DatabaseFixture(app: app)
+            do {
+                let first = try fixture.message(
+                    number: 1, dateHeader: "broken",
+                    archiveTimestamp: Date(timeIntervalSince1970: 1_600_000_000)
+                )
+                let later = try fixture.message(
+                    number: 1, dateHeader: "broken",
+                    archiveTimestamp: Date(timeIntervalSince1970: 1_600_000_600)
+                )
+                let service = PostgresIngestService(client: app.postgres)
+                _ = try await service.ingestBatch(
+                    [first], mailingListID: fixture.mailingListID, epoch: fixture.epoch,
+                    expectedPreviousCommitOID: nil, logger: app.logger
+                )
+                _ = try await service.ingestBatch(
+                    [PreparedPublicInboxMessage(commitOID: String(repeating: "f", count: 40),
+                                                blobOID: first.blobOID, parsed: later.parsed)],
+                    mailingListID: fixture.mailingListID, epoch: fixture.epoch,
+                    expectedPreviousCommitOID: first.commitOID, logger: app.logger
+                )
+                #expect(try await fixture.threadMetadata(messageID: first.parsed.message.messageID)?
+                    .lastUpdatedAt == Date(timeIntervalSince1970: 1_600_000_000))
+            } catch {
+                try? await fixture.remove()
+                throw error
+            }
+            try await fixture.remove()
+        }
+    }
+
+    @Test("Cross-post timestamps converge and refresh derived dates on replay", arguments: [false, true])
+    func reconcilesCrossPostTimestamps(laterFirst: Bool) async throws {
+        try await withApp(configure: configure) { app in
+            let fixture = try await DatabaseFixture(app: app)
+            do {
+                let messageID = "\(fixture.prefix)-clock@example.com"
+                let early = try fixture.message(
+                    number: 1, messageID: messageID, subject: "[PATCH] clock repair",
+                    dateHeader: "broken", archiveTimestamp: Date(timeIntervalSince1970: 1_600_000_000)
+                )
+                let late = try fixture.message(
+                    number: 2, messageID: messageID, subject: "[PATCH] clock repair",
+                    dateHeader: "broken", archiveTimestamp: Date(timeIntervalSince1970: 1_600_000_300)
+                )
+                let unknown = try fixture.message(
+                    number: 3, messageID: messageID, subject: "[PATCH] clock repair",
+                    dateHeader: "broken", archiveTimestamp: Date(timeIntervalSince1970: 0)
+                )
+                let otherList = try await fixture.createAdditionalMailingList()
+                let earlyList = laterFirst ? otherList : fixture.mailingListID
+                let lateList = laterFirst ? fixture.mailingListID : otherList
+                let first = laterFirst ? late : early
+                let second = laterFirst ? early : late
+                let service = PostgresIngestService(client: app.postgres)
+                _ = try await service.ingestBatch(
+                    [first], mailingListID: fixture.mailingListID, epoch: fixture.epoch,
+                    expectedPreviousCommitOID: nil, logger: app.logger
+                )
+                try await fixture.reconcilePendingLineages()
+                let lineage = try #require(try await fixture.lineageState(messageID: messageID))
+                _ = try await service.ingestBatch(
+                    [second], mailingListID: otherList, epoch: fixture.epoch,
+                    expectedPreviousCommitOID: nil, logger: app.logger
+                )
+                try await fixture.expectPatchTimestampMetadata(messageID: messageID, seconds: 1_600_000_000)
+
+                // Replaying the later copy cannot undo the canonical correction.
+                _ = try await service.ingestBatch(
+                    [late], mailingListID: lateList, epoch: fixture.epoch,
+                    expectedPreviousCommitOID: late.commitOID, logger: app.logger
+                )
+                try await fixture.expectPatchTimestampMetadata(messageID: messageID, seconds: 1_600_000_000)
+
+                // Replacing the earlier copy with unknown evidence keeps the
+                // other list's usable date; replacing both makes all dates nil.
+                _ = try await service.ingestBatch(
+                    [unknown], mailingListID: earlyList, epoch: fixture.epoch,
+                    expectedPreviousCommitOID: early.commitOID, logger: app.logger
+                )
+                try await fixture.expectPatchTimestampMetadata(messageID: messageID, seconds: 1_600_000_300)
+                _ = try await service.ingestBatch(
+                    [unknown], mailingListID: lateList, epoch: fixture.epoch,
+                    expectedPreviousCommitOID: late.commitOID, logger: app.logger
+                )
+                try await fixture.expectPatchTimestampMetadata(messageID: messageID, seconds: nil)
+
+                _ = try await service.ingestBatch(
+                    [early], mailingListID: earlyList, epoch: fixture.epoch,
+                    expectedPreviousCommitOID: unknown.commitOID, logger: app.logger
+                )
+                try await fixture.expectPatchTimestampMetadata(messageID: messageID, seconds: 1_600_000_000)
+                _ = try await service.ingestBatch(
+                    [.deletion(commitOID: String(repeating: "f", count: 40), blobOID: early.blobOID)],
+                    mailingListID: earlyList, epoch: fixture.epoch,
+                    expectedPreviousCommitOID: early.commitOID, logger: app.logger
+                )
+                try await fixture.expectPatchTimestampMetadata(messageID: messageID, seconds: nil)
+                #expect(try await fixture.lineageState(messageID: messageID)?.lineageID == lineage.lineageID)
+            } catch {
+                try? await fixture.remove()
+                throw error
+            }
+            try await fixture.remove()
+        }
+    }
+
+    @Test("Undated archive mail never overrides known thread activity, even after deletion")
+    func archiveDatesControlThreadActivity() async throws {
+        try await withApp(configure: configure) { app in
+            let fixture = try await DatabaseFixture(app: app)
+            do {
+                let root = try fixture.message(
+                    number: 1, dateHeader: "Sun, 13 Sep 2020 12:26:40 +0000",
+                    archiveTimestamp: Date(timeIntervalSince1970: 1_600_000_005)
+                )
+                let unknown = try fixture.message(
+                    number: 2, inReplyTo: root.parsed.message.messageID,
+                    dateHeader: "Wed, 3 Jan 1990 21:25:00 +0100",
+                    archiveTimestamp: Date(timeIntervalSince1970: 631_398_300)
+                )
+                let future = try fixture.message(
+                    number: 3, inReplyTo: root.parsed.message.messageID,
+                    dateHeader: "Mon, 18 Jun 2085 15:57:19 +0000",
+                    archiveTimestamp: Date(timeIntervalSince1970: 1_600_000_060)
+                )
+                #expect(unknown.parsed.message.date == nil)
+                let service = PostgresIngestService(client: app.postgres)
+                _ = try await service.ingestBatch(
+                    [root, unknown, future], mailingListID: fixture.mailingListID,
+                    epoch: fixture.epoch, expectedPreviousCommitOID: nil, logger: app.logger
+                )
+                #expect(try await fixture.threadMetadata(messageID: root.parsed.message.messageID)?
+                    .lastUpdatedAt == Date(timeIntervalSince1970: 1_600_000_060))
+                let deletion = String(repeating: "f", count: 40)
+                _ = try await service.ingestBatch(
+                    [.deletion(commitOID: deletion, blobOID: future.blobOID)],
+                    mailingListID: fixture.mailingListID, epoch: fixture.epoch,
+                    expectedPreviousCommitOID: future.commitOID, logger: app.logger
+                )
+                #expect(try await fixture.threadMetadata(messageID: root.parsed.message.messageID)?
+                    .lastUpdatedAt == Date(timeIntervalSince1970: 1_600_000_000))
+                _ = try await service.ingestBatch(
+                    [.deletion(commitOID: String(repeating: "e", count: 40), blobOID: root.blobOID)],
+                    mailingListID: fixture.mailingListID, epoch: fixture.epoch,
+                    expectedPreviousCommitOID: deletion, logger: app.logger
+                )
+                #expect(try await fixture.threadMetadata(messageID: unknown.parsed.message.messageID)?
+                    .lastUpdatedAt == Date(timeIntervalSince1970: 0))
+            } catch {
+                try? await fixture.remove()
+                throw error
+            }
+            try await fixture.remove()
+        }
+    }
+
     @Test("Batch commits messages and final cursor")
     func commitsBatchAndCursor() async throws {
         try await withApp(
@@ -1031,6 +1191,7 @@ private final class DatabaseFixture {
         subject: String? = nil,
         dateHeader: String =
             "Tue, 18 Aug 2026 12:00:00 -0400",
+        archiveTimestamp: Date? = nil,
         body: String? = nil,
         invalidPatchIndex: Bool = false
     ) throws -> PreparedPublicInboxMessage {
@@ -1096,7 +1257,8 @@ private final class DatabaseFixture {
 
         let parsed = try IngestMessageParser()
             .parse(
-                Data(rawMessage.utf8)
+                Data(rawMessage.utf8),
+                archiveTimestamp: archiveTimestamp
             )
 
         let effectiveParsed: ParsedIngestMessage
@@ -1637,6 +1799,34 @@ private final class DatabaseFixture {
         }
 
         return 0
+    }
+
+    func expectPatchTimestampMetadata(messageID: String, seconds: Double?) async throws {
+        let rows = try await app.postgres.query(
+            """
+            SELECT message.sent_at, thread.last_updated_at, patchset.sent_at,
+                   lineage.first_sent_at, lineage.latest_sent_at
+            FROM messages AS message
+            JOIN threads AS thread ON thread.id = message.thread_id
+            JOIN patchsets AS patchset ON patchset.cover_letter_message_id = message.message_id
+            JOIN patchset_lineage_state AS state ON state.patchset_id = patchset.id
+            JOIN patch_lineages AS lineage ON lineage.id = state.lineage_id
+            WHERE message.message_id = \(messageID)
+            """,
+            logger: app.logger
+        )
+        var count = 0
+        let expected = seconds.map { Date(timeIntervalSince1970: $0) }
+        for try await row in rows {
+            count += 1
+            let value = try row.decode((Date?, Date, Date?, Date?, Date?).self)
+            #expect(value.0 == expected)
+            #expect(value.1 == (expected ?? Date(timeIntervalSince1970: 0)))
+            #expect(value.2 == expected)
+            #expect(value.3 == expected)
+            #expect(value.4 == expected)
+        }
+        #expect(count == 1)
     }
 
     func reconcilePendingLineages() async throws {

@@ -86,13 +86,17 @@ struct PostgresIngestService: Sendable {
         var threadID: Int64
     }
 
+    private struct MailingListObservation: Sendable {
+        let blobOID: String
+        let sentAt: Date?
+    }
+
     private struct ThreadMetadataInput:
         Sendable
     {
         var threadID: Int64
         let rootCandidateMessageID: String
         let subject: String
-        let timestamp: Date
     }
 
     private struct BatchPersistenceState:
@@ -100,8 +104,8 @@ struct PostgresIngestService: Sendable {
     {
         var messagesByMessageID: [String: MessageState] = [:]
 
-        var mailingListBlobOIDByMessageDatabaseID:
-            [Int64: String] = [:]
+        var mailingListObservationsByMessageDatabaseID:
+            [Int64: MailingListObservation] = [:]
 
         var threadMetadataInputs:
             [ThreadMetadataInput] = []
@@ -365,7 +369,7 @@ struct PostgresIngestService: Sendable {
             try await persistMailingListLinks(
                 linksByMessageDatabaseID:
                     batchState
-                    .mailingListBlobOIDByMessageDatabaseID,
+                    .mailingListObservationsByMessageDatabaseID,
                 mailingListID: mailingListID,
                 connection: connection,
                 logger: logger
@@ -403,6 +407,36 @@ struct PostgresIngestService: Sendable {
                 candidateMessageIDs:
                     unlinkedMessageIDs,
                 connection: connection,
+                logger: logger
+            )
+
+            // Reconcile after all links/replacements/deletions are final. The
+            // aggregate may decrease, increase, or become unknown on replay.
+            let timestampMessageIDs = Set(
+                batchState.mailingListObservationsByMessageDatabaseID.keys
+            ).union(unlinkedMessageIDs).sorted()
+            try await execute(
+                """
+                SELECT refresh_message_timestamps(\(timestampMessageIDs)::bigint[])
+                """,
+                on: connection,
+                logger: logger
+            )
+            let timestampPatchSetIDs = batchState.affectedPatchSetIDs
+                .union(deletionAffectedPatchSetIDs).sorted()
+            try await execute(
+                """
+                SELECT refresh_patchset_timestamps(ARRAY(
+                    SELECT id FROM patchsets
+                    WHERE thread_id IN (
+                        SELECT thread_id FROM messages
+                        WHERE id = ANY(\(timestampMessageIDs)::bigint[])
+                    )
+                    UNION
+                    SELECT unnest(\(timestampPatchSetIDs)::bigint[])
+                ))
+                """,
+                on: connection,
                 logger: logger
             )
 
@@ -720,17 +754,16 @@ struct PostgresIngestService: Sendable {
         }
 
         batchState
-            .mailingListBlobOIDByMessageDatabaseID[
+            .mailingListObservationsByMessageDatabaseID[
                 messageDatabaseID
-            ] = blobOID
+            ] = MailingListObservation(blobOID: blobOID, sentAt: message.date)
 
         batchState.threadMetadataInputs.append(
             ThreadMetadataInput(
                 threadID: targetThreadID,
                 rootCandidateMessageID:
                     message.messageID,
-                subject: message.subject,
-                timestamp: timestamp
+                subject: message.subject
             )
         )
 
@@ -1056,7 +1089,7 @@ struct PostgresIngestService: Sendable {
 
     private func persistMailingListLinks(
         linksByMessageDatabaseID:
-            [Int64: String],
+            [Int64: MailingListObservation],
         mailingListID: Int64,
         connection: PostgresConnection,
         logger: Logger
@@ -1076,33 +1109,51 @@ struct PostgresIngestService: Sendable {
         }
 
         let blobOIDs = links.map {
-            $0.value
+            $0.value.blobOID
         }
+        // PostgresNIO does not encode arrays with optional Date elements.
+        let sentAts = links.map { $0.value.sentAt ?? Date(timeIntervalSince1970: 0) }
+        let hasSentAts = links.map { $0.value.sentAt != nil }
 
         try await execute(
             """
             INSERT INTO messages_mailing_lists (
                 message_id,
                 mailing_list_id,
-                archive_blob_oid
+                archive_blob_oid,
+                effective_sent_at,
+                timestamp_recorded
             )
             SELECT
                 input.message_id,
                 \(mailingListID),
-                input.archive_blob_oid
+                input.archive_blob_oid,
+                CASE WHEN input.has_sent_at THEN input.sent_at ELSE NULL END,
+                true
             FROM unnest(
                 \(messageIDs)::bigint[],
-                \(blobOIDs)::text[]
+                \(blobOIDs)::text[],
+                \(sentAts)::timestamptz[],
+                \(hasSentAts)::boolean[]
             ) AS input(
                 message_id,
-                archive_blob_oid
+                archive_blob_oid,
+                sent_at,
+                has_sent_at
             )
             ON CONFLICT (
                 message_id,
                 mailing_list_id
             ) DO UPDATE
             SET archive_blob_oid =
-                EXCLUDED.archive_blob_oid
+                EXCLUDED.archive_blob_oid,
+                effective_sent_at = CASE
+                    WHEN messages_mailing_lists.timestamp_recorded
+                         AND messages_mailing_lists.archive_blob_oid = EXCLUDED.archive_blob_oid
+                    THEN LEAST(messages_mailing_lists.effective_sent_at, EXCLUDED.effective_sent_at)
+                    ELSE EXCLUDED.effective_sent_at
+                END,
+                timestamp_recorded = true
             """,
             on: connection,
             logger: logger
@@ -1399,18 +1450,13 @@ struct PostgresIngestService: Sendable {
                     ) AS subject,
                     COALESCE(
                         (
-                            SELECT max(
-                                COALESCE(
-                                    message.sent_at,
-                                    message.created_at
-                                )
-                            )
+                            SELECT max(message.sent_at)
                             FROM messages AS message
                             WHERE message.thread_id =
                                     target.id
                               AND NOT message.is_placeholder
                         ),
-                        target.created_at
+                        'epoch'::timestamptz
                     ) AS last_updated_at
                 FROM threads AS target
                 WHERE target.id = ANY(
@@ -1448,10 +1494,6 @@ struct PostgresIngestService: Sendable {
             $0.subject
         }
 
-        let timestamps = inputs.map {
-            $0.timestamp
-        }
-
         try await execute(
             """
             WITH metadata_input AS (
@@ -1459,19 +1501,16 @@ struct PostgresIngestService: Sendable {
                     input.thread_id,
                     input.root_candidate_message_id,
                     input.subject,
-                    input.message_timestamp,
                     input.ordinality
                 FROM unnest(
                     \(threadIDs)::bigint[],
                     \(rootCandidateMessageIDs)::text[],
-                    \(subjects)::text[],
-                    \(timestamps)::timestamptz[]
+                    \(subjects)::text[]
                 ) WITH ORDINALITY
                   AS input(
                       thread_id,
                       root_candidate_message_id,
                       subject,
-                      message_timestamp,
                       ordinality
                   )
             ),
@@ -1506,13 +1545,7 @@ struct PostgresIngestService: Sendable {
                                     input.ordinality
                             )
                         )[1]
-                    ) AS subject,
-                    GREATEST(
-                        thread.last_updated_at,
-                        max(
-                            input.message_timestamp
-                        )
-                    ) AS last_updated_at
+                    ) AS subject
                 FROM metadata_input AS input
                 JOIN threads AS thread
                   ON thread.id =
@@ -1521,9 +1554,7 @@ struct PostgresIngestService: Sendable {
             )
             UPDATE threads AS thread
             SET
-                subject = metadata.subject,
-                last_updated_at =
-                    metadata.last_updated_at
+                subject = metadata.subject
             FROM metadata_by_thread AS metadata
             WHERE thread.id =
                     metadata.thread_id

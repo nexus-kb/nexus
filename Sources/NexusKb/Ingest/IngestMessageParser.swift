@@ -105,7 +105,8 @@ struct IngestMessageParser: Sendable {
     private let messageParser = MessageParser()
 
     func parse(
-        _ data: Data
+        _ data: Data,
+        archiveTimestamp: Date? = nil
     ) throws -> ParsedIngestMessage {
         guard let parsedMessage = messageParser.parse(data)
         else {
@@ -157,8 +158,10 @@ struct IngestMessageParser: Sendable {
             from: from,
             to: to,
             cc: cc,
-            date: parsedMessage.date?
-                .foundationDate,
+            date: Self.effectiveDate(
+                sentAt: parsedMessage.date?.foundationDate,
+                archiveTimestamp: archiveTimestamp
+            ),
             inReplyTo: parsedMessage
                 .inReplyToIDs
                 .compactMap(
@@ -188,6 +191,24 @@ struct IngestMessageParser: Sendable {
                 body: message.textBody
             )
         )
+    }
+
+    /// Keep normal sender dates, including delayed delivery. The archive's
+    /// Received-preferred committer time bounds future sender clocks and fills
+    /// missing/broken dates. Pre-1991 dates predate this Linux knowledge base.
+    /// If both clocks are unusable, leave the date unknown rather than inventing
+    /// a delivery time. Raw mail and Git metadata remain available for review.
+    static func effectiveDate(
+        sentAt: Date?, archiveTimestamp: Date?, now: Date = Date()
+    ) -> Date? {
+        guard let archiveTimestamp else { return sentAt }
+        let earliestDate = Date(timeIntervalSince1970: 662_688_000) // 1991-01-01 UTC
+        guard archiveTimestamp >= earliestDate, archiveTimestamp <= now else {
+            guard let sentAt, sentAt >= earliestDate, sentAt <= now else { return nil }
+            return sentAt
+        }
+        guard let sentAt, sentAt >= earliestDate else { return archiveTimestamp }
+        return min(sentAt, archiveTimestamp)
     }
 
     private func resolvedAuthor(

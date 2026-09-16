@@ -29,7 +29,10 @@ enum PublicInboxEntryPreparation {
                     PreparedPublicInboxMessage(
                         commitOID: message.commitOID,
                         blobOID: message.blobOID,
-                        parsed: try parser.parse(message.rawMessage)
+                        parsed: try parser.parse(
+                            message.rawMessage,
+                            archiveTimestamp: message.archiveTimestamp
+                        )
                     )
                 )
             } catch IngestMessageParserError.missingMessageID {

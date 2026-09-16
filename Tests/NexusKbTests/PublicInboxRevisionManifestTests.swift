@@ -259,6 +259,26 @@ struct PublicInboxRevisionManifestTests {
         )
     }
 
+    @Test("Archive committer time corrects future Date before ingestion")
+    func preparesArchiveTimestamp() throws {
+        let repository = try TemporaryGitRepository()
+        let commit = try repository.commit("""
+            From: sender@example.com
+            Message-ID: <future@example.com>
+            Date: Mon, 18 Jun 2085 15:57:19 +0000
+            Subject: Future clock
+
+            Body
+            """)
+        let entry = try #require(repository.subject.loadEntries(commitOIDs: [commit]).first)
+        guard case .message(let prepared) = try PublicInboxEntryPreparation.prepare(entry) else {
+            Issue.record("Expected prepared message")
+            return
+        }
+        // Deliberately differs from Git's author time (1_500_000_000).
+        #expect(prepared.parsed.message.date == Date(timeIntervalSince1970: 1_600_000_000))
+    }
+
     @Test("Archive loader rejects a commit without m or d")
     func rejectsInvalidArchiveEntry() throws {
         let repository = try TemporaryGitRepository()
@@ -357,6 +377,7 @@ private final class TemporaryGitRepository {
         ])
         try run([
             "commit",
+            "--date=@1500000000 +0000",
             "-m",
             value,
         ])
@@ -478,6 +499,9 @@ private final class TemporaryGitRepository {
             "-C",
             url.path,
         ] + arguments
+        var environment = ProcessInfo.processInfo.environment
+        environment["GIT_COMMITTER_DATE"] = "@1600000000 +0000"
+        process.environment = environment
         process.standardOutput = output
         process.standardError = error
 

@@ -263,3 +263,43 @@ func preservesMeaningfulSubjectBrackets() {
             == "docs: explain array[index]"
     )
 }
+
+@Test("Archive dates bound sender clocks without moving delayed mail forward", arguments: [
+    ("Date: Sun, 13 Sep 2020 12:26:39 +0000", 1_599_999_999.0),
+    ("Date: Sun, 13 Sep 2020 12:26:40 +0000", 1_600_000_000.0),
+    ("Date: Sun, 13 Sep 2020 12:26:41 +0000", 1_600_000_000.0),
+    ("Date: Wed, 01 Jan 2014 00:00:00 +0000", 1_388_534_400.0),
+    ("Date: Thu, 01 Jan 1970 00:00:00 +0000", 1_600_000_000.0),
+    ("Date: Tue, 01 Jan 1991 00:00:00 +0000", 662_688_000.0),
+    ("Date: Mon, 31 Dec 1990 23:59:59 +0000", 1_600_000_000.0),
+    ("Date: broken", 1_600_000_000.0),
+    ("", 1_600_000_000.0),
+])
+func normalizesArchiveDates(_ input: (String, Double)) throws {
+    let raw = Data("Message-ID: <date@example.com>\n\(input.0)\n\nBody".utf8)
+    let parsed = try IngestMessageParser().parse(
+        raw, archiveTimestamp: Date(timeIntervalSince1970: 1_600_000_000)
+    )
+    #expect(parsed.message.date == Date(timeIntervalSince1970: input.1))
+}
+
+@Test("Absent or unusable archive dates do not invent a receipt time")
+func preservesDateWithoutArchiveEvidence() {
+    let sentAt = Date(timeIntervalSince1970: 1_600_000_000)
+    #expect(IngestMessageParser.effectiveDate(sentAt: sentAt, archiveTimestamp: nil) == sentAt)
+    #expect(IngestMessageParser.effectiveDate(sentAt: nil, archiveTimestamp: nil) == nil)
+    #expect(IngestMessageParser.effectiveDate(
+        sentAt: sentAt, archiveTimestamp: Date(timeIntervalSince1970: 0)
+    ) == sentAt)
+    #expect(IngestMessageParser.effectiveDate(
+        sentAt: Date(timeIntervalSince1970: 600_000_000),
+        archiveTimestamp: Date(timeIntervalSince1970: 600_000_000)
+    ) == nil)
+    #expect(IngestMessageParser.effectiveDate(
+        sentAt: sentAt.addingTimeInterval(1), archiveTimestamp: sentAt.addingTimeInterval(2),
+        now: sentAt
+    ) == nil)
+    #expect(IngestMessageParser.effectiveDate(
+        sentAt: sentAt, archiveTimestamp: sentAt.addingTimeInterval(1), now: sentAt
+    ) == sentAt)
+}
