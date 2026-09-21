@@ -34,6 +34,14 @@ struct MaintenanceWorkflowAPITests {
                 ).run(id: ingest.id, logger: app.logger)
                 #expect(completedIngest.state == .succeeded)
                 #expect(completedIngest.stages.first?.processedItems == 1)
+                #expect(
+                    try await PostgresMaintenanceRepository(
+                        client: app.postgres
+                    ).affectedThreadIDs(
+                        runID: ingest.id,
+                        logger: app.logger
+                    ).count == 1
+                )
                 #expect(try await fixture.messageCount() == 1)
                 var searchComponents = URLComponents()
                 searchComponents.path = "/api/v1/search"

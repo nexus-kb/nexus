@@ -471,6 +471,48 @@ struct PostgresMaintenanceRepository: Sendable {
         )
     }
 
+    func affectedThreadIDs(
+        runID: UUID,
+        logger: Logger
+    ) async throws -> [Int64] {
+        let rows = try await client.query(
+            """
+            SELECT DISTINCT target.thread_id
+            FROM maintenance_stage_thread_targets AS target
+            JOIN maintenance_run_stages AS stage
+              ON stage.id = target.stage_id
+            WHERE stage.run_id = \(runID)
+              AND stage.operation = 'ingest'
+            ORDER BY target.thread_id
+            """,
+            logger: logger
+        )
+        var values: [Int64] = []
+        for try await row in rows {
+            values.append(try row.decode(Int64.self))
+        }
+        return values
+    }
+
+    func hasCompleteThreadTargets(
+        runID: UUID,
+        logger: Logger
+    ) async throws -> Bool {
+        let rows = try await client.query(
+            """
+            SELECT COALESCE(bool_and(thread_targets_complete), true)
+            FROM maintenance_run_stages
+            WHERE run_id = \(runID)
+              AND operation = 'ingest'
+            """,
+            logger: logger
+        )
+        for try await row in rows {
+            return try row.decode(Bool.self)
+        }
+        return true
+    }
+
     func initializePatchSetTargets(
         stage: MaintenanceStageRecord,
         logger: Logger

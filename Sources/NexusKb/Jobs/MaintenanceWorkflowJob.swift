@@ -110,9 +110,21 @@ struct MaintenanceWorkflowJob: AsyncJob {
             }
 
             if current.kind == .grokmirror {
+                let hasCompleteThreadTargets = try await repository
+                    .hasCompleteThreadTargets(
+                        runID: current.id,
+                        logger: context.logger
+                    )
+                let affectedThreadIDs = hasCompleteThreadTargets
+                    ? try await repository.affectedThreadIDs(
+                        runID: current.id,
+                        logger: context.logger
+                    )
+                    : nil
                 try await PostgresThreadRootService(
                     client: context.application.postgres
                 ).finalizeEligibleRoots(
+                    threadIDs: affectedThreadIDs,
                     mailingListIDs: current.stages
                         .filter {
                             $0.operation == .ingest

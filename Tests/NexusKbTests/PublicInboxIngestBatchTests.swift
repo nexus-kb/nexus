@@ -1137,6 +1137,11 @@ private struct TestThreadMetadata {
     let lastUpdatedAt: Date
 }
 
+private struct TestPromotedThread {
+    let threadID: Int64
+    let promotedRootMessageID: String
+}
+
 private struct TestLineageState {
     let lineageID: Int64
     let source: String
@@ -1778,6 +1783,78 @@ private final class DatabaseFixture {
             return try row.decode(String.self)
         }
 
+        return nil
+    }
+
+    func insertInvalidPromotedThread() async throws -> TestPromotedThread {
+        let missingRootMessageID =
+            "\(prefix)-unrelated-missing@example.com"
+        let promotedRootMessageID =
+            "\(prefix)-unrelated-child@example.com"
+        let threadRows = try await app.postgres.query(
+            """
+            INSERT INTO threads (
+                root_message_id,
+                promoted_from_message_id,
+                subject,
+                last_updated_at
+            ) VALUES (
+                \(promotedRootMessageID),
+                \(missingRootMessageID),
+                'Promoted child',
+                now()
+            )
+            RETURNING id
+            """,
+            logger: app.logger
+        )
+        var threadID: Int64?
+        for try await row in threadRows {
+            threadID = try row.decode(Int64.self)
+        }
+        let value = try #require(threadID)
+
+        try await execute(
+            """
+            INSERT INTO messages (
+                message_id,
+                thread_id,
+                in_reply_to,
+                references_ids,
+                author,
+                subject,
+                sent_at,
+                body,
+                is_placeholder
+            ) VALUES
+            (
+                \(missingRootMessageID), \(value), NULL,
+                ARRAY[]::text[], 'Late parent', 'Late parent', now(), '', false
+            ),
+            (
+                \(promotedRootMessageID), \(value), \(missingRootMessageID),
+                ARRAY[\(missingRootMessageID)]::text[], 'Child',
+                'Promoted child', now(), '', false
+            )
+            """
+        )
+
+        return TestPromotedThread(
+            threadID: value,
+            promotedRootMessageID: promotedRootMessageID
+        )
+    }
+
+    func rootMessageID(
+        threadID: Int64
+    ) async throws -> String? {
+        let rows = try await app.postgres.query(
+            "SELECT root_message_id FROM threads WHERE id = \(threadID)",
+            logger: app.logger
+        )
+        for try await row in rows {
+            return try row.decode(String.self)
+        }
         return nil
     }
 
@@ -2719,6 +2796,46 @@ func resolvesPromotedRootInLaterBatch() async throws {
                 )?.subject == "Late root"
             )
             #expect(try await fixture.threadCount() == 1)
+        } catch {
+            try? await fixture.remove()
+            throw error
+        }
+
+        try await fixture.remove()
+    }
+}
+
+@Test(
+    "Ingest reconciliation does not inspect unrelated promoted threads"
+)
+func scopesPromotionReconciliationToAffectedThreads() async throws {
+    try await withApp(
+        configure: configure
+    ) { app in
+        let fixture = try await DatabaseFixture(
+            app: app
+        )
+
+        do {
+            let unrelated = try await fixture
+                .insertInvalidPromotedThread()
+            let message = try fixture.message(number: 1)
+
+            _ = try await PostgresIngestService(
+                client: app.postgres
+            ).ingestBatch(
+                [message],
+                mailingListID: fixture.mailingListID,
+                epoch: fixture.epoch,
+                expectedPreviousCommitOID: nil,
+                logger: app.logger
+            )
+
+            #expect(
+                try await fixture.rootMessageID(
+                    threadID: unrelated.threadID
+                ) == unrelated.promotedRootMessageID
+            )
         } catch {
             try? await fixture.remove()
             throw error

@@ -99,6 +99,16 @@ struct PostgresIngestService: Sendable {
         let subject: String
     }
 
+    private struct OrphanCleanupResult: Sendable {
+        let patchSetIDs: Set<Int64>
+        let threadIDs: Set<Int64>
+
+        static let empty = OrphanCleanupResult(
+            patchSetIDs: [],
+            threadIDs: []
+        )
+    }
+
     private struct BatchPersistenceState:
         Sendable
     {
@@ -113,11 +123,16 @@ struct PostgresIngestService: Sendable {
         var recipientsByMessageDatabaseID: [Int64: [ResolvedBatchRecipient]] = [:]
 
         var affectedPatchSetIDs: Set<Int64> = []
+        var affectedThreadIDs: Set<Int64> = []
 
         mutating func remapThread(
             from sourceThreadID: Int64,
             to targetThreadID: Int64
         ) {
+            if affectedThreadIDs.remove(sourceThreadID) != nil {
+                affectedThreadIDs.insert(targetThreadID)
+            }
+
             for messageID in Array(
                 messagesByMessageID.keys
             ) {
@@ -402,7 +417,7 @@ struct PostgresIngestService: Sendable {
                     logger: logger
                 )
 
-            let deletionAffectedPatchSetIDs =
+            let deletionEffects =
                 try await cleanupOrphanedMessages(
                 candidateMessageIDs:
                     unlinkedMessageIDs,
@@ -423,7 +438,7 @@ struct PostgresIngestService: Sendable {
                 logger: logger
             )
             let timestampPatchSetIDs = batchState.affectedPatchSetIDs
-                .union(deletionAffectedPatchSetIDs).sorted()
+                .union(deletionEffects.patchSetIDs).sorted()
             try await execute(
                 """
                 SELECT refresh_patchset_timestamps(ARRAY(
@@ -440,9 +455,13 @@ struct PostgresIngestService: Sendable {
                 logger: logger
             )
 
+            let affectedThreadIDs = batchState.affectedThreadIDs
+                .union(deletionEffects.threadIDs)
+                .sorted()
             try await PostgresThreadRootService(
                 client: client
             ).reconcilePromotions(
+                threadIDs: affectedThreadIDs,
                 connection: connection,
                 logger: logger
             )
@@ -450,11 +469,20 @@ struct PostgresIngestService: Sendable {
             try await enqueuePatchLineageWork(
                 patchSetIDs:
                     batchState.affectedPatchSetIDs
-                    .union(deletionAffectedPatchSetIDs),
+                    .union(deletionEffects.patchSetIDs),
                 mailingListID: mailingListID,
                 connection: connection,
                 logger: logger
             )
+
+            if let maintenanceStageID {
+                try await recordMaintenanceThreadTargets(
+                    stageID: maintenanceStageID,
+                    threadIDs: affectedThreadIDs,
+                    connection: connection,
+                    logger: logger
+                )
+            }
 
             try await advanceCursor(
                 mailingListID: mailingListID,
@@ -737,6 +765,7 @@ struct PostgresIngestService: Sendable {
             id: messageDatabaseID,
             threadID: targetThreadID
         )
+        batchState.affectedThreadIDs.insert(targetThreadID)
 
         let patchSetID = try await PostgresPatchIngestService()
             .persist(
@@ -1198,9 +1227,9 @@ struct PostgresIngestService: Sendable {
         candidateMessageIDs: [Int64],
         connection: PostgresConnection,
         logger: Logger
-    ) async throws -> Set<Int64> {
+    ) async throws -> OrphanCleanupResult {
         guard !candidateMessageIDs.isEmpty else {
-            return []
+            return .empty
         }
 
         let orphanRows = try await connection.query(
@@ -1239,7 +1268,7 @@ struct PostgresIngestService: Sendable {
         }
 
         guard !orphanIDs.isEmpty else {
-            return []
+            return .empty
         }
 
         let patchSetRows = try await connection.query(
@@ -1469,7 +1498,35 @@ struct PostgresIngestService: Sendable {
             logger: logger
         )
 
-        return Set(affectedPatchSetIDs)
+        return OrphanCleanupResult(
+            patchSetIDs: Set(affectedPatchSetIDs),
+            threadIDs: affectedThreadIDs
+        )
+    }
+
+    private func recordMaintenanceThreadTargets(
+        stageID: UUID,
+        threadIDs: [Int64],
+        connection: PostgresConnection,
+        logger: Logger
+    ) async throws {
+        guard !threadIDs.isEmpty else {
+            return
+        }
+
+        try await execute(
+            """
+            INSERT INTO maintenance_stage_thread_targets (
+                stage_id, thread_id
+            )
+            SELECT \(stageID), thread.id
+            FROM threads AS thread
+            WHERE thread.id = ANY(\(threadIDs)::bigint[])
+            ON CONFLICT DO NOTHING
+            """,
+            on: connection,
+            logger: logger
+        )
     }
 
     private func updateThreadMetadata(
