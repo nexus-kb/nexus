@@ -54,6 +54,69 @@ afterEach(() => {
 });
 
 describe("ThreadListPage", () => {
+  it("replaces the current threads with a skeleton while switching mailing lists", async () => {
+    const initialSubject = "[PATCH] net: repair the packet path";
+    const lkmlSubject = "[PATCH] lkml-only thread";
+    const lkmlThread: ThreadDetail = {
+      ...thread,
+      rootMessageId: "lkml-thread@example.com",
+      subject: lkmlSubject,
+    };
+    let resolveLkml!: (response: Response) => void;
+    const lkmlResponse = new Promise<Response>((resolve) => {
+      resolveLkml = resolve;
+    });
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "/api/v1/mailing-lists") {
+        return Promise.resolve(
+          jsonResponse({
+            items: [{ name: "Linux Kernel Mailing List", archiveGroup: "lkml" }],
+          }),
+        );
+      }
+      if (url.includes("mailingList=lkml")) {
+        return lkmlResponse;
+      }
+      return Promise.resolve(
+        jsonResponse({
+          items: [thread],
+          pagination: { previousCursor: null, nextCursor: null },
+        } satisfies ThreadListResponse),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { container } = render(() => (
+      <HashRouter preload={false}>
+        <Route path="/" component={ThreadListPage} />
+      </HashRouter>
+    ));
+
+    expect(await screen.findByText(initialSubject)).toBeInTheDocument();
+    const resultsRegion = container.querySelector("[aria-live='polite']");
+    expect(resultsRegion).toHaveAttribute("aria-busy", "false");
+    await userEvent.selectOptions(screen.getByLabelText("Filter by mailing list"), "lkml");
+
+    expect(await screen.findByRole("list", { name: "Loading threads" })).toBeInTheDocument();
+    expect(resultsRegion).toBe(container.querySelector("[aria-live='polite']"));
+    expect(resultsRegion).toHaveAttribute("aria-busy", "true");
+    expect(screen.queryByText(initialSubject)).not.toBeInTheDocument();
+
+    resolveLkml(
+      jsonResponse({
+        items: [lkmlThread],
+        pagination: { previousCursor: null, nextCursor: null },
+      } satisfies ThreadListResponse),
+    );
+
+    expect(await screen.findByText(lkmlSubject)).toBeInTheDocument();
+    expect(resultsRegion).toBe(container.querySelector("[aria-live='polite']"));
+    expect(resultsRegion).toHaveAttribute("aria-busy", "false");
+    expect(screen.queryByText(initialSubject)).not.toBeInTheDocument();
+    expect(screen.queryByRole("list", { name: "Loading threads" })).not.toBeInTheDocument();
+  });
+
   it("filters, searches, clears search, resets the cursor, and paginates", async () => {
     window.location.hash = "#/?cursor=old-cursor";
     const firstPage: ThreadListResponse = {

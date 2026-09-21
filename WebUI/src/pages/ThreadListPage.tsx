@@ -193,19 +193,6 @@ export function ThreadListPage() {
         </div>
       </Show>
 
-      <Show when={listing.loading && !listing.latest}>
-        <ol class="thread-list" aria-label="Loading threads" aria-busy="true">
-          <For each={Array.from({ length: 8 })}>
-            {() => (
-              <li class="thread-row thread-skeleton">
-                <span />
-                <span />
-              </li>
-            )}
-          </For>
-        </ol>
-      </Show>
-
       <Show when={listing.error}>
         <div class="error-state" role="alert">
           <h2>Could not load results</h2>
@@ -216,52 +203,74 @@ export function ThreadListPage() {
         </div>
       </Show>
 
+      <div aria-busy={listing.loading} aria-live="polite">
+        <Show
+          when={!listing.loading}
+          fallback={
+            <ol class="thread-list" aria-label="Loading threads">
+              <For each={Array.from({ length: 8 })}>
+                {() => (
+                  <li class="thread-row thread-skeleton">
+                    <span />
+                    <span />
+                  </li>
+                )}
+              </For>
+            </ol>
+          }
+        >
+          <Show when={visibleListing()}>
+            {(page) => (
+              <Show
+                when={
+                  page().mode === "search" ? page().results.length > 0 : page().threads.length > 0
+                }
+                fallback={
+                  <p class="empty-state">
+                    {page().mode === "search"
+                      ? "No threads match this search."
+                      : "No threads match these filters."}
+                  </p>
+                }
+              >
+                <ol class="thread-list">
+                  <Show
+                    when={page().mode === "search"}
+                    fallback={
+                      <For each={page().threads}>
+                        {(thread) => <ThreadRow thread={thread} />}
+                      </For>
+                    }
+                  >
+                    <For each={page().results}>
+                      {(result) => <ThreadRow thread={result} />}
+                    </For>
+                  </Show>
+                </ol>
+              </Show>
+            )}
+          </Show>
+        </Show>
+      </div>
+
       <Show when={visibleListing()}>
         {(page) => (
-          <>
-            <Show
-              when={page().mode === "search" ? page().results.length > 0 : page().threads.length > 0}
-              fallback={
-                <p class="empty-state">
-                  {page().mode === "search"
-                    ? "No threads match this search."
-                    : "No threads match these filters."}
-                </p>
-              }
+          <nav class="pagination" aria-label="Thread pages">
+            <button
+              disabled={!page().pagination.previousCursor || listing.loading}
+              onClick={() => moveToCursor(page().pagination.previousCursor)}
+              type="button"
             >
-              <ol class="thread-list" aria-live="polite" aria-busy={listing.loading}>
-                <Show
-                  when={page().mode === "search"}
-                  fallback={
-                    <For each={page().threads}>
-                      {(thread) => <ThreadRow thread={thread} />}
-                    </For>
-                  }
-                >
-                  <For each={page().results}>
-                    {(result) => <ThreadRow thread={result} />}
-                  </For>
-                </Show>
-              </ol>
-            </Show>
-
-            <nav class="pagination" aria-label="Thread pages">
-              <button
-                disabled={!page().pagination.previousCursor || listing.loading}
-                onClick={() => moveToCursor(page().pagination.previousCursor)}
-                type="button"
-              >
-                Previous
-              </button>
-              <button
-                disabled={!page().pagination.nextCursor || listing.loading}
-                onClick={() => moveToCursor(page().pagination.nextCursor)}
-                type="button"
-              >
-                Next
-              </button>
-            </nav>
-          </>
+              Previous
+            </button>
+            <button
+              disabled={!page().pagination.nextCursor || listing.loading}
+              onClick={() => moveToCursor(page().pagination.nextCursor)}
+              type="button"
+            >
+              Next
+            </button>
+          </nav>
         )}
       </Show>
     </section>
