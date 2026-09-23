@@ -2134,6 +2134,364 @@ private final class DatabaseFixture {
     }
 }
 
+private extension DatabaseFixture {
+    func rebuildRevisionLineages() async throws {
+        let repository = PostgresMaintenanceRepository(client: app.postgres)
+        let list = try #require(try await repository.mailingList(archiveGroup: prefix, logger: app.logger))
+        let run = try await repository.createManualRun(
+            mailingList: list, operation: .patchLineage, mode: .full, logger: app.logger
+        )
+        do {
+            let stage = try #require(run.stages.first)
+            try await repository.initializePatchSetTargets(stage: stage, logger: app.logger)
+            let targets = try await repository.pendingPatchSetTargets(stageID: stage.id, limit: 250, logger: app.logger)
+            try await app.postgres.withTransaction(logger: app.logger) { connection in
+                for target in targets {
+                    _ = try await PostgresPatchLineageService().reconcile(
+                        patchSetID: target.patchSetID, forceRematch: target.forceRematch,
+                        rebuildStageID: stage.id, connection: connection, logger: app.logger
+                    )
+                    try await repository.markPatchSetProcessed(
+                        stageID: stage.id, mailingListID: mailingListID, patchSetID: target.patchSetID,
+                        connection: connection, logger: app.logger
+                    )
+                }
+            }
+        } catch {
+            try? await execute("DELETE FROM maintenance_runs WHERE id = \(run.id)")
+            throw error
+        }
+        try await execute("DELETE FROM maintenance_runs WHERE id = \(run.id)")
+    }
+}
+
+@Suite("Revision link lineage tests", .serialized)
+struct RevisionLinkLineageTests {
+    @Test("Sparse and ambiguous histories are independent of import order", arguments:
+        [false, true], [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]])
+    func resolvesHistoryInEveryOrder(ambiguous: Bool, order: [Int]) async throws {
+        try await withApp(configure: configure) { app in
+            let fixture = try await DatabaseFixture(app: app)
+            do {
+                let first = try fixture.message(
+                    number: 1, subject: "[PATCH v1 0/2] \(fixture.prefix): old",
+                    dateHeader: "1 Sep 2026 12:00:00 +0000"
+                )
+                let second = try fixture.message(
+                    number: 2, subject: ambiguous
+                        ? "[PATCH v1 0/2] \(fixture.prefix): unrelated"
+                        : "[PATCH v2 0/2] \(fixture.prefix): old",
+                    dateHeader: "2 Sep 2026 12:00:00 +0000"
+                )
+                var history = "v1: https://lore.kernel.org/bpf/\(first.parsed.message.messageID)/"
+                if ambiguous { history += "\nv1: https://lore.kernel.org/bpf/\(second.parsed.message.messageID)/" }
+                let third = try fixture.message(
+                    number: 3, subject: "[PATCH v3 0/2] \(fixture.prefix): renamed",
+                    dateHeader: "3 Sep 2026 12:00:00 +0000", body: history
+                )
+                let messages = [first, second, third]
+                var cursor: String?
+                for index in order {
+                    let message = messages[index]
+                    _ = try await PostgresIngestService(client: app.postgres).ingestBatch(
+                        [message], mailingListID: fixture.mailingListID, epoch: fixture.epoch,
+                        expectedPreviousCommitOID: cursor, logger: app.logger
+                    )
+                    cursor = message.commitOID
+                    try await fixture.reconcilePendingLineages()
+                }
+                // Check convergence before a rebuild can mask late-import bugs.
+                var ids: Set<Int64> = []
+                for message in messages {
+                    let state = try #require(try await fixture.lineageState(messageID: message.parsed.message.messageID))
+                    ids.insert(state.lineageID)
+                }
+                #expect(ids.count == (ambiguous ? 3 : 1))
+            } catch {
+                try? await fixture.remove()
+                throw error
+            }
+            try await fixture.remove()
+        }
+    }
+
+    @Test("Late history targets cannot override the referrer's stronger match", arguments: ["change-id", "reply-chain"])
+    func preservesReferrerPrecedence(rule: String) async throws {
+        try await withApp(configure: configure) { app in
+            let fixture = try await DatabaseFixture(app: app)
+            do {
+                let late = try fixture.message(
+                    number: 1, subject: "[PATCH v1 0/2] \(fixture.prefix): ignored history",
+                    dateHeader: "1 Sep 2026 12:00:00 +0000"
+                )
+                let trailer = rule == "change-id" ? "\nchange-id: \(fixture.prefix)-identity" : ""
+                let anchor = try fixture.message(
+                    number: 2, subject: "[PATCH v2 0/2] \(fixture.prefix): anchor",
+                    dateHeader: "2 Sep 2026 12:00:00 +0000", body: trailer
+                )
+                let referrer = try fixture.message(
+                    number: 3, inReplyTo: rule == "reply-chain" ? anchor.parsed.message.messageID : nil,
+                    subject: "[PATCH v3 0/2] \(fixture.prefix): renamed",
+                    dateHeader: "3 Sep 2026 12:00:00 +0000",
+                    body: "v1: https://lore.kernel.org/bpf/\(late.parsed.message.messageID)/" + trailer
+                )
+                var cursor: String?
+                for message in [anchor, referrer, late] {
+                    _ = try await PostgresIngestService(client: app.postgres).ingestBatch(
+                        [message], mailingListID: fixture.mailingListID, epoch: fixture.epoch,
+                        expectedPreviousCommitOID: cursor, logger: app.logger
+                    )
+                    cursor = message.commitOID
+                    try await fixture.reconcilePendingLineages()
+                }
+                let anchorState = try #require(try await fixture.lineageState(messageID: anchor.parsed.message.messageID))
+                let referrerState = try #require(try await fixture.lineageState(messageID: referrer.parsed.message.messageID))
+                let lateState = try #require(try await fixture.lineageState(messageID: late.parsed.message.messageID))
+                #expect(referrerState.lineageID == anchorState.lineageID)
+                #expect(referrerState.source == rule)
+                #expect(lateState.lineageID != anchorState.lineageID)
+            } catch {
+                try? await fixture.remove()
+                throw error
+            }
+            try await fixture.remove()
+        }
+    }
+
+    @Test("Encoded NUL history does not abort a lineage maintenance batch")
+    func ignoresMalformedHistoryInBatch() async throws {
+        try await withApp(configure: configure) { app in
+            let fixture = try await DatabaseFixture(app: app)
+            do {
+                let malformed = try fixture.message(
+                    number: 1, subject: "[PATCH v2 0/2] \(fixture.prefix): malformed",
+                    body: "v1: https://lore.kernel.org/bpf/bad%00@example.com/"
+                )
+                let valid = try fixture.message(number: 2, subject: "[PATCH v1 0/2] \(fixture.prefix): valid")
+                _ = try await PostgresIngestService(client: app.postgres).ingestBatch(
+                    [malformed, valid], mailingListID: fixture.mailingListID, epoch: fixture.epoch,
+                    expectedPreviousCommitOID: nil, logger: app.logger
+                )
+                try await fixture.rebuildRevisionLineages()
+                #expect(try await fixture.lineageState(messageID: malformed.parsed.message.messageID)?.source == "singleton")
+                #expect(try await fixture.lineageState(messageID: valid.parsed.message.messageID)?.source == "singleton")
+            } catch {
+                try? await fixture.remove()
+                throw error
+            }
+            try await fixture.remove()
+        }
+    }
+
+    @Test("Renamed BPF series converges in both import orders and repeated full rebuilds", arguments: [false, true])
+    func linksRenamedSeries(reverse: Bool) async throws {
+        try await withApp(configure: configure) { app in
+            let fixture = try await DatabaseFixture(app: app)
+            do {
+                // Preserve both v4 submissions; v3/v5 need not be linked directly
+                // from v9 to remain part of its lineage.
+                let versions = [1, 2, 3, 4, 4, 5, 7, 8, 9]
+                let ids = versions.indices.map { "\(fixture.prefix)-\($0)@example.com" }
+                let messages = try versions.enumerated().map { index, version in
+                    let history = versions.enumerated().filter { $0.offset < index && [1, 2, 4, 7, 8].contains($0.element) }
+                        .filter { $0.element < version && $0.offset != 4 }
+                        .map { "v\($0.element):\nhttps://lore.kernel.org/bpf/\(ids[$0.offset])/T/#t" }
+                        .joined(separator: "\n")
+                    return try fixture.message(
+                        number: index + 1, messageID: ids[index],
+                        subject: "[PATCH bpf-next v\(version) 0/3] \(fixture.prefix): reclaim\(version < 8 ? "/OOM" : "")",
+                        dateHeader: "\(index + 1) Sep 2026 12:00:00 +0000", body: history
+                    )
+                }
+                let service = PostgresIngestService(client: app.postgres)
+                var cursor: String?
+                for message in reverse ? Array(messages.reversed()) : messages {
+                    _ = try await service.ingestBatch(
+                        [message], mailingListID: fixture.mailingListID, epoch: fixture.epoch,
+                        expectedPreviousCommitOID: cursor, logger: app.logger
+                    )
+                    cursor = message.commitOID
+                    try await fixture.reconcilePendingLineages()
+                }
+                for pass in 0..<3 {
+                    if pass > 0 { try await fixture.rebuildRevisionLineages() }
+                    try await app.testing().test(.GET, "/api/v1/threads/\(ids[8])/patch-lineages") { response async throws in
+                        #expect(response.status == .ok)
+                        let result = try response.content.decode(PatchLineageCollectionView.self)
+                        #expect(result.items.count == 1)
+                        let lineage = try #require(result.items.first)
+                        #expect(lineage.revisions.map(\.revision) == [9, 8, 7, 5, 4, 4, 3, 2, 1])
+                        #expect(Set(lineage.revisions.compactMap(\.coverLetterMessageId)) == Set(ids))
+                        #expect(lineage.revisions.first?.matchSource == "revision-link")
+                    }
+                }
+            } catch {
+                try? await fixture.remove()
+                throw error
+            }
+            try await fixture.remove()
+        }
+    }
+
+    @Test("A version link repairs existing split groups and records evidence")
+    func repairsExistingSplit() async throws {
+        try await withApp(configure: configure) { app in
+            let fixture = try await DatabaseFixture(app: app)
+            do {
+                let versions = [1, 7, 8, 9]
+                let messages = try versions.enumerated().map { index, version in
+                    try fixture.message(
+                        number: index + 1,
+                        subject: "[PATCH v\(version) 0/3] \(fixture.prefix): reclaim\(version < 8 ? "/OOM" : "")",
+                        dateHeader: "\(index + 1) Sep 2026 12:00:00 +0000"
+                    )
+                }
+                _ = try await PostgresIngestService(client: app.postgres).ingestBatch(
+                    messages, mailingListID: fixture.mailingListID, epoch: fixture.epoch,
+                    expectedPreviousCommitOID: nil, logger: app.logger
+                )
+                try await fixture.reconcilePendingLineages()
+                let before = try #require(try await fixture.lineageState(messageID: messages[0].parsed.message.messageID))
+                let split = try #require(try await fixture.lineageState(messageID: messages[3].parsed.message.messageID))
+                #expect(before.lineageID != split.lineageID)
+                let references = [messages[1].parsed.message.messageID, messages[2].parsed.message.messageID]
+                let body = "v7:\nhttps://lore.kernel.org/bpf/\(references[0])/#r\nv8:\nhttps://lore.kernel.org/bpf/\(references[1])/"
+                let newestID = messages[3].parsed.message.messageID
+                let updated = try await app.postgres.query(
+                    "UPDATE messages SET body = \(body) WHERE message_id = \(newestID)", logger: app.logger
+                )
+                for try await _ in updated {}
+                // Reconcile only v9: v8 must move with its existing group.
+                let rows = try await app.postgres.query(
+                    "SELECT id FROM patchsets WHERE cover_letter_message_id = \(newestID)", logger: app.logger
+                )
+                for try await row in rows {
+                    let id = try row.decode(Int64.self)
+                    for _ in 0..<2 {
+                        _ = try await app.postgres.withTransaction(logger: app.logger) { connection in
+                            try await PostgresPatchLineageService().reconcile(
+                                patchSetID: id, connection: connection, logger: app.logger
+                            )
+                        }
+                    }
+                }
+                for message in messages {
+                    #expect(try await fixture.lineageState(messageID: message.parsed.message.messageID)?.lineageID == before.lineageID)
+                }
+                #expect(try await fixture.lineageExists(id: split.lineageID) == false)
+                let evidence = try await app.postgres.query(
+                    """
+                    SELECT state.match_evidence->'referenceMessageIds' = to_jsonb(\(references.sorted())::text[]),
+                           (SELECT count(*)::bigint FROM patch_lineage_events AS event
+                            WHERE event.patchset_id = state.patchset_id AND event.match_source = 'revision-link'),
+                           (SELECT count(*)::bigint FROM patch_lineage_events AS event
+                            WHERE event.previous_lineage_id = \(split.lineageID)
+                              AND event.match_source = 'revision-link'
+                              AND event.match_evidence->'viaPatchsetId' = to_jsonb(state.patchset_id)
+                              AND event.match_evidence->'referenceRevisions' = '[7,8]'::jsonb
+                              AND event.match_evidence->'referenceMessageIds' = to_jsonb(\(references.sorted())::text[]))
+                    FROM patchset_lineage_state AS state JOIN patchsets AS patchset ON patchset.id = state.patchset_id
+                    WHERE patchset.cover_letter_message_id = \(newestID)
+                    """, logger: app.logger
+                )
+                var count = 0
+                for try await row in evidence {
+                    count += 1
+                    let value = try row.decode((Bool, Int64, Int64).self)
+                    #expect(value.0)
+                    #expect(value.1 == 1)
+                    // Both v8's move and v9's assignment identify v9 as the
+                    // source, along with the exact claimed target revisions.
+                    #expect(value.2 == 2)
+                }
+                #expect(count == 1)
+            } catch {
+                try? await fixture.remove()
+                throw error
+            }
+            try await fixture.remove()
+        }
+    }
+
+    @Test("Invalid or conflicting history cannot join lineages", arguments: [
+        "ordinary-link", "wrong-version", "future-date", "different-author", "change-id", "manual", "ambiguous",
+        "group-manual", "group-change-id"
+    ])
+    func rejectsUnsafeLinks(reason: String) async throws {
+        try await withApp(configure: configure) { app in
+            let fixture = try await DatabaseFixture(app: app)
+            do {
+                let first = try fixture.message(
+                    number: 1, subject: "[PATCH v1 0/2] \(fixture.prefix): old",
+                    dateHeader: "1 Sep 2026 12:00:00 +0000",
+                    body: reason.contains("change-id") ? "change-id: \(fixture.prefix)-old" : ""
+                )
+                let other = try fixture.message(
+                    number: 2,
+                    subject: reason.hasPrefix("group-")
+                        ? "[PATCH v2 0/2] \(fixture.prefix): old"
+                        : "[PATCH v1 0/2] \(fixture.prefix): unrelated",
+                    dateHeader: "2 Sep 2026 12:00:00 +0000",
+                    body: reason == "group-change-id" ? "change-id: \(fixture.prefix)-conflicting" : ""
+                )
+                let service = PostgresIngestService(client: app.postgres)
+                _ = try await service.ingestBatch(
+                    [first, other], mailingListID: fixture.mailingListID, epoch: fixture.epoch,
+                    expectedPreviousCommitOID: nil, logger: app.logger
+                )
+                try await fixture.reconcilePendingLineages()
+                let original = try #require(try await fixture.lineageState(messageID: first.parsed.message.messageID))
+                if reason.hasPrefix("group-") {
+                    #expect(try await fixture.lineageState(messageID: other.parsed.message.messageID)?.lineageID == original.lineageID)
+                }
+                if reason == "group-manual" {
+                    let rows = try await app.postgres.query(
+                        """
+                        UPDATE patchset_lineage_state SET manual_lock = true, match_source = 'manual'
+                        WHERE patchset_id IN (SELECT id FROM patchsets WHERE cover_letter_message_id = \(other.parsed.message.messageID))
+                        """, logger: app.logger
+                    )
+                    for try await _ in rows {}
+                }
+                if reason == "manual" || reason == "different-author" {
+                    let query: PostgresQuery = reason == "manual"
+                        ? "UPDATE patchset_lineage_state SET manual_lock = true, match_source = 'manual' WHERE lineage_id = \(original.lineageID)"
+                        : "UPDATE patchset_lineage_state SET author_email = 'other@example.com' WHERE lineage_id = \(original.lineageID)"
+                    let rows = try await app.postgres.query(query, logger: app.logger)
+                    for try await _ in rows {}
+                }
+                let label = reason == "ordinary-link" ? "Link" : (reason == "wrong-version" ? "v2" : "v1")
+                var body = "\(label): https://lore.kernel.org/bpf/\(first.parsed.message.messageID)/"
+                if reason == "change-id" { body += "\nchange-id: \(fixture.prefix)-new" }
+                if reason == "ambiguous" { body += "\nv1: https://lore.kernel.org/bpf/\(other.parsed.message.messageID)/" }
+                let newest = try fixture.message(
+                    number: 3, subject: "[PATCH v3 0/2] \(fixture.prefix): new",
+                    dateHeader: reason == "future-date" ? "31 Aug 2026 12:00:00 +0000" : "3 Sep 2026 12:00:00 +0000",
+                    body: body
+                )
+                _ = try await service.ingestBatch(
+                    [newest], mailingListID: fixture.mailingListID, epoch: fixture.epoch,
+                    expectedPreviousCommitOID: other.commitOID, logger: app.logger
+                )
+                try await fixture.reconcilePendingLineages()
+                let result = try #require(try await fixture.lineageState(messageID: newest.parsed.message.messageID))
+                #expect(result.source == "singleton")
+                #expect(result.lineageID != original.lineageID)
+                #expect(try await fixture.lineageState(messageID: first.parsed.message.messageID)?.lineageID == original.lineageID)
+                if reason == "manual" {
+                    try await fixture.rebuildRevisionLineages()
+                    #expect(try await fixture.lineageState(messageID: first.parsed.message.messageID)?.source == "manual")
+                    #expect(try await fixture.lineageState(messageID: first.parsed.message.messageID)?.lineageID == original.lineageID)
+                }
+            } catch {
+                try? await fixture.remove()
+                throw error
+            }
+            try await fixture.remove()
+        }
+    }
+}
+
 @Test("Change-id links independent patch revisions")
 func linksPatchRevisionsByChangeID() async throws {
     try await withApp(

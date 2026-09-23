@@ -12,7 +12,7 @@ enum PostgresPatchLineageError:
 }
 
 struct PostgresPatchLineageService: Sendable {
-    static let matcherVersion: Int32 = 1
+    static let matcherVersion: Int32 = 2
 
     private struct Facts {
         let patchSetID: Int64
@@ -43,6 +43,9 @@ struct PostgresPatchLineageService: Sendable {
         let lineageID: Int64
         let source: String
         let confidence: Int32
+        var referenceMessageIDs: [String] = []
+        var referenceRevisions: [Int32] = []
+        var viaPatchSetID: Int64? = nil
     }
 
     @discardableResult
@@ -52,6 +55,35 @@ struct PostgresPatchLineageService: Sendable {
         rebuildStageID: UUID? = nil,
         connection: PostgresConnection,
         logger: Logger
+    ) async throws -> Int64 {
+        let lineageID = try await reconcileOne(
+            patchSetID: patchSetID, forceRematch: forceRematch,
+            rebuildStageID: rebuildStageID, connection: connection, logger: logger
+        )
+        // An incoming reference is a reason to reevaluate its source, not
+        // authority to merge the target. Process the source's complete history
+        // and higher-priority rules only after the target has its own assignment.
+        let referrers = try await revisionReferrers(
+            patchSetID: patchSetID, rebuildStageID: rebuildStageID,
+            connection: connection, logger: logger
+        )
+        for id in referrers {
+            _ = try await reconcileOne(
+                patchSetID: id, forceRematch: false, rebuildStageID: rebuildStageID,
+                connection: connection, logger: logger
+            )
+        }
+        guard !referrers.isEmpty else { return lineageID }
+        // Reevaluating a referrer may have merged the original group too.
+        guard let state = try await loadExistingState(
+            patchSetID: patchSetID, connection: connection, logger: logger
+        ) else { throw PostgresPatchLineageError.missingLineage }
+        return state.lineageID
+    }
+
+    private func reconcileOne(
+        patchSetID: Int64, forceRematch: Bool, rebuildStageID: UUID?,
+        connection: PostgresConnection, logger: Logger
     ) async throws -> Int64 {
         let facts = try await loadFacts(
             patchSetID: patchSetID,
@@ -63,6 +95,8 @@ struct PostgresPatchLineageService: Sendable {
             connection: connection,
             logger: logger
         )
+
+        try await replaceRevisionLinks(facts: facts, connection: connection, logger: logger)
 
         if let existing,
            existing.manualLock
@@ -88,6 +122,7 @@ struct PostgresPatchLineageService: Sendable {
 
         let discovered = try await selectLineage(
             for: facts,
+            existingLineageID: forceRematch ? nil : existing?.lineageID,
             rebuildStageID: rebuildStageID,
             connection: connection,
             logger: logger
@@ -284,6 +319,7 @@ struct PostgresPatchLineageService: Sendable {
 
     private func selectLineage(
         for facts: Facts,
+        existingLineageID: Int64?,
         rebuildStageID: UUID?,
         connection: PostgresConnection,
         logger: Logger
@@ -324,6 +360,32 @@ struct PostgresPatchLineageService: Sendable {
             }
         }
 
+        let links = try await revisionLinkCandidates(
+            facts: facts, rebuildStageID: rebuildStageID,
+            connection: connection, logger: logger
+        )
+        let priorLinks = facts.metadata.revisionLinks.filter { $0.revision < facts.metadata.revision }
+        for (revision, group) in Dictionary(grouping: priorLinks, by: \.revision)
+            where group.count > 1
+        {
+            // Do not accept one half of a conflicting claim just because the
+            // other target has not arrived yet. Multiple URLs for one revision
+            // are usable only once they all resolve to the same lineage.
+            let targets = links.filter { candidate in
+                candidate.revision == revision && group.contains { $0.messageID == candidate.messageID }
+            }
+            guard Set(targets.map(\.messageID)) == Set(group.map(\.messageID)),
+                  Set(targets.map(\.lineageID)).count == 1 else { return nil }
+        }
+        if !links.isEmpty {
+            // Conflicting explicit evidence must not fall through to a weaker
+            // subject match. Keep the existing assignment (or a singleton).
+            return try await joinRevisionLineages(
+                links: links, facts: facts, existingLineageID: existingLineageID,
+                rebuildStageID: rebuildStageID, connection: connection, logger: logger
+            )
+        }
+
         let candidates = try await subjectCandidates(
             facts: facts,
             rebuildStageID: rebuildStageID,
@@ -346,6 +408,192 @@ struct PostgresPatchLineageService: Sendable {
         }
 
         return nil
+    }
+
+    private func replaceRevisionLinks(
+        facts: Facts, connection: PostgresConnection, logger: Logger
+    ) async throws {
+        try await execute(
+            "DELETE FROM patch_revision_links WHERE patchset_id = \(facts.patchSetID)",
+            connection: connection, logger: logger
+        )
+        for link in facts.metadata.revisionLinks where link.revision < facts.metadata.revision {
+            try await execute(
+                """
+                INSERT INTO patch_revision_links (patchset_id, message_id, revision)
+                VALUES (\(facts.patchSetID), \(link.messageID), \(link.revision))
+                """,
+                connection: connection, logger: logger
+            )
+        }
+    }
+
+    private struct RevisionCandidate {
+        let lineageID: Int64
+        let revision: Int32
+        let messageID: String
+    }
+
+    private func revisionReferrers(
+        patchSetID: Int64, rebuildStageID: UUID?,
+        connection: PostgresConnection, logger: Logger
+    ) async throws -> [Int64] {
+        let rows = try await connection.query(
+            """
+            WITH RECURSIVE referrers AS (
+                SELECT id AS patchset_id, sent_at FROM patchsets WHERE id = \(patchSetID)
+                UNION
+                SELECT source.id, source.sent_at
+                FROM referrers AS target
+                JOIN LATERAL (
+                    SELECT cover_letter_message_id AS message_id FROM patchsets WHERE id = target.patchset_id
+                    UNION
+                    SELECT message_id FROM patches WHERE patchset_id = target.patchset_id
+                ) AS target_messages ON true
+                JOIN patch_revision_links AS link ON link.message_id = target_messages.message_id
+                JOIN patchsets AS source ON source.id = link.patchset_id
+                JOIN patchset_lineage_state AS state ON state.patchset_id = source.id
+                WHERE source.sent_at > target.sent_at
+                  AND (\(rebuildStageID == nil) OR NOT EXISTS (
+                      SELECT 1 FROM maintenance_stage_patchset_targets AS pending
+                      WHERE pending.stage_id = \(rebuildStageID)
+                        AND pending.patchset_id = source.id
+                        AND pending.force_rematch AND NOT pending.processed
+                  ))
+            )
+            SELECT patchset_id FROM referrers WHERE patchset_id <> \(patchSetID)
+            ORDER BY sent_at, patchset_id
+            """,
+            logger: logger
+        )
+        // Strictly increasing dates make this acyclic. UNION deduplicates
+        // shared descendants so dense histories are reevaluated only once.
+        return try await decodeIDs(rows)
+    }
+
+    private func revisionLinkCandidates(
+        facts: Facts, rebuildStageID: UUID?,
+        connection: PostgresConnection, logger: Logger
+    ) async throws -> [RevisionCandidate] {
+        let rows = try await connection.query(
+            """
+            WITH revision_references AS (
+                SELECT target.id AS patchset_id, link.message_id, link.revision
+                FROM patch_revision_links AS link
+                JOIN patchsets AS target ON target.cover_letter_message_id = link.message_id
+                WHERE link.patchset_id = \(facts.patchSetID)
+                UNION
+                SELECT patch.patchset_id, link.message_id, link.revision
+                FROM patch_revision_links AS link
+                JOIN patches AS patch ON patch.message_id = link.message_id
+                WHERE link.patchset_id = \(facts.patchSetID)
+            )
+            SELECT DISTINCT state.lineage_id, state.revision, reference.message_id
+            FROM revision_references AS reference
+            JOIN patchset_lineage_state AS state ON state.patchset_id = reference.patchset_id
+            JOIN patchsets AS patchset ON patchset.id = state.patchset_id
+            WHERE state.patchset_id <> \(facts.patchSetID)
+              AND lower(state.author_email) = lower(\(facts.authorEmail))
+              AND state.phase = \(facts.metadata.phase.rawValue)
+              AND state.revision = reference.revision
+              AND state.revision < \(facts.metadata.revision)
+              AND patchset.sent_at < \(facts.sentAt)
+              AND (
+                  \(rebuildStageID == nil) OR NOT EXISTS (
+                      SELECT 1 FROM maintenance_stage_patchset_targets AS target
+                      WHERE target.stage_id = \(rebuildStageID)
+                        AND target.patchset_id = state.patchset_id
+                        AND target.force_rematch AND NOT target.processed
+                  )
+              )
+            ORDER BY state.lineage_id, state.revision, reference.message_id
+            """,
+            logger: logger
+        )
+        var values: [RevisionCandidate] = []
+        for try await row in rows {
+            let value = try row.decode((Int64, Int32, String).self)
+            values.append(RevisionCandidate(lineageID: value.0, revision: value.1, messageID: value.2))
+        }
+        return values
+    }
+
+    private func joinRevisionLineages(
+        links: [RevisionCandidate], facts: Facts, existingLineageID: Int64?,
+        rebuildStageID: UUID?, connection: PostgresConnection, logger: Logger
+    ) async throws -> Selection? {
+        // Two distinct series claiming the same revision are ambiguous.
+        for group in Dictionary(grouping: links, by: \.revision).values {
+            guard Set(group.map(\.lineageID)).count == 1 else { return nil }
+        }
+        var ids = Set(links.map(\.lineageID))
+        if let existingLineageID { ids.insert(existingLineageID) }
+        let lineageIDs = ids.sorted()
+        guard let destination = lineageIDs.first else { return nil }
+        let orderedLinks = links.sorted { $0.messageID < $1.messageID }
+        let evidence = orderedLinks.map(\.messageID)
+        let revisions = orderedLinks.map(\.revision)
+
+        // Lock and validate the entire groups before moving any member. Never
+        // override a manual decision or combine conflicting change identities.
+        let rows = try await connection.query(
+            """
+            SELECT patchset_id, lineage_id, author_email, change_id, manual_lock
+            FROM patchset_lineage_state AS state
+            WHERE lineage_id = ANY(\(lineageIDs)::bigint[])
+              AND (\(rebuildStageID == nil) OR NOT EXISTS (
+                  SELECT 1 FROM maintenance_stage_patchset_targets AS target
+                  WHERE target.stage_id = \(rebuildStageID)
+                    AND target.patchset_id = state.patchset_id
+                    AND target.force_rematch AND NOT target.processed
+              ))
+            ORDER BY patchset_id
+            FOR UPDATE
+            """,
+            logger: logger
+        )
+        var members: [(Int64, Int64)] = []
+        var changeIDs = Set([facts.metadata.changeID].compactMap { $0?.lowercased() })
+        for try await row in rows {
+            let value = try row.decode((Int64, Int64, String, String?, Bool).self)
+            guard !value.4, value.2.lowercased() == facts.authorEmail.lowercased() else { return nil }
+            if let changeID = value.3 { changeIDs.insert(changeID.lowercased()) }
+            members.append((value.0, value.1))
+        }
+        guard changeIDs.count <= 1 else { return nil }
+
+        let selection = Selection(
+            lineageID: destination, source: "revision-link", confidence: 95,
+            referenceMessageIDs: evidence, referenceRevisions: revisions,
+            viaPatchSetID: facts.patchSetID
+        )
+        for (patchSetID, previousID) in members
+            where previousID != destination && patchSetID != facts.patchSetID
+        {
+            try await execute(
+                """
+                UPDATE patchset_lineage_state
+                SET lineage_id = \(destination), match_source = 'revision-link',
+                    match_confidence = 95, matcher_version = \(Self.matcherVersion),
+                    match_evidence = jsonb_build_object(
+                        'rule', 'revision-link', 'referenceMessageIds', \(evidence)::text[],
+                        'referenceRevisions', \(revisions)::integer[],
+                        'viaPatchsetId', \(facts.patchSetID)
+                    ), updated_at = now()
+                WHERE patchset_id = \(patchSetID)
+                """,
+                connection: connection, logger: logger
+            )
+            try await insertEvent(
+                patchSetID: patchSetID, previousLineageID: previousID, selection: selection,
+                connection: connection, logger: logger
+            )
+        }
+        for id in lineageIDs where id != destination {
+            try await refreshLineage(id, connection: connection, logger: logger)
+            try await deleteEmptyLineage(id, connection: connection, logger: logger)
+        }
+        return selection
     }
 
     private func changeIDCandidates(
@@ -618,7 +866,10 @@ struct PostgresPatchLineageService: Sendable {
                 jsonb_build_object(
                     'rule', \(selection.source),
                     'primaryMessageId',
-                        \(facts.primaryMessageID)
+                        \(facts.primaryMessageID),
+                    'referenceMessageIds', \(selection.referenceMessageIDs)::text[],
+                    'referenceRevisions', \(selection.referenceRevisions)::integer[],
+                    'viaPatchsetId', \(selection.viaPatchSetID)::bigint
                 ),
                 \(Self.matcherVersion),
                 \(manualLock)
@@ -678,7 +929,10 @@ struct PostgresPatchLineageService: Sendable {
                 \(selection.source),
                 \(selection.confidence),
                 jsonb_build_object(
-                    'rule', \(selection.source)
+                    'rule', \(selection.source),
+                    'referenceMessageIds', \(selection.referenceMessageIDs)::text[],
+                    'referenceRevisions', \(selection.referenceRevisions)::integer[],
+                    'viaPatchsetId', \(selection.viaPatchSetID)::bigint
                 ),
                 \(Self.matcherVersion)
             )
@@ -782,6 +1036,8 @@ struct PostgresPatchLineageService: Sendable {
             100
         case "reply-chain":
             98
+        case "revision-link":
+            95
         case "subject-author":
             90
         default:

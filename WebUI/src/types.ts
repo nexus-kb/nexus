@@ -112,6 +112,7 @@ export interface PatchLineageRevision {
     | "singleton"
     | "change-id"
     | "reply-chain"
+    | "revision-link"
     | "subject-author"
     | "manual";
   matchConfidence: number;

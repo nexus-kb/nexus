@@ -21,6 +21,12 @@ struct PatchLineageMetadata:
     let normalizedSubject: String
     let changeID: String?
     let baseCommit: String?
+    let revisionLinks: [RevisionLink]
+
+    struct RevisionLink: Sendable, Equatable, Hashable {
+        let revision: Int32
+        let messageID: String
+    }
 }
 
 enum PatchLineageMetadataParser {
@@ -114,8 +120,42 @@ enum PatchLineageMetadataParser {
             baseCommit: trailer(
                 named: "base-commit",
                 in: body
-            )
+            ),
+            revisionLinks: revisionLinks(in: body)
         )
+    }
+
+    private static func revisionLinks(
+        in body: String
+    ) -> [PatchLineageMetadata.RevisionLink] {
+        // Only explicit history entries, never arbitrary Link: trailers,
+        // prerequisite trailers, quoted mail, or URLs in a patch diff.
+        let text = body.components(separatedBy: "\ndiff --git ").first ?? body
+        let pattern = #"(?im)^[ \t]*v([1-9][0-9]*):[ \t]*(?:\r?\n[ \t]*)?(https?://lore\.kernel\.org/[^\s<>]+)[ \t]*\r?$"#
+        guard let expression = try? NSRegularExpression(pattern: pattern) else {
+            return []
+        }
+        let source = text as NSString
+        var seen: Set<PatchLineageMetadata.RevisionLink> = []
+        return expression.matches(
+            in: text, range: NSRange(location: 0, length: source.length)
+        ).compactMap { match in
+            guard let revision = Int32(source.substring(with: match.range(at: 1))),
+                  let url = URLComponents(string: source.substring(with: match.range(at: 2))),
+                  url.host?.lowercased() == "lore.kernel.org",
+                  url.user == nil, url.password == nil, url.port == nil
+            else { return nil }
+            let path = url.percentEncodedPath.split(separator: "/")
+            guard (2...3).contains(path.count),
+                  path.count == 2 || ["T", "t", "raw"].contains(String(path[2])),
+                  let messageID = String(path[1]).removingPercentEncoding,
+                  messageID.contains("@"),
+                  messageID.rangeOfCharacter(from: .controlCharacters) == nil,
+                  !messageID.contains(where: { $0.isWhitespace || $0 == "<" || $0 == ">" })
+            else { return nil }
+            let link = PatchLineageMetadata.RevisionLink(revision: revision, messageID: messageID)
+            return seen.insert(link).inserted ? link : nil
+        }
     }
 
     private static func subjectTokens(

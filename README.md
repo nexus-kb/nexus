@@ -106,6 +106,25 @@ Applied migration names and checksums are recorded in
 `nexus_schema_migrations`; an already-applied SQL file must never be edited.
 Add a new numbered migration instead.
 
+After deploying the revision-link matcher (migration `0019`), rebuild lineage
+for existing lists to extract their cover-letter version references. Incremental
+maintenance only processes queued patchsets; changing the matcher version does
+not automatically backfill old records. For BPF, an operator can queue:
+
+```bash
+curl --fail-with-body -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"mode":"full"}' \
+  http://127.0.0.1:8080/api/v1/admin/mailing-lists/bpf/patch-lineage
+```
+
+This changes stored lineage assignments, not archive messages, and preserves
+manual locks. Monitor the returned operation ID at
+`/api/v1/admin/operations/<id>`. No mirror pull or full message re-ingest is needed.
+Revision links currently recognize explicit `vN:` lore URLs on the same or next
+line. They require matching authors/phases, an older matching revision, and an
+earlier timestamp; ordinary discussion links are not lineage evidence.
+
 Useful operational commands:
 
 ```bash

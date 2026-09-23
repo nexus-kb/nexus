@@ -250,6 +250,53 @@ func parsesInferredRFCRevision() {
     )
 }
 
+@Test("Revision history links normalize lore views and ignore unrelated URLs")
+func parsesRevisionHistoryLinks() {
+    let value = PatchLineageMetadataParser.parse(
+        subject: "[PATCH v9 0/3] renamed series",
+        body: """
+        Background: https://lore.kernel.org/bpf/background@example.com/
+        Link: https://lore.kernel.org/r/dependency@example.com/
+        v8:
+        https://lore.kernel.org/bpf/eight@example.com/
+        v7: https://lore.kernel.org/bpf/seven%40example.com/#r
+        v4:
+        https://lore.kernel.org/bpf/four@example.com/T/#t
+        v2:
+        http://lore.kernel.org/r/two@example.com/
+        v1: https://lore.kernel.org/all/one@example.com/raw
+        v7: https://lore.kernel.org/bpf/seven@example.com/
+        > v3: https://lore.kernel.org/bpf/quoted@example.com/
+        prerequisite v3: https://lore.kernel.org/bpf/other@example.com/
+        v3: https://lore.kernel.org.evil.example/bpf/spoof@example.com/
+        v3: https://lore.kernel.org/bpf/invalid%0A@example.com/
+        v3: https://lore.kernel.org/bpf/three@example.com/unrecognized/
+        diff --git a/document b/document
+         v6: https://lore.kernel.org/bpf/diff-context@example.com/
+        """
+    )
+    #expect(value.revisionLinks == [
+        .init(revision: 8, messageID: "eight@example.com"),
+        .init(revision: 7, messageID: "seven@example.com"),
+        .init(revision: 4, messageID: "four@example.com"),
+        .init(revision: 2, messageID: "two@example.com"),
+        .init(revision: 1, messageID: "one@example.com"),
+    ])
+    let crlf = PatchLineageMetadataParser.parse(
+        subject: "[PATCH v2] title", body: "v1:\r\nhttps://lore.kernel.org/bpf/one%40example.com/T/#t\r\n"
+    )
+    #expect(crlf.revisionLinks == [.init(revision: 1, messageID: "one@example.com")])
+}
+
+@Test("Revision links reject decoded control characters", arguments: ["%00", "%01", "%7F", "%C2%85"])
+func rejectsRevisionLinkControls(encoded: String) {
+    let metadata = PatchLineageMetadataParser.parse(
+        subject: "[PATCH v3] title",
+        body: "v1: https://lore.kernel.org/bpf/bad\(encoded)@example.com/"
+    )
+    #expect(metadata.revisionLinks.isEmpty)
+}
+
 @Test("Patch lineage metadata preserves non-leading brackets")
 func preservesMeaningfulSubjectBrackets() {
     let value = PatchLineageMetadataParser.parse(
