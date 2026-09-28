@@ -270,6 +270,12 @@ struct PostgresReadRepository: Sendable {
         rootMessageID: MessageIdentifier,
         logger: Logger
     ) async throws -> ThreadSummary? {
+        let started = ContinuousClock.now
+        defer {
+            logger.info("Thread summary finished", metadata: [
+                "duration_ms": .stringConvertible(ThreadLoadTiming.milliseconds(since: started))
+            ])
+        }
         let rows = try await client.query(
             """
             WITH page AS MATERIALIZED (
@@ -295,12 +301,15 @@ struct PostgresReadRepository: Sendable {
         cursor: MessageCursor?,
         logger: Logger
     ) async throws -> ThreadMessagePageResult? {
+        let started = ContinuousClock.now
         guard let threadIdentity = try await threadIdentity(
             rootMessageID: rootMessageID,
             logger: logger
         ) else {
             return nil
         }
+        let identityMilliseconds = ThreadLoadTiming.milliseconds(since: started)
+        let queryStarted = ContinuousClock.now
         let threadID = threadIdentity.id
 
         let fetchLimit = limit + 1
@@ -385,6 +394,15 @@ struct PostgresReadRepository: Sendable {
         }
 
         var items = try await decodeThreadMessages(rows)
+        // PostgresRowSequence streams results: include consumption and decoding,
+        // not just the time until client.query returns.
+        logger.info("Thread messages loaded", metadata: [
+            "identity_ms": .stringConvertible(identityMilliseconds),
+            "query_and_decode_ms": .stringConvertible(ThreadLoadTiming.milliseconds(since: queryStarted)),
+            "rows": .stringConvertible(items.count),
+            "limit": .stringConvertible(limit),
+            "direction": .string(cursor.map { String(describing: $0.direction) } ?? "initial")
+        ])
         let hasExtra = items.count > limit
 
         if hasExtra {
@@ -983,12 +1001,21 @@ struct PostgresReadRepository: Sendable {
             SELECT
                 COALESCE(patch.part_index, 0) AS part_index,
                 patchset.total_parts
-            FROM patchsets AS patchset
+            -- Resolve both indexed candidates before ordering. An OR across
+            -- the outer join scans patchsets in ID order for every message.
+            FROM (
+                SELECT id
+                FROM patchsets
+                WHERE cover_letter_message_id = message.message_id
+                UNION
+                SELECT patchset_id AS id
+                FROM patches
+                WHERE message_id = message.message_id
+            ) AS candidate
+            JOIN patchsets AS patchset ON patchset.id = candidate.id
             LEFT JOIN patches AS patch
               ON patch.patchset_id = patchset.id
              AND patch.message_id = message.message_id
-            WHERE patchset.cover_letter_message_id = message.message_id
-               OR patch.message_id IS NOT NULL
             ORDER BY patchset.id
             LIMIT 1
         ) AS patch_data ON true

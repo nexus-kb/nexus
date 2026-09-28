@@ -5,8 +5,95 @@ import Vapor
 import VaporTesting
 import Testing
 
-@Suite("Read API integration tests")
+@Suite("Read API integration tests", .serialized)
 struct ReadAPIIntegrationTests {
+    @Test("Message patch lookup preserves cover, patch, reply and ambiguous matches")
+    func messagePatchLookup() async throws {
+        try await withApp(configure: configure) { app in
+            let fixture = try await ReadAPIIntegrationFixture(app: app)
+            do {
+                let root = fixture.rootMessageID
+                let patch = "patch-\(root)"
+                let reply = "reply-\(root)"
+                let single = "single-\(root)"
+                let rows = try await app.postgres.query(
+                    """
+                    INSERT INTO messages (message_id, thread_id, body, sent_at)
+                    VALUES
+                        (\(patch), \(fixture.threadID), 'Patch body', '2100-01-01T00:00:01Z'),
+                        (\(reply), \(fixture.threadID), 'Reply body', '2100-01-01T00:00:02Z'),
+                        (\(single), \(fixture.threadID), 'Single body', '2100-01-01T00:00:03Z')
+                    """, logger: app.logger
+                )
+                for try await _ in rows {}
+
+                // The oldest series must win even when the patch also covers
+                // a newer series. A single patch can be its own cover letter.
+                for (cover, total, member, position) in [
+                    (root, 3, patch, 2),
+                    (single, 1, single, 1),
+                    (patch, 9, "", 0)
+                ] {
+                    let series = try await app.postgres.query(
+                        """
+                        INSERT INTO patchsets (thread_id, cover_letter_message_id, total_parts)
+                        VALUES (\(fixture.threadID), \(cover), \(total))
+                        RETURNING id
+                        """, logger: app.logger
+                    )
+                    for try await row in series {
+                        let id = try row.decode(Int64.self)
+                        if !member.isEmpty {
+                            let inserted = try await app.postgres.query(
+                                """
+                                INSERT INTO patches (patchset_id, message_id, part_index, diff)
+                                VALUES (\(id), \(member), \(position), 'diff')
+                                """, logger: app.logger
+                            )
+                            for try await _ in inserted {}
+                        }
+                    }
+                }
+
+                let encoded = try #require(root.addingPercentEncoding(
+                    withAllowedCharacters: .readAPIPathAllowed
+                ))
+                try await app.testing().test(
+                    .GET, "/api/v1/threads/\(encoded)/messages?limit=200"
+                ) { response async throws in
+                    #expect(response.status == .ok)
+                    #expect(response.headers.first(name: "Server-Timing") != nil)
+                    let value = try response.content.decode(ThreadMessagesView.self)
+                    #expect(value.items.map(\.messageId) == [root, patch, reply, single])
+                    #expect(value.items.map(\.body) == ["Fixture body", "Patch body", "Reply body", "Single body"])
+                    #expect(value.items.map { $0.patch?.partIndex } == [0, 2, nil, 1])
+                    #expect(value.items.map { $0.patch?.totalParts } == [3, 3, nil, 1])
+                }
+
+                var url = "/api/v1/threads/\(encoded)/messages?limit=2"
+                for pageIndex in 0..<3 {
+                    try await app.testing().test(.GET, url) { response async throws in
+                        #expect(response.status == .ok)
+                        let page = try response.content.decode(ThreadMessagesView.self)
+                        let isLastPage = pageIndex == 1
+                        #expect(page.items.map(\.messageId) == (isLastPage ? [reply, single] : [root, patch]))
+                        #expect(page.items.map { $0.patch?.partIndex } == (isLastPage ? [nil, 1] : [0, 2]))
+                        if pageIndex < 2 {
+                            let cursor = try #require(isLastPage
+                                ? page.pagination.previousCursor
+                                : page.pagination.nextCursor)
+                            url = "/api/v1/threads/\(encoded)/messages?cursor=\(cursor)"
+                        }
+                    }
+                }
+            } catch {
+                try? await fixture.remove()
+                throw error
+            }
+            try await fixture.remove()
+        }
+    }
+
     @Test("Read endpoints execute against Postgres")
     func readEndpoints() async throws {
         try await withApp(

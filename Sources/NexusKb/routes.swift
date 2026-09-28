@@ -56,21 +56,23 @@ func routes(_ app: Application) throws {
         use: searchController.index
     )
 
-    api.get(
+    let timedThreadAPI = api.grouped(ThreadLoadTiming())
+
+    timedThreadAPI.get(
         "threads",
         ":rootMessageID",
         "patch-lineages",
         use: patchLineageController.forThread
     )
 
-    api.get(
+    timedThreadAPI.get(
         "threads",
         ":rootMessageID",
         "messages",
         use: threadController.messages
     )
 
-    api.get(
+    timedThreadAPI.get(
         "threads",
         ":rootMessageID",
         use: threadController.show
