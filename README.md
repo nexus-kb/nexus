@@ -125,6 +125,72 @@ Revision links currently recognize explicit `vN:` lore URLs on the same or next
 line. They require matching authors/phases, an older matching revision, and an
 earlier timestamp; ordinary discussion links are not lineage evidence.
 
+## Mainline patch tracking
+
+Linus's full-history bare repository lives at `/opt/nexus/mainline.git`, beside
+the mail archives at `/opt/nexus/lore`. The host fetches `master` and tags from
+`https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git`; application
+containers mount it read-only. The four-hour mirror script independently queues
+mainline indexing even when no mail changed. A failed lore pull does not prevent
+mainline maintenance, and a failed mainline fetch leaves the previous index intact.
+
+Deploy migration `0020` before the new application, and install the updated host
+script (`sudo install -m 0755 deploy/run-grokmirror.sh /usr/local/sbin/nexus-grokmirror`).
+For existing installations, clone the bare repository before recreating containers:
+
+```bash
+sudo git clone --bare --origin origin \
+  https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git \
+  /opt/nexus/mainline.git
+```
+
+Skip that clone if the repository already exists. `setup-vm.sh` handles this on
+new installations. The initial index covers commits **after `v2.6.12`**, the first
+final release backed by a commit in this tree. The `v2.6.11` tags reference a tree
+snapshot, not commit history. The boundary release itself and its ancestors are
+excluded. `MAINLINE_BASE_REF` sets this boundary; moving it to an older
+ancestor expands coverage on the next run. Narrowing coverage or a non-fast-forward
+mainline rewrite fails visibly rather than silently retaining invalid results.
+An interrupted run must resume with the same base commit before changing coverage.
+Native development can override `MAINLINE_REPO_PATH`; Compose uses the path above.
+The first backfill is heavier than subsequent incremental runs and shares the
+existing queue worker. Progress appears in worker logs.
+
+```bash
+# Index the current local clone (does not fetch).
+curl --fail-with-body -X POST http://127.0.0.1:8080/api/v1/admin/mainline/sync
+curl --fail-with-body http://127.0.0.1:8080/api/v1/admin/mainline
+# Reverse lookup: full hash or an unambiguous prefix of at least seven characters.
+curl --fail-with-body http://127.0.0.1:8080/api/v1/commits/COMMIT_HASH
+```
+
+Lineage statuses distinguish unchecked, no match, partial, merged/unreleased, and
+merged/released revisions. Versions come from ancestry against **final mainline
+release tags only**, never RCs or stable-backport tags. The series version is the
+first final release containing every part of a complete revision; each commit also
+shows its own first release. Results expose the indexed boundary and last check.
+During incomplete or failed indexing, lineage results show unchecked without
+provisional commit evidence, and reverse lookup returns HTTP 503 until recovery.
+
+Stable patch IDs identify equivalent changes; a corroborating Message-ID link
+additionally identifies a source submission. Identical resends can all match the
+same commit without proving which revision was applied. Unrelated links alone do
+not establish a match. Rename-aware and delete/add diffs are both indexed.
+Whitespace is normalized; edited, squashed, or split patches
+may be missed. “No mainline match found” is not proof of non-merge, and historical
+inclusion does not imply that a change has never been reverted. Commit lookup only
+covers indexed history. Unimported mailing-list references remain available as lore
+links, explicitly distinguished from confirmed source matches.
+
+The mainline integration tests reset the singleton index and are guarded by
+`NEXUS_TEST_DISPOSABLE=1`. Set this **only with a disposable database**, migrate it,
+then run `swift test` with its `POSTGRES_*` connection settings. Tests construct a
+small local bare Git history; they do not fetch or modify the mainline clone.
+An optional real-clone check can be enabled with `NEXUS_MAINLINE_SMOKE_BASE=v7.1`
+and `swift test --filter indexesRealMainline`, using the same disposable database.
+It compares indexed commit counts and sampled release assignments with Git and
+checks an incremental rerun; it reads the clone without changing it.
+
 Useful operational commands:
 
 ```bash

@@ -7,7 +7,7 @@ if ((EUID != 0)); then
     exec sudo -- "$repository_root/deploy/setup-vm.sh" "$@"
 fi
 
-for command in curl docker flock grok-pull openssl systemctl systemd-run; do
+for command in curl docker flock git grok-pull openssl systemctl systemd-run; do
     if ! command -v "$command" >/dev/null; then
         echo "Required command not found: $command" >&2
         exit 1
@@ -19,6 +19,12 @@ install -m 0644 "$repository_root/deploy/grokmirror.conf" \
     /opt/nexus/lore/grokmirror.conf
 install -m 0755 "$repository_root/deploy/run-grokmirror.sh" \
     /usr/local/sbin/nexus-grokmirror
+
+if [[ ! -f /opt/nexus/mainline.git/HEAD ]]; then
+    git clone --bare --origin origin \
+        https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git \
+        /opt/nexus/mainline.git
+fi
 
 if [[ ! -f "$repository_root/.env" ]]; then
     umask 077
