@@ -1,6 +1,6 @@
 services:
   web:
-    command: pnpm dev --host 0.0.0.0 --port "$PORT"
+    command: pnpm dev --host 0.0.0.0 --port "$PORT" --experimentalBundle
     cwd: WebUI
     env:
       NEXUS_API_ORIGIN: http://nexus-dev.tail1326.ts.net:8080
