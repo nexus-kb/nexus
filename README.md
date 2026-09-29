@@ -77,12 +77,22 @@ clone the repository and run:
 
 The idempotent setup creates a private `.env` with a random database password and admin token,
 installs the tracked grokmirror configuration, installs a cron entry that pulls
-the BPF, DAMON, Git, KVM, Linux MM, LKML, LLVM, Netdev, Rust for Linux,
+the BPF, DAMON, KVM, Linux MM, LKML, LLVM, Netdev, Rust for Linux,
 Sched-ext, and Linux Stable archives at minute 17 every four hours, applies
 pending SQL migrations, builds the WebUI and Vapor image, starts the stack, and
 queues an initial mirror pull followed by maintenance. Edit `.env` before
 rerunning setup if the bind address, port, logging, or credentials need to
 differ.
+
+Migration `0021` removes the Git development mailing list and Git-only data,
+preserving messages cross-posted to retained lists and placeholder parents needed
+by retained replies. For existing installations, back up the database, hold
+`/run/lock/nexus-grokmirror.lock`, drain maintenance, and pause maintenance writers
+before applying it. Install the updated `deploy/grokmirror.conf` at
+`/opt/nexus/lore/grokmirror.conf` before resuming maintenance; update any external
+configuration-management copy too. The old `/opt/nexus/lore/git` archive is no
+longer synced and may be retained offline for rollback. Do not remove
+`/opt/nexus/mainline.git`, which is the Linux mainline mirror.
 
 All `/api/v1/admin/` endpoints require `Authorization: Bearer <token>`, including
 localhost requests. Set `NEXUS_ADMIN_TOKEN` to the output of `openssl rand -hex 32`
