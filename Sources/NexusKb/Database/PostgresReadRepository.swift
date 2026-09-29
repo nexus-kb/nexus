@@ -28,19 +28,7 @@ struct PostgresReadRepository: Sendable {
                         \(cursor.anchorUpdatedAt),
                         \(cursor.anchorRootMessageID)
                     )
-                      AND (
-                        \(scope.mailingList == nil)
-                        OR EXISTS (
-                            SELECT 1
-                            FROM messages AS filter_message
-                            JOIN messages_mailing_lists AS filter_link
-                              ON filter_link.message_id = filter_message.id
-                            JOIN mailing_lists AS filter_list
-                              ON filter_list.id = filter_link.mailing_list_id
-                            WHERE filter_message.thread_id = t.id
-                              AND filter_list.archive_group = \(scope.mailingList)
-                        )
-                      )
+                      AND \(threadMailingList: scope.mailingList)
                       AND (
                         \(scope.subsystem == nil)
                         OR EXISTS (
@@ -98,19 +86,7 @@ struct PostgresReadRepository: Sendable {
                         \(cursor.anchorUpdatedAt),
                         \(cursor.anchorRootMessageID)
                     )
-                      AND (
-                        \(scope.mailingList == nil)
-                        OR EXISTS (
-                            SELECT 1
-                            FROM messages AS filter_message
-                            JOIN messages_mailing_lists AS filter_link
-                              ON filter_link.message_id = filter_message.id
-                            JOIN mailing_lists AS filter_list
-                              ON filter_list.id = filter_link.mailing_list_id
-                            WHERE filter_message.thread_id = t.id
-                              AND filter_list.archive_group = \(scope.mailingList)
-                        )
-                      )
+                      AND \(threadMailingList: scope.mailingList)
                       AND (
                         \(scope.subsystem == nil)
                         OR EXISTS (
@@ -160,19 +136,7 @@ struct PostgresReadRepository: Sendable {
                 WITH page AS MATERIALIZED (
                     SELECT t.*
                     FROM threads AS t
-                    WHERE (
-                        \(scope.mailingList == nil)
-                        OR EXISTS (
-                            SELECT 1
-                            FROM messages AS filter_message
-                            JOIN messages_mailing_lists AS filter_link
-                              ON filter_link.message_id = filter_message.id
-                            JOIN mailing_lists AS filter_list
-                              ON filter_list.id = filter_link.mailing_list_id
-                            WHERE filter_message.thread_id = t.id
-                              AND filter_list.archive_group = \(scope.mailingList)
-                        )
-                      )
+                    WHERE \(threadMailingList: scope.mailingList)
                       AND (
                         \(scope.subsystem == nil)
                         OR EXISTS (
@@ -1091,5 +1055,30 @@ struct PostgresReadRepository: Sendable {
             WHERE link.message_id = message.id
         ) AS subsystem_data ON true
         """
+    }
+}
+
+private extension PostgresQuery.StringInterpolation {
+    mutating func appendInterpolation(threadMailingList mailingList: String?) {
+        guard let mailingList else {
+            appendLiteral("TRUE")
+            return
+        }
+
+        // Keep EXISTS outside an optional-filter OR so PostgreSQL can use a
+        // semi join and stop after finding enough threads for the page.
+        appendLiteral("""
+            EXISTS (
+                SELECT 1
+                FROM messages AS filter_message
+                JOIN messages_mailing_lists AS filter_link
+                  ON filter_link.message_id = filter_message.id
+                JOIN mailing_lists AS filter_list
+                  ON filter_list.id = filter_link.mailing_list_id
+                WHERE filter_message.thread_id = t.id
+                  AND filter_list.archive_group =
+            """)
+        appendInterpolation(mailingList)
+        appendLiteral(")")
     }
 }

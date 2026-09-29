@@ -7,6 +7,95 @@ import Testing
 
 @Suite("Read API integration tests", .serialized)
 struct ReadAPIIntegrationTests {
+    @Test("List filtering preserves reply membership and both pagination directions")
+    func mailingListPagination() async throws {
+        try await withApp(configure: configure) { app in
+            let fixture = try await ReadAPIIntegrationFixture(app: app)
+            let excluded = try await ReadAPIIntegrationFixture(app: app)
+            // Include a quote to ensure list names remain bound parameters.
+            let group = "read-api-'\(UUID().uuidString)"
+            let otherGroup = "other-\(group)"
+            do {
+                let lists = try await app.postgres.query(
+                    """
+                    INSERT INTO mailing_lists (name, archive_group)
+                    VALUES ('Selected', \(group)), ('Other', \(otherGroup))
+                    """, logger: app.logger
+                )
+                for try await _ in lists {}
+                let reply = try await app.postgres.query(
+                    """
+                    INSERT INTO messages (message_id, thread_id, body)
+                    VALUES (\("reply-\(fixture.rootMessageID)"), \(fixture.threadID), 'Reply')
+                    """, logger: app.logger
+                )
+                for try await _ in reply {}
+                let links = try await app.postgres.query(
+                    """
+                    INSERT INTO messages_mailing_lists (message_id, mailing_list_id)
+                    SELECT message.id, list.id
+                    FROM messages AS message
+                    CROSS JOIN mailing_lists AS list
+                    WHERE (list.archive_group = \(group)
+                        AND (message.message_id = \("reply-\(fixture.rootMessageID)")
+                            OR message.thread_id = \(fixture.companionThreadID)))
+                       OR (list.archive_group = \(otherGroup)
+                        AND message.thread_id = \(excluded.threadID))
+                    """, logger: app.logger
+                )
+                for try await _ in links {}
+
+                let encodedGroup = try #require(group.addingPercentEncoding(
+                    withAllowedCharacters: .urlQueryAllowed
+                ))
+                var url = "/api/v1/threads?limit=1&mailingList=\(encodedGroup)"
+                for pageIndex in 0..<3 {
+                    try await app.testing().test(.GET, url) { response async throws in
+                        #expect(response.status == .ok)
+                        let page = try response.content.decode(ThreadListView.self)
+                        #expect(page.items.count == 1)
+                        if pageIndex == 1 {
+                            #expect(page.items.first?.rootMessageId == fixture.companionRootMessageID)
+                            #expect(page.items.first?.mailingLists.map(\.archiveGroup) == [group])
+                            #expect(page.pagination.nextCursor == nil)
+                        } else {
+                            #expect(page.items.first?.rootMessageId == fixture.rootMessageID)
+                            #expect(page.pagination.previousCursor == nil)
+                        }
+                        if pageIndex < 2 {
+                            let cursor = try #require(pageIndex == 0
+                                ? page.pagination.nextCursor : page.pagination.previousCursor)
+                            url = "/api/v1/threads?cursor=\(cursor)&mailingList=\(encodedGroup)"
+                        }
+                    }
+                }
+                try await app.testing().test(.GET, "/api/v1/threads?limit=10") { response async throws in
+                    let page = try response.content.decode(ThreadListView.self)
+                    #expect(page.items.contains { $0.rootMessageId == fixture.rootMessageID })
+                    #expect(page.items.contains { $0.rootMessageId == excluded.rootMessageID })
+                }
+                try await app.testing().test(
+                    .GET, "/api/v1/threads?mailingList=missing-\(UUID().uuidString)"
+                ) { response async throws in
+                    #expect(response.status == .ok)
+                    let page = try response.content.decode(ThreadListView.self)
+                    #expect(page.items.isEmpty)
+                }
+            } catch {
+                try? await fixture.remove()
+                try? await excluded.remove()
+                throw error
+            }
+            try await fixture.remove()
+            try await excluded.remove()
+            let removed = try await app.postgres.query(
+                "DELETE FROM mailing_lists WHERE archive_group IN (\(group), \(otherGroup))",
+                logger: app.logger
+            )
+            for try await _ in removed {}
+        }
+    }
+
     @Test("Message patch lookup preserves cover, patch, reply and ambiguous matches")
     func messagePatchLookup() async throws {
         try await withApp(configure: configure) { app in
@@ -281,6 +370,7 @@ struct ReadAPIIntegrationTests {
 private final class ReadAPIIntegrationFixture {
     let app: Application
     let rootMessageID: String
+    let companionRootMessageID: String
     let searchToken: String
     let threadID: Int64
     let companionThreadID: Int64
@@ -322,7 +412,7 @@ private final class ReadAPIIntegrationFixture {
         self.threadID = try #require(
             insertedThreadID
         )
-        let companionRootMessageID =
+        self.companionRootMessageID =
             "read-api-companion-\(UUID().uuidString)@example.com"
         let companionSentAt = sentAt.addingTimeInterval(
             -1
