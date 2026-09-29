@@ -18,7 +18,7 @@ import {
 import { absoluteDate, displayAuthor, displaySubject, plural } from "../format";
 import { MessageBody } from "../messageBody";
 import { buildThreadTree, mergeMessages, type ThreadTreeNode } from "../threadTree";
-import type { MessageDetail } from "../types";
+import type { MainlineMatch, MessageDetail, PatchLineageRevision } from "../types";
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "The request failed";
@@ -43,6 +43,42 @@ function revisionLabel(
   const version = revisionExplicit || revision > 1 ? " v" + revision : "";
   const resend = isResend ? " RESEND" : "";
   return phase + version + resend;
+}
+
+export function mainlineLabel(mainline: MainlineMatch): string {
+  switch (mainline.state) {
+    case "not_checked": return "Not checked";
+    case "no_match": return "No mainline match found";
+    case "partial": return `Partially merged · ${mainline.matchedParts}/${mainline.totalParts} patches`;
+    case "merged_unreleased": return "Merged in mainline · unreleased";
+    case "merged_released": return `Merged · first fully included in ${mainline.firstRelease}`;
+  }
+}
+
+export function laterMergedRevision(
+  revisions: readonly PatchLineageRevision[],
+  viewed: PatchLineageRevision,
+): PatchLineageRevision | undefined {
+  return revisions.find((candidate) => candidate.revision > viewed.revision &&
+    (candidate.mainline?.state === "merged_released" || candidate.mainline?.state === "merged_unreleased"));
+}
+
+function MainlineStatus(props: { revision: PatchLineageRevision }) {
+  return <Show when={props.revision.mainline}>{(mainline) => <div class="mainline-status">
+    <div class={`mainline-state state-${mainline().state}`}>v{props.revision.revision} · {mainlineLabel(mainline())}</div>
+    <Show when={mainline().checkedAt || mainline().coverageStart || mainline().indexedTip}>
+      <div class="mainline-coverage">
+        <Show when={mainline().checkedAt}>Checked {absoluteDate(mainline().checkedAt)} · </Show>
+        <Show when={mainline().coverageStart && mainline().indexedTip}>History after <code>{mainline().coverageStart}</code> through <code title={mainline().indexedTip!}>{mainline().indexedTip?.slice(0, 12)}</code></Show>
+      </div>
+    </Show>
+    <Show when={mainline().patches.length}><div class="mainline-patches"><For each={mainline().patches}>{(patch) => <details>
+      <summary>Patch {patch.partIndex}: {patch.subject} · {plural(patch.commits.length, "commit")}</summary>
+      <Show when={patch.commits.length} fallback={<p class="mainline-coverage">{mainline().state === "not_checked" ? "Matching is not complete." : "No accepted mainline match within indexed history."}</p>}>
+        <ul><For each={patch.commits}>{(commit) => <li><A class="commit-hash" title={commit.oid} href={`/commits/${commit.oid}`}>{commit.oid.slice(0, 12)}</A> {commit.subject}<span class="commit-evidence"> · {commit.firstRelease ? `first included in ${commit.firstRelease}` : "unreleased"} · {commit.matchKind === "submission" ? "source submission (link + patch ID)" : "equivalent content (patch ID; revision not confirmed)"}</span></li>}</For></ul>
+      </Show>
+    </details>}</For></div></Show>
+  </div>}</Show>;
 }
 
 function expandedMessageIDs(
@@ -305,6 +341,14 @@ export function ThreadPage() {
                         )}
                       </For>
                     </nav>
+                    <For each={lineage.revisions.filter((revision) => revision.rootMessageId === rootMessageID())}>
+                      {(revision) => <>
+                        <Show when={laterMergedRevision(lineage.revisions, revision)}>
+                          {(later) => <div class="later-merged">Later revision v{later().revision} merged</div>}
+                        </Show>
+                        <MainlineStatus revision={revision} />
+                      </>}
+                    </For>
                   </section>
                 )}
               </For>

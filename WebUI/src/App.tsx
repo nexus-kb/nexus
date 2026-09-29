@@ -1,4 +1,4 @@
-import { A, type RouteSectionProps } from "@solidjs/router";
+import { A, useNavigate, type RouteSectionProps } from "@solidjs/router";
 import { createSignal } from "solid-js";
 import { saveTheme, storedTheme, type ThemePreference } from "./theme";
 
@@ -27,12 +27,23 @@ export function ThemeToggle() {
 }
 
 export function AppShell(props: RouteSectionProps) {
+  const navigate = useNavigate();
+  const [commit, setCommit] = createSignal("");
+  const findCommit = (event: SubmitEvent) => {
+    event.preventDefault();
+    const value = commit().trim();
+    if (value) navigate(`/commits/${encodeURIComponent(value)}`);
+  };
   return (
     <div class="site-shell">
       <header class="site-header">
         <A class="site-title" href="/" end>
           Nexus KB
         </A>
+        <form class="commit-lookup" onSubmit={findCommit}>
+          <input aria-label="Commit hash" placeholder="commit hash" value={commit()} onInput={(event) => setCommit(event.currentTarget.value)} />
+          <button type="submit">Lookup</button>
+        </form>
         <ThemeToggle />
       </header>
       <main id="main-content">{props.children}</main>

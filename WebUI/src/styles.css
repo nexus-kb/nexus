@@ -197,6 +197,10 @@ p {
   text-decoration: none;
 }
 
+.commit-lookup { display: flex; gap: 5px; margin-left: auto; }
+.commit-lookup input { width: 15ch; padding: 4px 7px; }
+.commit-lookup + .theme-control { margin-left: 0; }
+
 .theme-control {
   display: flex;
   align-items: center;
@@ -544,6 +548,33 @@ p {
 .lineage-revision.active {
   border-bottom-color: var(--link);
   color: var(--text);
+}
+
+.mainline-status, .later-merged { border-top: 1px solid var(--border-light); padding: 9px 12px; }
+.later-merged { color: var(--warning); font-weight: 700; }
+.mainline-state { color: var(--text); font-weight: 700; }
+.state-partial { color: var(--warning); }
+.mainline-coverage, .commit-meta, .commit-evidence { margin-top: 3px; color: var(--text-muted); font-size: .82rem; }
+.mainline-coverage code { overflow-wrap: anywhere; }
+.mainline-patches { margin-top: 8px; }
+.mainline-patches details { border-top: 1px solid var(--border-light); padding: 6px 0; }
+.mainline-patches summary { cursor: pointer; overflow-wrap: anywhere; }
+.mainline-patches ul { margin: 6px 0 0; padding-left: 24px; }
+.mainline-patches li { margin: 4px 0; overflow-wrap: anywhere; }
+.commit-hash { display: inline-block; max-width: 100%; overflow-wrap: anywhere; }
+
+.commit-heading { margin-bottom: 18px; border: 1px solid var(--border); background: var(--surface); }
+.commit-heading h1, .commit-heading p, .commit-heading .commit-oid { margin: 10px 12px; }
+.commit-oid { display: block; overflow-wrap: anywhere; color: var(--text); }
+.commit-page h2 { margin: 18px 0 6px; font-size: 1rem; }
+.submission-list, .reference-list { margin: 0; padding: 0; list-style: none; border-top: 1px solid var(--border-light); }
+.submission-list li, .reference-list li { padding: 9px 7px; overflow-wrap: anywhere; border-bottom: 1px solid var(--border-light); }
+.reference-list span { color: var(--warning); }
+
+@media (max-width: 680px) {
+  .site-header { flex-wrap: wrap; }
+  .commit-lookup { order: 3; width: 100%; margin-left: 0; }
+  .commit-lookup input { flex: 1; width: auto; min-width: 0; }
 }
 
 .thread-heading {

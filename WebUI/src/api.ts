@@ -7,6 +7,7 @@ import type {
   ThreadDetail,
   ThreadListResponse,
   ThreadMessagesResponse,
+  CommitLookup,
 } from "./types";
 
 interface VaporErrorBody {
@@ -168,4 +169,8 @@ export function getThreadPatchLineages(
     "/api/v1/threads/" + encodeMessageID(rootMessageID) + "/patch-lineages",
     signal,
   );
+}
+
+export function getCommit(commitID: string, signal?: AbortSignal): Promise<CommitLookup> {
+  return fetchJSON(`/api/v1/commits/${encodeURIComponent(commitID)}`, signal);
 }

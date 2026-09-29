@@ -117,6 +117,54 @@ export interface PatchLineageRevision {
     | "manual";
   matchConfidence: number;
   mailingLists: MailingList[];
+  mainline?: MainlineMatch;
+}
+
+export type MainlineState =
+  | "not_checked"
+  | "no_match"
+  | "partial"
+  | "merged_unreleased"
+  | "merged_released";
+
+export interface MainlineCommit {
+  oid: string;
+  subject: string;
+  firstRelease: string | null;
+  matchKind: "submission" | "equivalent";
+}
+
+export interface MainlineMatch {
+  state: MainlineState;
+  checkedAt: string | null;
+  coverageStart: string | null;
+  indexedTip: string | null;
+  totalParts: number;
+  matchedParts: number;
+  firstRelease: string | null;
+  patches: Array<{
+    partIndex: number;
+    messageId: string;
+    subject: string;
+    commits: MainlineCommit[];
+  }>;
+}
+
+export interface CommitLookup {
+  oid: string;
+  subject: string;
+  firstRelease: string | null;
+  submissions: Array<{
+    messageId: string;
+    subject: string;
+    rootMessageId: string;
+    patchsetId: number;
+    lineageId: number | null;
+    revision: number | null;
+    partIndex: number;
+    matchKind: "submission" | "equivalent";
+  }>;
+  references: string[];
 }
 
 export interface PatchLineage {

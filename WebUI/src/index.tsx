@@ -3,6 +3,7 @@ import { render } from "solid-js/web";
 import { AppShell } from "./App";
 import { ThreadListPage } from "./pages/ThreadListPage";
 import { ThreadPage } from "./pages/ThreadPage";
+import { CommitPage } from "./pages/CommitPage";
 import { applyTheme, storedTheme } from "./theme";
 import "./styles.css";
 
@@ -19,6 +20,7 @@ render(
     <HashRouter root={AppShell}>
       <Route path="/" component={ThreadListPage} />
       <Route path="/thread" component={ThreadPage} />
+      <Route path="/commits/:commitID" component={CommitPage} />
     </HashRouter>
   ),
   root,
