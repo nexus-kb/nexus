@@ -554,13 +554,7 @@ p {
 .later-merged { color: var(--warning); font-weight: 700; }
 .mainline-state { color: var(--text); font-weight: 700; }
 .state-partial { color: var(--warning); }
-.mainline-coverage, .commit-meta, .commit-evidence { margin-top: 3px; color: var(--text-muted); font-size: .82rem; }
-.mainline-coverage code { overflow-wrap: anywhere; }
-.mainline-patches { margin-top: 8px; }
-.mainline-patches details { border-top: 1px solid var(--border-light); padding: 6px 0; }
-.mainline-patches summary { cursor: pointer; overflow-wrap: anywhere; }
-.mainline-patches ul { margin: 6px 0 0; padding-left: 24px; }
-.mainline-patches li { margin: 4px 0; overflow-wrap: anywhere; }
+.commit-meta, .commit-evidence { margin-top: 3px; color: var(--text-muted); font-size: .82rem; }
 .commit-hash { display: inline-block; max-width: 100%; overflow-wrap: anywhere; }
 
 .commit-heading { margin-bottom: 18px; border: 1px solid var(--border); background: var(--surface); }
@@ -669,16 +663,21 @@ p {
   margin-top: 0;
 }
 
-.message-author {
+.message-author,
+.message-subject {
   color: var(--text);
+  font-size: 0.86rem;
   font-weight: 700;
+}
+
+.message-author {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .message-subject {
   margin-top: 4px;
   overflow-wrap: anywhere;
-  color: var(--text-muted);
-  font-size: 0.9rem;
 }
 
 .message-body {
@@ -926,9 +925,26 @@ html[data-theme="dark"] .message-highlight .diff-metadata span {
   color: var(--text-muted) !important;
 }
 
+.message-summary-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.message-commits {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 4px 8px;
+  max-width: 40%;
+  flex: none;
+  font-size: 0.82rem;
+}
+
 .message-summary {
   display: block;
   width: 100%;
+  min-width: 0;
   min-height: 0;
   border: 0;
   border-radius: 0;

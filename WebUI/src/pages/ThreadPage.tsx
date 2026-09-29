@@ -18,7 +18,7 @@ import {
 import { absoluteDate, displayAuthor, displaySubject, plural } from "../format";
 import { MessageBody } from "../messageBody";
 import { buildThreadTree, mergeMessages, type ThreadTreeNode } from "../threadTree";
-import type { MainlineMatch, MessageDetail, PatchLineageRevision } from "../types";
+import type { MainlineCommit, MainlineMatch, MessageDetail, PatchLineageRevision } from "../types";
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "The request failed";
@@ -66,18 +66,6 @@ export function laterMergedRevision(
 function MainlineStatus(props: { revision: PatchLineageRevision }) {
   return <Show when={props.revision.mainline}>{(mainline) => <div class="mainline-status">
     <div class={`mainline-state state-${mainline().state}`}>v{props.revision.revision} · {mainlineLabel(mainline())}</div>
-    <Show when={mainline().checkedAt || mainline().coverageStart || mainline().indexedTip}>
-      <div class="mainline-coverage">
-        <Show when={mainline().checkedAt}>Checked {absoluteDate(mainline().checkedAt)} · </Show>
-        <Show when={mainline().coverageStart && mainline().indexedTip}>History after <code>{mainline().coverageStart}</code> through <code title={mainline().indexedTip!}>{mainline().indexedTip?.slice(0, 12)}</code></Show>
-      </div>
-    </Show>
-    <Show when={mainline().patches.length}><div class="mainline-patches"><For each={mainline().patches}>{(patch) => <details>
-      <summary>Patch {patch.partIndex}: {patch.subject} · {plural(patch.commits.length, "commit")}</summary>
-      <Show when={patch.commits.length} fallback={<p class="mainline-coverage">{mainline().state === "not_checked" ? "Matching is not complete." : "No accepted mainline match within indexed history."}</p>}>
-        <ul><For each={patch.commits}>{(commit) => <li><A class="commit-hash" title={commit.oid} href={`/commits/${commit.oid}`}>{commit.oid.slice(0, 12)}</A> {commit.subject}<span class="commit-evidence"> · {commit.firstRelease ? `first included in ${commit.firstRelease}` : "unreleased"} · {commit.matchKind === "submission" ? "source submission (link + patch ID)" : "equivalent content (patch ID; revision not confirmed)"}</span></li>}</For></ul>
-      </Show>
-    </details>}</For></div></Show>
   </div>}</Show>;
 }
 
@@ -113,6 +101,7 @@ interface MessageNodeProps {
   depth: number;
   expanded: (messageID: string) => boolean;
   toggle: (message: MessageDetail) => void;
+  commits: (messageID: string) => readonly MainlineCommit[];
 }
 
 function MessageNode(props: MessageNodeProps) {
@@ -141,23 +130,34 @@ function MessageNode(props: MessageNodeProps) {
             </div>
           }
         >
-          <button
-            aria-expanded={isExpanded()}
-            aria-label={`${isExpanded() ? "Collapse" : "Expand"} message from ${displayAuthor(message().author)}: ${displaySubject(message().subject)}`}
-            class="message-summary"
-            onClick={() => props.toggle(message())}
-            type="button"
-          >
-            <div class="message-header">
-              <span class="message-author">{displayAuthor(message().author)}</span>
-              <Show when={isExpanded()}>
-                <span>{absoluteDate(message().sentAt)}</span>
+          <div class="message-summary-row">
+            <button
+              aria-expanded={isExpanded()}
+              aria-label={`${isExpanded() ? "Collapse" : "Expand"} message from ${displayAuthor(message().author)}: ${displaySubject(message().subject)}`}
+              class="message-summary"
+              onClick={() => props.toggle(message())}
+              type="button"
+            >
+              <div class="message-header">
+                <span class="message-author">{displayAuthor(message().author)}</span>
+                <Show when={isExpanded()}>
+                  <span>{absoluteDate(message().sentAt)}</span>
+                </Show>
+              </div>
+              <Show when={message().subject}>
+                <div class="message-subject">{displaySubject(message().subject)}</div>
               </Show>
-            </div>
-            <Show when={message().subject}>
-              <div class="message-subject">{displaySubject(message().subject)}</div>
+            </button>
+            <Show when={props.commits(message().messageId).length}>
+              <div class="message-commits">
+                <For each={props.commits(message().messageId)}>{(commit) => (
+                  <A class="commit-hash" title={`Mainline commit ${commit.oid}`} href={`/commits/${commit.oid}`}>
+                    {commit.oid.slice(0, 12)}
+                  </A>
+                )}</For>
+              </div>
             </Show>
-          </button>
+          </div>
         </Show>
 
         <Show
@@ -224,6 +224,12 @@ export function ThreadPage() {
   });
 
   const tree = createMemo(() => buildThreadTree(messages()));
+  const matchedCommits = createMemo(() => new Map(
+    (lineagePage.error ? [] : lineagePage()?.items ?? []).flatMap((lineage) => lineage.revisions
+      .filter((revision) => revision.rootMessageId === rootMessageID())
+      .flatMap((revision) => (revision.mainline?.patches ?? [])
+        .map((patch) => [patch.messageId, patch.commits] as const))),
+  ));
   const isExpanded = (messageID: string) => expandedIDs().has(messageID);
   const toggleMessage = (message: MessageDetail) => {
     const messageID = message.messageId;
@@ -430,6 +436,7 @@ export function ThreadPage() {
                         expanded={isExpanded}
                         node={node}
                         toggle={toggleMessage}
+                        commits={(messageID) => matchedCommits().get(messageID) ?? []}
                       />
                     )}
                   </For>

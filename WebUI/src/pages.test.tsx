@@ -325,6 +325,21 @@ describe("ThreadPage", () => {
               matchSource: "change-id",
               matchConfidence: 100,
               mailingLists: thread.mailingLists,
+              mainline: {
+                state: "partial",
+                checkedAt: "2026-09-29T20:17:00Z",
+                coverageStart: "v2.6.12",
+                indexedTip: "f".repeat(40),
+                totalParts: 2,
+                matchedParts: 1,
+                firstRelease: null,
+                patches: [{
+                  partIndex: 1,
+                  messageId: "child@example.com",
+                  subject: "Matched patch subject",
+                  commits: [{ oid: "a".repeat(40), subject: "Matched commit subject", firstRelease: null, matchKind: "submission" }],
+                }],
+              },
             },
             {
               patchsetId: 101,
@@ -404,6 +419,12 @@ describe("ThreadPage", () => {
     );
     expect(screen.queryByText("[message unavailable]", { exact: false })).not.toBeInTheDocument();
     expect(screen.queryByText("patch 0/2")).not.toBeInTheDocument();
+    expect(screen.getByText("v2 · Partially merged · 1/2 patches")).toBeInTheDocument();
+    expect(screen.queryByText(/Checked 2026/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/History after/)).not.toBeInTheDocument();
+    expect(screen.queryByText("Matched patch subject")).not.toBeInTheDocument();
+    expect(screen.queryByText("Matched commit subject")).not.toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "aaaaaaaaaaaa" })).not.toBeInTheDocument();
     expect(
       fetchMock.mock.calls.some(([input]) => String(input).includes("missing%40example.com")),
     ).toBe(false);
@@ -418,8 +439,13 @@ describe("ThreadPage", () => {
       await screen.findByRole("button", { name: /Expand message from Reviewer/ }),
     ).toBeInTheDocument();
     expect(screen.queryByText("Reviewed-by: Reviewer")).not.toBeInTheDocument();
+    const commitLink = screen.getByRole("link", { name: "aaaaaaaaaaaa" });
+    expect(commitLink).toHaveAttribute("href", `#/commits/${"a".repeat(40)}`);
+    expect(commitLink.closest("article")).toHaveAttribute("data-message-id", "child@example.com");
+    expect(commitLink.closest("button")).toBeNull();
     await userEvent.click(screen.getByRole("button", { name: /Expand message from Reviewer/ }));
     expect(await screen.findByText("Reviewed-by: Reviewer")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "aaaaaaaaaaaa" })).toBeInTheDocument();
     expect(screen.getByText("2026-08-15 13:00 UTC")).toBeInTheDocument();
 
     const detailRequests = fetchMock.mock.calls.filter(([input]) =>
