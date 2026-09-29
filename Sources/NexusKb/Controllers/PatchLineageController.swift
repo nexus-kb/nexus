@@ -29,7 +29,9 @@ struct PatchLineageController {
             )
         }
 
-        return PatchLineageDetailView(value)
+        let mainline = try await MainlineReadRepository(client: req.postgres)
+            .statuses(patchsetIDs: value.revisions.map(\.patchSetID), logger: req.logger)
+        return PatchLineageDetailView(value, mainline: mainline)
     }
 
     func forThread(
@@ -44,7 +46,9 @@ struct PatchLineageController {
                 logger: req.logger
             )
 
-        return PatchLineageCollectionView(values)
+        let mainline = try await MainlineReadRepository(client: req.postgres)
+            .statuses(patchsetIDs: values.flatMap { $0.revisions.map(\.patchSetID) }, logger: req.logger)
+        return PatchLineageCollectionView(values, mainline: mainline)
     }
 
     private func repository(

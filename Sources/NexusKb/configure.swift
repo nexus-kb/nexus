@@ -21,6 +21,7 @@ func configure(_ app: Application) async throws {
     
     app.queues.configuration.workerCount = 1
     app.queues.add(MaintenanceWorkflowJob())
+    app.queues.add(MainlineSyncJob())
     
     // register routes
     try routes(app)

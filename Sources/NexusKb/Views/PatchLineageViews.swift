@@ -20,8 +20,9 @@ struct PatchLineageRevisionView: Content {
     let matchSource: String
     let matchConfidence: Int32
     let mailingLists: [MailingListView]
+    let mainline: MainlineStatusView?
 
-    init(_ value: PatchLineageRevisionSummary) {
+    init(_ value: PatchLineageRevisionSummary, mainline: MainlineStatusView? = nil) {
         patchsetId = value.patchSetID
         rootMessageId = value.rootMessageID
         coverLetterMessageId =
@@ -45,6 +46,7 @@ struct PatchLineageRevisionView: Content {
         mailingLists = value.mailingLists.map(
             MailingListView.init
         )
+        self.mainline = mainline
     }
 }
 
@@ -55,23 +57,21 @@ struct PatchLineageDetailView: Content {
     let latestSentAt: Date?
     let revisions: [PatchLineageRevisionView]
 
-    init(_ value: PatchLineageDetail) {
+    init(_ value: PatchLineageDetail, mainline: [Int64: MainlineStatusView] = [:]) {
         id = value.id
         subject = value.subject
         firstSentAt = value.firstSentAt
         latestSentAt = value.latestSentAt
-        revisions = value.revisions.map(
-            PatchLineageRevisionView.init
-        )
+        revisions = value.revisions.map {
+            PatchLineageRevisionView($0, mainline: mainline[$0.patchSetID])
+        }
     }
 }
 
 struct PatchLineageCollectionView: Content {
     let items: [PatchLineageDetailView]
 
-    init(_ values: [PatchLineageDetail]) {
-        items = values.map(
-            PatchLineageDetailView.init
-        )
+    init(_ values: [PatchLineageDetail], mainline: [Int64: MainlineStatusView] = [:]) {
+        items = values.map { PatchLineageDetailView($0, mainline: mainline) }
     }
 }

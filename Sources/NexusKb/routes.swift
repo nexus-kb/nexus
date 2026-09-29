@@ -8,6 +8,10 @@ func routes(_ app: Application) throws {
     let admin = api.grouped("admin")
     let maintenanceController =
         AdminMaintenanceController()
+    let mainlineController = MainlineController()
+    admin.post("mainline", "sync", use: mainlineController.sync)
+    admin.get("mainline", use: mainlineController.status)
+    api.get("commits", ":commitID", use: mainlineController.show)
 
     admin.post(
         "mailing-lists",
