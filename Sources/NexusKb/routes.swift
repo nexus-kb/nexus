@@ -1,11 +1,13 @@
 import Vapor
 
-func routes(_ app: Application) throws {
+func routes(_ app: Application, adminToken: String? = Environment.get("NEXUS_ADMIN_TOKEN")) throws {
+    let authenticator = try AdminTokenAuthenticator(token: adminToken)
     let api = app.grouped(
         "api",
         "v1"
     )
     let admin = api.grouped("admin")
+        .grouped(authenticator, AdminIdentity.guardMiddleware())
     let maintenanceController =
         AdminMaintenanceController()
     let mainlineController = MainlineController()

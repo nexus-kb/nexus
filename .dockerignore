@@ -1,6 +1,9 @@
 .build/
 .swiftpm/
 .git/
+.env
+.env.*
+.amp/
 .vscode/
 docs/
 WebUI/node_modules/

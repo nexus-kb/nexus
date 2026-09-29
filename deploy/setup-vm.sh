@@ -31,6 +31,7 @@ if [[ ! -f "$repository_root/.env" ]]; then
     cat >"$repository_root/.env" <<EOF
 POSTGRES_USER=nexus
 POSTGRES_PASSWORD=$(openssl rand -hex 32)
+NEXUS_ADMIN_TOKEN=$(openssl rand -hex 32)
 POSTGRES_DATABASE=nexus
 NEXUS_DATABASE_PORT=5432
 LOG_LEVEL=info
@@ -40,6 +41,16 @@ NEXUS_IMAGE_TAG=latest
 EOF
     chown "${SUDO_USER:-root}" "$repository_root/.env"
     echo "Created $repository_root/.env"
+fi
+
+chmod 0600 "$repository_root/.env"
+if ! grep -q '^NEXUS_ADMIN_TOKEN=' "$repository_root/.env"; then
+    printf 'NEXUS_ADMIN_TOKEN=%s\n' "$(openssl rand -hex 32)" >>"$repository_root/.env"
+fi
+admin_token=$(sed -n 's/^NEXUS_ADMIN_TOKEN=//p' "$repository_root/.env")
+if [[ ! "$admin_token" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "NEXUS_ADMIN_TOKEN must be 64 lowercase hexadecimal characters" >&2
+    exit 1
 fi
 
 cd "$repository_root"
@@ -53,10 +64,13 @@ if [[ ! "$nexus_port" =~ ^[0-9]+$ ]] || ((nexus_port < 1 || nexus_port > 65535))
     exit 1
 fi
 
+touch /etc/default/nexus
+chown root:root /etc/default/nexus
+chmod 0600 /etc/default/nexus
 cat >/etc/default/nexus <<EOF
 NEXUS_WEBHOOK_URL=http://127.0.0.1:$nexus_port/api/v1/admin/webhooks/grokmirror
+NEXUS_ADMIN_TOKEN=$admin_token
 EOF
-chmod 0644 /etc/default/nexus
 
 cat >/etc/cron.d/nexus-grokmirror <<'CRON'
 SHELL=/bin/bash

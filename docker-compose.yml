@@ -1,5 +1,6 @@
 x-shared_environment: &shared_environment
   LOG_LEVEL: ${LOG_LEVEL:-info}
+  NEXUS_ADMIN_TOKEN: ${NEXUS_ADMIN_TOKEN:?Set NEXUS_ADMIN_TOKEN in .env}
   POSTGRES_HOST: db
   POSTGRES_PORT: 5432
   POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}

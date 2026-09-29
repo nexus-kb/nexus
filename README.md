@@ -75,7 +75,7 @@ clone the repository and run:
 ./deploy/setup-vm.sh
 ```
 
-The idempotent setup creates a private `.env` with a random database password,
+The idempotent setup creates a private `.env` with a random database password and admin token,
 installs the tracked grokmirror configuration, installs a cron entry that pulls
 the BPF, DAMON, Git, KVM, Linux MM, LKML, LLVM, Netdev, Rust for Linux,
 Sched-ext, and Linux Stable archives at minute 17 every four hours, applies
@@ -83,6 +83,22 @@ pending SQL migrations, builds the WebUI and Vapor image, starts the stack, and
 queues an initial mirror pull followed by maintenance. Edit `.env` before
 rerunning setup if the bind address, port, logging, or credentials need to
 differ.
+
+All `/api/v1/admin/` endpoints require `Authorization: Bearer <token>`, including
+localhost requests. Set `NEXUS_ADMIN_TOKEN` to the output of `openssl rand -hex 32`
+for native development and existing deployments; server and worker startup fail
+without a valid 64-character lowercase hex token. Setup generates it only when
+absent and preserves it on subsequent runs. Public APIs and health checks need no token.
+Keep `.env` private and store the same token in root-owned mode-0600
+`/etc/default/nexus` for the mirror script. Ansible deployments should source both
+files from the same encrypted secret, outside the checkout. Never log the token
+or put it in URLs or frontend configuration. Docker administrators can read container
+environment variables. Use HTTPS for remote requests; HTTP is only for local callers.
+Rotate the token while holding `/run/lock/nexus-grokmirror.lock`: update both files
+and recreate server and worker before releasing the lock.
+
+For the operator examples below, load `NEXUS_ADMIN_TOKEN` securely into your shell.
+The header is passed on stdin so it does not appear in curl's command-line arguments.
 
 Migrations are deliberately manual. On later deployments, run them before
 restarting application processes:
@@ -113,6 +129,7 @@ not automatically backfill old records. For BPF, an operator can queue:
 
 ```bash
 curl --fail-with-body -X POST \
+  --header @- <<<"Authorization: Bearer $NEXUS_ADMIN_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"mode":"full"}' \
   http://127.0.0.1:8080/api/v1/admin/mailing-lists/bpf/patch-lineage
@@ -158,8 +175,8 @@ existing queue worker. Progress appears in worker logs.
 
 ```bash
 # Index the current local clone (does not fetch).
-curl --fail-with-body -X POST http://127.0.0.1:8080/api/v1/admin/mainline/sync
-curl --fail-with-body http://127.0.0.1:8080/api/v1/admin/mainline
+curl --fail-with-body --header @- -X POST http://127.0.0.1:8080/api/v1/admin/mainline/sync <<<"Authorization: Bearer $NEXUS_ADMIN_TOKEN"
+curl --fail-with-body --header @- http://127.0.0.1:8080/api/v1/admin/mainline <<<"Authorization: Bearer $NEXUS_ADMIN_TOKEN"
 # Reverse lookup: full hash or an unambiguous prefix of at least seven characters.
 curl --fail-with-body http://127.0.0.1:8080/api/v1/commits/COMMIT_HASH
 ```

@@ -168,6 +168,7 @@ struct MaintenanceWorkflowAPITests {
                     .POST,
                     "/api/v1/admin/mailing-lists/\(fixture.archiveGroup)/ingest",
                     beforeRequest: { request in
+                        request.headers.bearerAuthorization = .init(token: try #require(Environment.get("NEXUS_ADMIN_TOKEN")))
                         try request.content.encode(["mode": "incremental"])
                     },
                     afterResponse: { response async throws in
@@ -189,7 +190,8 @@ struct MaintenanceWorkflowAPITests {
 
                         try await app.testing().test(
                             .GET,
-                            "/api/v1/admin/operations/\(value.id)"
+                            "/api/v1/admin/operations/\(value.id)",
+                            headers: self.adminHeaders()
                         ) { showResponse async throws in
                             #expect(showResponse.status == .ok)
                             let shown = try showResponse.content.decode(
@@ -220,6 +222,7 @@ struct MaintenanceWorkflowAPITests {
                     .POST,
                     "/api/v1/admin/mailing-lists/\(fixture.archiveGroup)/ingest",
                     beforeRequest: { request in
+                        request.headers.bearerAuthorization = .init(token: try #require(Environment.get("NEXUS_ADMIN_TOKEN")))
                         try request.content.encode(["mode": "full"])
                     }
                 ) { response async in
@@ -255,7 +258,8 @@ struct MaintenanceWorkflowAPITests {
                 for _ in 0..<2 {
                     try await app.testing().test(
                         .POST,
-                        "/api/v1/admin/webhooks/grokmirror"
+                        "/api/v1/admin/webhooks/grokmirror",
+                        headers: self.adminHeaders()
                     ) { response async throws in
                         #expect(response.status == .accepted)
                         let run = try response.content.decode(
@@ -322,6 +326,7 @@ struct MaintenanceWorkflowAPITests {
         try await app.testing().test(
             .POST,
             path,
+            headers: adminHeaders(),
             beforeRequest: { request in
                 try request.content.encode(["mode": mode])
             },
@@ -331,6 +336,12 @@ struct MaintenanceWorkflowAPITests {
             }
         )
         return try #require(value)
+    }
+
+    private func adminHeaders() -> HTTPHeaders {
+        var headers = HTTPHeaders()
+        headers.bearerAuthorization = .init(token: Environment.get("NEXUS_ADMIN_TOKEN") ?? "")
+        return headers
     }
 }
 
