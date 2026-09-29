@@ -14,4 +14,5 @@ WebUI/node_modules/
 WebUI/coverage/
 WebUI/.vite/
 WebUI/dist/
-.amp/
+.amp/*
+!.amp/services.yaml

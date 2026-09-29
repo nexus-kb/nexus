@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${TAILSCALE_CLIENT_ID:?Set TAILSCALE_CLIENT_ID in the Nexus Amp project environment variables}"
+: "${TAILSCALE_AUDIENCE:?Set TAILSCALE_AUDIENCE in the Nexus Amp project environment variables}"
+
+sudo install -d /etc/systemd/system/tailscaled.service.d
+sudo tee /etc/systemd/system/tailscaled.service.d/amp-orb.conf >/dev/null <<'EOF'
+[Service]
+Environment=TS_ASSUME_NETWORK_UP_FOR_TEST=true
+EOF
+sudo systemctl daemon-reload
+sudo systemctl enable tailscaled.service
+sudo systemctl restart tailscaled.service
+
+token_file=$(mktemp)
+trap 'rm -f "$token_file"' EXIT
+amp orb id-token \
+    --audience "$TAILSCALE_AUDIENCE" \
+    --subject-scope project >"$token_file"
+
+sudo tailscale up \
+    --client-id="${TAILSCALE_CLIENT_ID}?ephemeral=true&preauthorized=true" \
+    --id-token="file:$token_file" \
+    --advertise-tags=tag:amp-orb \
+    --hostname="amp-nexus-${AMP_THREAD_ID:2:8}"

@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+step() {
+    printf '\n==> %s\n' "$1"
+}
+
+step "Installing Tailscale"
+if ! command -v tailscale >/dev/null 2>&1; then
+    curl -fsSL https://pkgs.tailscale.com/stable/debian/bookworm.noarmor.gpg |
+        sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+    curl -fsSL https://pkgs.tailscale.com/stable/debian/bookworm.tailscale-keyring.list |
+        sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null
+
+    (
+        set -e
+        policy_backup=$(mktemp)
+        if [[ -e /usr/sbin/policy-rc.d ]]; then
+            sudo cp -p /usr/sbin/policy-rc.d "$policy_backup"
+        else
+            rm "$policy_backup"
+        fi
+        restore_policy() {
+            if [[ -e "$policy_backup" ]]; then
+                sudo cp -p "$policy_backup" /usr/sbin/policy-rc.d
+            else
+                sudo rm -f /usr/sbin/policy-rc.d
+            fi
+            sudo rm -f "$policy_backup"
+        }
+        trap restore_policy EXIT
+
+        printf '#!/bin/sh\nexit 101\n' | sudo tee /usr/sbin/policy-rc.d >/dev/null
+        sudo chmod 0755 /usr/sbin/policy-rc.d
+        sudo apt-get update
+        sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tailscale
+    )
+fi
+sudo systemctl disable --now tailscaled.service
+
+step "Installing Node.js"
+node_version=24.21.0
+node_directory="$HOME/.local/share/nexus-node-$node_version"
+if [[ ! -x "$node_directory/bin/node" ]]; then
+    node_archive="node-v$node_version-linux-x64.tar.xz"
+    node_download=$(mktemp)
+    trap 'rm -f "$node_download"' EXIT
+    curl -fsSL "https://nodejs.org/download/release/v$node_version/$node_archive" -o "$node_download"
+    printf '%s  %s\n' \
+        fd8e59d5a511510f6a298afb548f18c7d2b1be404d8b4a27d94fbe49f56cb2d6 \
+        "$node_download" | sha256sum --check --status
+    mkdir -p "$node_directory"
+    tar -xJf "$node_download" --strip-components=1 -C "$node_directory"
+    rm -f "$node_download"
+    trap - EXIT
+fi
+export PATH="$node_directory/bin:$PATH"
+
+profile_marker="# Nexus Node.js $node_version"
+if ! grep -Fqx "$profile_marker" "$HOME/.bash_profile" 2>/dev/null; then
+    cat >>"$HOME/.bash_profile" <<EOF
+
+$profile_marker
+export PATH="$node_directory/bin:\$PATH"
+EOF
+fi
+
+step "Installing WebUI dependencies"
+corepack enable
+corepack prepare pnpm@11.19.0 --activate
+pnpm --dir WebUI install --frozen-lockfile
+
+step "Installing Playwright browsers"
+playwright_marker="$HOME/.cache/ms-playwright/.nexus-playwright-1.63.0"
+if [[ ! -e "$playwright_marker" ]]; then
+    pnpm dlx playwright@1.63.0 install --with-deps chromium firefox webkit
+    mkdir -p "$(dirname "$playwright_marker")"
+    touch "$playwright_marker"
+fi
+
+step "Checking WebUI"
+pnpm --dir WebUI check
