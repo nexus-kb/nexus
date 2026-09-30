@@ -424,7 +424,7 @@ describe("ThreadPage", () => {
     expect(screen.queryByText(/History after/)).not.toBeInTheDocument();
     expect(screen.queryByText("Matched patch subject")).not.toBeInTheDocument();
     expect(screen.queryByText("Matched commit subject")).not.toBeInTheDocument();
-    expect(screen.queryByRole("link", { name: "aaaaaaaaaaaa" })).not.toBeInTheDocument();
+    expect(screen.queryByText("aaaaaaaaaaaa")).not.toBeInTheDocument();
     expect(
       fetchMock.mock.calls.some(([input]) => String(input).includes("missing%40example.com")),
     ).toBe(false);
@@ -439,13 +439,24 @@ describe("ThreadPage", () => {
       await screen.findByRole("button", { name: /Expand message from Reviewer/ }),
     ).toBeInTheDocument();
     expect(screen.queryByText("Reviewed-by: Reviewer")).not.toBeInTheDocument();
-    const commitLink = screen.getByRole("link", { name: "aaaaaaaaaaaa" });
-    expect(commitLink).toHaveAttribute("href", `#/commits/${"a".repeat(40)}`);
-    expect(commitLink.closest("article")).toHaveAttribute("data-message-id", "child@example.com");
-    expect(commitLink.closest("button")).toBeNull();
+    const commitHash = screen.getByText("aaaaaaaaaaaa");
+    expect(commitHash.tagName).toBe("CODE");
+    expect(commitHash).toHaveAttribute("title", `Mainline commit ${"a".repeat(40)}`);
+    expect(commitHash.closest("a")).toBeNull();
+    for (const [name, href] of [
+      ["kernel.org", `https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=${"a".repeat(40)}`],
+      ["GitHub", `https://github.com/torvalds/linux/commit/${"a".repeat(40)}`],
+    ]) {
+      const commitLink = screen.getByRole("link", { name });
+      expect(commitLink).toHaveAttribute("href", href);
+      expect(commitLink).toHaveAttribute("target", "_blank");
+      expect(commitLink).toHaveAttribute("rel", "noreferrer");
+      expect(commitLink.closest("article")).toHaveAttribute("data-message-id", "child@example.com");
+      expect(commitLink.closest("button")).toBeNull();
+    }
     await userEvent.click(screen.getByRole("button", { name: /Expand message from Reviewer/ }));
     expect(await screen.findByText("Reviewed-by: Reviewer")).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "aaaaaaaaaaaa" })).toBeInTheDocument();
+    expect(screen.getByText("aaaaaaaaaaaa")).toBeInTheDocument();
     expect(screen.getByText("2026-08-15 13:00 UTC")).toBeInTheDocument();
 
     const detailRequests = fetchMock.mock.calls.filter(([input]) =>

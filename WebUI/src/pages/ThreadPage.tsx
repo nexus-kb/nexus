@@ -151,9 +151,13 @@ function MessageNode(props: MessageNodeProps) {
             <Show when={props.commits(message().messageId).length}>
               <div class="message-commits">
                 <For each={props.commits(message().messageId)}>{(commit) => (
-                  <A class="commit-hash" title={`Mainline commit ${commit.oid}`} href={`/commits/${commit.oid}`}>
-                    {commit.oid.slice(0, 12)}
-                  </A>
+                  <span>
+                    <code class="commit-hash" title={`Mainline commit ${commit.oid}`}>{commit.oid.slice(0, 12)}</code>
+                    {" · "}
+                    <a href={`https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=${commit.oid}`} target="_blank" rel="noreferrer">kernel.org</a>
+                    {" · "}
+                    <a href={`https://github.com/torvalds/linux/commit/${commit.oid}`} target="_blank" rel="noreferrer">GitHub</a>
+                  </span>
                 )}</For>
               </div>
             </Show>
